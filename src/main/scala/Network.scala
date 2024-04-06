@@ -20,6 +20,7 @@ class Network(numberOfAgents: Int, density: Int, degreeDistributionParameter: Do
 
     // Agents
     val agents: Array[ActorRef] = Array.ofDim[ActorRef](numberOfAgents)
+    val bimodal = new BimodalDistribution(0.25, 0.75)
 
     // Round state
     var currentRound: Int = 0
@@ -40,7 +41,7 @@ class Network(numberOfAgents: Int, density: Int, degreeDistributionParameter: Do
     def receive: Receive = building
 
     def createNewAgent(agentName: String): ActorRef = {
-        context.actorOf(Props(new Agent(stopThreshold, distribution, agentData, networkSaver)), agentName)
+        context.actorOf(Props(new Agent(stopThreshold, distribution, bimodal, agentData, networkSaver)), agentName)
     }
     
     def building: Receive = {

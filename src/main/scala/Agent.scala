@@ -23,7 +23,8 @@ case class ConfidenceUpdated(hasNextIter: Boolean) // Agent -> network
 case class SendNeighbors(network: Vector[ActorRef], influences: Vector[Double]) // Agent -> NetworkSaver
 
 // Actor
-class Agent(stopThreshold: Double, distribution: Distribution, agentDataSaver: ActorRef, networkSaver: ActorRef)
+class Agent(stopThreshold: Double, distribution: Distribution, bimodal: BimodalDistribution, agentDataSaver: ActorRef,
+            networkSaver: ActorRef)
   extends Actor {
     var belief: Double = -1
     val tolRadius: Double = randomBetween(0, 0.5)
@@ -41,7 +42,7 @@ class Agent(stopThreshold: Double, distribution: Distribution, agentDataSaver: A
     implicit val timeout: Timeout = Timeout(600.seconds)
 
     // Experimental zone
-    val openMindedness: Int = randomIntBetween(1, 100)
+    val openMindedness: Int = 50 // randomIntBetween(1, 100)
     var curInteractions: Int = 0
     //
 
@@ -157,8 +158,8 @@ class Agent(stopThreshold: Double, distribution: Distribution, agentDataSaver: A
                 // Uniform
                 // belief = randomBetween(0.0, 1)
                 // Bimodal
-                val bimodal = new BimodalDistribution(0.25, 0.75)
-                belief = bimodal.sample()
+                //belief = bimodal.sample()
+                belief = randomBetween()
 
                 def reverseConfidence(c: Double): Double = {
                     if (c == 1.0) {
