@@ -1,160 +1,162 @@
 import akka.actor.{Actor, ActorRef, Props}
-import java.time.LocalDateTime
-import java.time.format.DateTimeFormatter
-import java.io.File
 
-// Data creation path
-def createRunDirectory(basePath: String): String = {
-    val currentDateTime = LocalDateTime.now()
-    val formatter = DateTimeFormatter.ofPattern("yyyy-MM-dd_HH-mm-ss_SSS")
-    val formattedDateTime = currentDateTime.format(formatter)
+import scala.collection.mutable.ArrayBuffer
 
-    val dirName = s"run_$formattedDateTime"
-    val fullPath = s"$basePath/$dirName"
+import java.util.UUID
 
-    // Create the directory
-    val directory = new File(fullPath)
-    if (!directory.exists()) {
-        val result = directory.mkdirs()
-        if (result) {
-            println(s"Directory created successfully at $fullPath")
-        } else {
-            println(s"Failed to create directory at $fullPath")
-        }
-    } else {
-        println(s"Directory already exists at $fullPath")
-    }
-    fullPath
-}
+import cats.effect.IO
+import cats.effect.unsafe.implicits.global
+import tech.ant8e.uuid4cats.UUIDv7
 
 // Monitor
-
-// Modes of operation
-sealed trait OperationMode
-
-case object Debug extends OperationMode
-case object Run extends OperationMode
-
-val mode: String = "Run"
+object UUIDGenerator {
+    private val generator = UUIDv7.generator[IO]
+    
+    def generateUUID(): IO[java.util.UUID] = for {
+        gen <- generator
+        uuid <- gen.uuid
+    } yield uuid
+}
 
 // Messages
-case class CreateNetwork  // Monitor -> Network
+case class CreateNetwork // Monitor -> Network
 (
   numberOfAgents: Int,
   density: Int,
-  stopThreshold: Double,
-  degreeDistributionParameter: Double,
+  stopThreshold: Float,
+  degreeDistributionParameter: Float,
   distribution: Distribution
 )
+
+case class BuildCustomNetwork(agents: Array[AgentInitialState]) // Monitor -> network
 case object BuildNetwork // Monitor -> network
 case object RunNetwork // Monitor -> network
 case object StartAnalysis // Monitor -> network
 case object RunBatch // Monitor -> self
 
 // Actor
-class Monitor(operationMode: OperationMode, numOfNetworks: Int) extends Actor {
+class Monitor extends Actor {
     // Networks
-    val networks: Array[ActorRef] = Array.ofDim[ActorRef](numOfNetworks + 1)
-    var networkNumber: Int = 0
-
+    var networks = ArrayBuffer[ActorRef]()
+    var runId: Option[Int] = Some(-1)
+    
     // Timing
-    val totalTimer = new CustomTimer()
-    val batchTimer = new CustomTimer()
-    val totalBatchTimer = new CustomTimer()
-    val buildingTimer: Array[CustomTimer] = Array.ofDim[CustomTimer](numOfNetworks + 1)
-    val runningTimer: Array[CustomTimer] = Array.ofDim[CustomTimer](numOfNetworks + 1)
-    val analysingTimer = new CustomTimer()
-
+    val globalTimers = new CustomMultiTimer
+    val buildingTimers = new CustomMultiTimer
+    val runningTimers = new CustomMultiTimer
+    val analysisTimers = new CustomMultiTimer
+    
     // Data saving
-    val dataSavingPath: String =  createRunDirectory("src/data/runs")
-    val dataSaver: ActorRef = context.actorOf(Props(new DataSaver(numOfNetworks, dataSavingPath)), name = "DataSaver")
-
+    val dbManager = new DatabaseManager()
+    val agentLimit = 100000
+    
     // Batches
-    var curBatch: Int = 0
-    var numberOfBatches: Int = 0
-    var batchSize: Int = 0
-    var numberOfNetworksFinished: Int = 0
-    var networkInfo: (Int, Int, Double, Double, Distribution) = (0, 0, 0.0, 0.0, Uniform)
-
+    var batches = 0
+    var networksPerBatch = 0
+    var numberOfNetworks = 0
+    var curBatch = 0
+    var numberOfNetworksFinished = 0
+    var networksBuilt = 0
+    var networksAnalyzed = 0
+    
+    // Load balancer
+    val dbDataLoadBalancer: ActorRef = context.actorOf(Props(
+        new DBDataLoadBalancer(dbManager, 24)
+    ).withDispatcher("prio-mailbox"), name = s"LoadBalancer")
+    
     def receive: Receive = {
-        case CreateNetworkBatch(batchSize, batchNumber, numberOfAgents, density, stopThreshold,
-        degreeDistributionParameter, distribution) =>
-            totalTimer.start()
-            this.batchSize = batchSize
-            this.numberOfBatches = batchNumber
-            networkInfo = (numberOfAgents, density, stopThreshold, degreeDistributionParameter, distribution)
+        case AddSpecificNetwork(agents, stopThreshold, iterationLimit, name) =>
+            runId = dbManager.createRun(
+                1, None, None, stopThreshold, iterationLimit, CustomDistribution.toString, None, None
+            )
+            globalTimers.start(s"Run")
+            val networkId: UUID = UUIDGenerator.generateUUID().unsafeRunSync() 
+            val network = context.actorOf(Props(new Network(networkId, agents.length, stopThreshold = stopThreshold,
+                monitor = self, dbManager = dbManager, iterationLimit = iterationLimit,
+                dbDataLoadBalancer = dbDataLoadBalancer)), name)
+            dbManager.createNetwork(networkId, name, runId.get, agents.length)
+            networks += network
+            network ! BuildCustomNetwork(agents)
+            batches = 1
+            networksPerBatch = 1
+            numberOfNetworks = 1
+            
+        case AddNetworks(numberOfNetworks, numberOfAgents, density, degreeDistribution, stopThreshold, distribution,
+        iterationLimit) =>
+            runId = dbManager.createRun(
+                numberOfNetworks, Some(density), Some(degreeDistribution), stopThreshold, iterationLimit,
+                distribution.toString, None, None
+            )
+            
+            globalTimers.start(s"Total_time")
+            val (batches, networksPerBatch) = calculateBatches(numberOfNetworks, numberOfAgents)
+            this.batches = batches
+            this.networksPerBatch = math.min(networksPerBatch, numberOfNetworks)
+            this.numberOfNetworks = numberOfNetworks
+            globalTimers.start("Building")
+            for (i <- 0 until numberOfNetworks) {
+                val networkId: UUID = UUIDGenerator.generateUUID().unsafeRunSync()
+                networks += context.actorOf(Props(new Network(networkId, numberOfAgents, density, degreeDistribution,
+                    stopThreshold, distribution, self, dbManager, iterationLimit, dbDataLoadBalancer)), s"N${i + 1}"
+                )
+                dbManager.createNetwork(networkId, s"N${i + 1}", runId.get, numberOfAgents)
+            }
             self ! RunBatch
-            totalBatchTimer.start()
-
+        
         case RunBatch =>
-            batchTimer.start()
-            for (i <- 0 until batchSize) {
-                self ! CreateNetwork(
-                    networkInfo._1, networkInfo._2,
-                    networkInfo._3, networkInfo._4,
-                    networkInfo._5)
+            for (i <- numberOfNetworksFinished until networksPerBatch + numberOfNetworksFinished) {
+                if (i < networks.size)
+                    buildingTimers.start(networks(i).path.name)
+                    networks(i) ! BuildNetwork
             }
             curBatch += 1
-
-
-        case CreateNetwork(numberOfAgents, density, stopThreshold, degreeDistributionParameter, distribution) =>
-            networkNumber += 1
-            // Create a new Network actor
-            val newNetwork = context.actorOf(Props(new Network(numberOfAgents, density, degreeDistributionParameter,
-                stopThreshold, distribution, self, dataSavingPath, dataSaver)),
-                s"Network${networkNumber}_density$density"
-            )
-
-            // Add the new Network actor reference to the networks sequence
-            networks(networkNumber) = newNetwork
-
-            // Build the network
-            buildingTimer(networkNumber) = new CustomTimer()
-            buildingTimer(networkNumber).start()
-            newNetwork ! BuildNetwork
-
-
-        case BuildingComplete =>
+        
+        case BuildingComplete(networkId) =>
             val network = sender()
             val networkName = network.path.name
-            val networkNumber = "\\d+".r.findFirstIn(networkName).map(_.toInt).getOrElse(0)
-            buildingTimer(networkNumber).stop(s"$networkName building took")
-            runningTimer(networkNumber) = new CustomTimer()
-            runningTimer(networkNumber).start()
+            networksBuilt += 1
+            if (networksBuilt == 1) globalTimers.start("Running")
+            dbManager.updateTimeField(Right(networkId), buildingTimers.stop(networkName), "networks","build_time")
+            if (networksBuilt == numberOfNetworks)
+                dbManager.updateTimeField(Left(runId.get), globalTimers.stop("Building"), "runs", "build_time")
+                
+            runningTimers.start(networkName)
+            
             network ! RunNetwork
-
-
-        case RunningComplete =>
-            //caseClassToString(reportData)
+        
+        case RunningComplete(networkId) =>
             val network = sender()
             val networkName = network.path.name
-            val networkNumber = "\\d+".r.findFirstIn(networkName).map(_.toInt).getOrElse(0)
-            runningTimer(networkNumber).stop(s"$networkName was running for")
-            operationMode match {
-                case Debug =>
+            numberOfNetworksFinished += 1
+            dbManager.updateTimeField(Right(networkId), runningTimers.stop(networkName), "networks","run_time")
+            if (numberOfNetworksFinished == numberOfNetworks) {
+                dbManager.updateTimeField(Left(runId.get), globalTimers.stop("Running"), "runs", "run_time")
+                networks.foreach(network =>
+                    analysisTimers.start(networkName)
                     network ! StartAnalysis
-                    analysingTimer.start()
-                case Run =>
-                    numberOfNetworksFinished += 1
-
-                    if (curBatch >= numberOfBatches & numberOfNetworksFinished >= batchSize) {
-                        batchTimer.stop(s"Batch$curBatch was running for")
-                        totalBatchTimer.stop(s"Batches were running for")
-                        for (i <- 1 to numOfNetworks) {
-                            networks(i) ! StartAnalysis
-                        }
-                        analysingTimer.start()
-                    } else if (numberOfNetworksFinished >= batchSize) {
-                        numberOfNetworksFinished = 0
-                        self ! RunBatch
-                        batchTimer.stop(s"Batch$curBatch was running for")
-                    }
+                )
+            } else if (numberOfNetworksFinished % networksPerBatch == 0) {
+                self ! RunBatch
             }
             
         case AnalysisComplete =>
-            analysingTimer.stop(s"Analysis running for")
+            val network = sender()
+            val networkName = network.path.name
+            analysisTimers.stop(networkName)
+            globalTimers.stop(s"Run")
             
-            totalTimer.stop("Total time elapsed")
-
+    }
+    
+    /*
+    * ToDo make the algorithm to determine the batch size a better one
+    * */
+    private def calculateBatches(numberOfNetworks: Int, numberOfAgents: Int): (Int, Int) = {
+        if (numberOfAgents >= agentLimit) {
+            (numberOfNetworks, 1)
+        } else {
+            val networksPerBatch = agentLimit / numberOfAgents
+            val batches = math.ceil(numberOfNetworks.toDouble / networksPerBatch).toInt
+            (batches, networksPerBatch)
+        }
     }
 }
