@@ -1,5 +1,6 @@
 import akka.actor.{Actor, ActorRef}
 
+import scala.collection.mutable.ArrayBuffer
 import java.util.UUID
 
 case class NetworkStructure
@@ -9,8 +10,8 @@ case class NetworkStructure
   value: Float
 )
 
-class NetworkStructureSaver(dbManager: DatabaseManager, numberOfAgents: Int) extends Actor {
-    var networkStructure: Array[NetworkStructure] = Array.ofDim[NetworkStructure](numberOfAgents)
+class NetworkStructureSaver(numberOfAgents: Int) extends Actor {
+    var networkStructure: ArrayBuffer[NetworkStructure] = ArrayBuffer[NetworkStructure]()
     var agentsSaved = 0
     
     def receive: Receive = {
@@ -20,12 +21,12 @@ class NetworkStructureSaver(dbManager: DatabaseManager, numberOfAgents: Int) ext
             neighbors.foreach {
                 case (neighbor, influence) =>
                     val source = UUID.fromString(neighbor.path.name)
-                    networkStructure(agentsSaved) = NetworkStructure(source, target, influence)
+                    networkStructure += NetworkStructure(source, target, influence)
             }
             agentsSaved += 1
             if (agentsSaved == numberOfAgents) {
-                dbManager.insertNetworkStructureBatch(networkStructure)
-                networkStructure = Array.ofDim[NetworkStructure](0)
+                DatabaseManager.insertNetworkStructureBatch(networkStructure.toArray)
+                networkStructure.clear()
             }
     }
 }

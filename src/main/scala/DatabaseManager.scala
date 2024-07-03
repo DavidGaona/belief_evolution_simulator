@@ -1,15 +1,16 @@
 import com.zaxxer.hikari.{HikariConfig, HikariDataSource}
-
-import java.sql.{Connection, PreparedStatement, Statement}
-import java.util.UUID
-import scala.collection.mutable.{ArrayBuffer, ListBuffer}
 import org.postgresql.copy.CopyManager
 import org.postgresql.core.BaseConnection
 
 import java.io.StringReader
+import java.io.{ByteArrayOutputStream, DataOutputStream, ByteArrayInputStream}
+import java.nio.charset.StandardCharsets
+import java.sql.{Connection, PreparedStatement, Statement}
+import java.util.UUID
+import scala.collection.mutable.ArrayBuffer
 
 
-class DatabaseManager {
+object DatabaseManager {
     private val hikariConfig = new HikariConfig()
     hikariConfig.setJdbcUrl("jdbc:postgresql://localhost:5432/promueva")
     hikariConfig.setUsername("postgres")
@@ -175,7 +176,6 @@ class DatabaseManager {
                 ) VALUES (CAST(? AS uuid), CAST(? AS uuid), ?);
                 """
             val stmt = conn.prepareStatement(sql)
-            
             networkStructures.foreach { networkStructure =>
                 stmt.setString(1, networkStructure.source.toString)
                 stmt.setString(2, networkStructure.target.toString)
@@ -189,6 +189,79 @@ class DatabaseManager {
             case e: Exception =>
                 e.printStackTrace() // Properly handle exceptions
         } finally {
+            if (conn != null) conn.close()
+        }
+    }
+    
+    // Creation of unlogged tables:
+    private def createUnloggedTableMemoryMajority(tableName: String): Unit = {
+        executeSQL(
+            s"""
+                CREATE UNLOGGED TABLE IF NOT EXISTS public.$tableName (
+                    agent_id uuid NOT NULL,
+                    round integer NOT NULL,
+                    is_speaking boolean NOT NULL,
+                    belief real NOT NULL,
+                    public_belief real NOT NULL
+                );
+                """
+        )
+    }
+    
+    private def createUnloggedTableMemoryConfidence(tableName: String): Unit = {
+        executeSQL(
+            s"""
+                CREATE UNLOGGED TABLE IF NOT EXISTS public.$tableName (
+                    agent_id uuid NOT NULL,
+                    round integer NOT NULL,
+                    is_speaking boolean NOT NULL,
+                    confidence real NOT NULL,
+                    opinion_climate real NOT NULL,
+                    belief real,
+                    public_belief real
+                );
+                """
+        )
+    }
+    
+    private def createUnloggedTableMemorylessMajority(tableName: String): Unit = {
+        executeSQL(
+            s"""
+                CREATE UNLOGGED TABLE IF NOT EXISTS public.$tableName (
+                    agent_id uuid NOT NULL,
+                    round integer NOT NULL,
+                    is_speaking boolean NOT NULL,
+                    self_influence real NOT NULL,
+                    belief real NOT NULL
+                );
+                """
+        )
+    }
+    
+    private def createUnloggedTableMemorylessConfidence(tableName: String): Unit = {
+        executeSQL(
+            s"""
+                CREATE UNLOGGED TABLE IF NOT EXISTS public.$tableName (
+                    agent_id uuid NOT NULL,
+                    round integer NOT NULL,
+                    is_speaking boolean NOT NULL,
+                    confidence real NOT NULL,
+                    opinion_climate real NOT NULL,
+                    self_influence real NOT NULL,
+                    belief real
+                );
+            """
+        )
+    }
+    
+    private def executeSQL(sql: String): Unit = {
+        val conn = getConnection
+        var stmt: Statement = null
+        try {
+            stmt = conn.createStatement()
+            stmt.execute(sql)
+        } finally {
+            if (stmt != null) stmt.close()
             if (conn != null) conn.close()
         }
     }
@@ -210,82 +283,245 @@ class DatabaseManager {
                     self_influence real NOT NULL,
                     agent_id uuid NOT NULL
                 );
-            """)
+                """
+            )
         } finally {
             if (stmt != null) stmt.close()
             if (conn != null) conn.close()
         }
     }
     
-    private def insertBatchIntoUnloggedTable(tableName: String, roundDataEntries: ArrayBuffer[RoundData]): Unit = {
+    // Inserting the batch data for each agent type
+    private def insertBatchGenericBinary[T](tableName: String, entries: ArrayBuffer[T], toBinaryFunc: (T, DataOutputStream) => Unit): Unit = {
         val conn = getConnection
         var copyManager: CopyManager = null
         try {
             copyManager = new CopyManager(conn.unwrap(classOf[BaseConnection]))
             
-            val data = new StringBuilder
-            roundDataEntries.foreach { roundData =>
-                data.append(s"${roundData.round},${roundData.belief},${roundData.isSpeaking},")
-                data.append(s"${roundData.confidence.map(_.toString).getOrElse("")},")
-                data.append(s"${roundData.opinionClimate.map(_.toString).getOrElse("")},")
-                data.append(s"${roundData.publicBelief.map(_.toString).getOrElse("")},")
-                data.append(s"${roundData.selfInfluence},${roundData.agentId}\n")
+            val baos = new ByteArrayOutputStream()
+            val dos = new DataOutputStream(baos)
+            
+            // Write the file signature
+            dos.writeBytes("PGCOPY\n")
+            dos.write(0xff)
+            dos.write(0x0d)
+            dos.write(0x0a)
+            dos.write(0x00)
+            // Write flags field
+            dos.writeInt(0)
+            // Write header extension area length
+            dos.writeInt(0)
+            
+            entries.foreach { entry =>
+                toBinaryFunc(entry, dos)
             }
             
-            val reader = new StringReader(data.toString())
-            copyManager.copyIn(s"COPY public.$tableName FROM STDIN WITH (FORMAT CSV)", reader)
+            // Write file trailer
+            dos.writeShort(-1)
+            
+            dos.flush()
+            val byteArray = baos.toByteArray
+            val reader = new ByteArrayInputStream(byteArray)
+            
+            copyManager.copyIn(s"COPY public.$tableName FROM STDIN WITH (FORMAT BINARY)", reader)
         } catch {
-            case e: Exception => e.printStackTrace()
+            case e: Exception =>
+                e.printStackTrace()
+                throw e
         } finally {
             if (conn != null) conn.close()
         }
     }
     
-    private def copyDataFromTempTable(tableName: String): Unit = {
+    private def writeBinaryUUID(dos: DataOutputStream, uuid: UUID): Unit = {
+        dos.writeInt(16)
+        val msb = uuid.getMostSignificantBits
+        val lsb = uuid.getLeastSignificantBits
+        dos.writeLong(msb)
+        dos.writeLong(lsb)
+    }
+    
+    private def writeBinaryBoolean(dos: DataOutputStream, b: Boolean): Unit = {
+        dos.writeInt(1)
+        dos.writeByte(if (b) 1 else 0)
+    }
+    
+    private def writeBinaryInt(dos: DataOutputStream, i: Int): Unit = {
+        dos.writeInt(4)
+        dos.writeInt(i)
+    }
+    
+    private def writeBinaryFloat(dos: DataOutputStream, f: Float): Unit = {
+        dos.writeInt(4)
+        dos.writeFloat(f)
+    }
+    
+    private def writeBinaryOptionalFloat(dos: DataOutputStream, f: Option[Float]): Unit = {
+        f match {
+            case Some(value) => writeBinaryFloat(dos, value)
+            case None => dos.writeInt(-1) // -1 indicates NULL in PostgreSQL binary format
+        }
+    }
+    
+    private def insertBatchMemoryConfidence(tableName: String, entries: ArrayBuffer[MemoryConfidenceRound]): Unit = {
+        insertBatchGenericBinary(tableName, entries, (entry, dos) => {
+            dos.writeShort(7)
+            writeBinaryUUID(dos, entry.agentId)
+            writeBinaryInt(dos, entry.round)
+            writeBinaryBoolean(dos, entry.isSpeaking)
+            writeBinaryFloat(dos, entry.confidence)
+            writeBinaryFloat(dos, entry.opinionClimate)
+            writeBinaryOptionalFloat(dos, entry.belief)
+            writeBinaryOptionalFloat(dos, entry.publicBelief)
+        })
+    }
+    
+    private def insertBatchMemoryMajority(tableName: String, entries: ArrayBuffer[MemoryMajorityRound]): Unit = {
+        insertBatchGenericBinary(tableName, entries, (entry, dos) => {
+            dos.writeShort(5)
+            writeBinaryUUID(dos, entry.agentId)
+            writeBinaryInt(dos, entry.round)
+            writeBinaryBoolean(dos, entry.isSpeaking)
+            writeBinaryFloat(dos, entry.belief)
+            writeBinaryFloat(dos, entry.publicBelief)
+        })
+    }
+    
+    private def insertBatchMemoryLessConfidence(tableName: String, entries: ArrayBuffer[MemoryLessConfidenceRound]): Unit = {
+        insertBatchGenericBinary(tableName, entries, (entry, dos) => {
+            dos.writeShort(7)
+            writeBinaryUUID(dos, entry.agentId)
+            writeBinaryInt(dos, entry.round)
+            writeBinaryBoolean(dos, entry.isSpeaking)
+            writeBinaryFloat(dos, entry.confidence)
+            writeBinaryFloat(dos, entry.opinionClimate)
+            writeBinaryFloat(dos, entry.selfInfluence)
+            writeBinaryOptionalFloat(dos, entry.belief)
+        })
+    }
+    
+    private def insertBatchMemoryLessMajority(tableName: String, entries: ArrayBuffer[MemoryLessMajorityRound]): Unit = {
+        insertBatchGenericBinary(tableName, entries, (entry, dos) => {
+            dos.writeShort(5)
+            writeBinaryUUID(dos, entry.agentId)
+            writeBinaryInt(dos, entry.round)
+            writeBinaryBoolean(dos, entry.isSpeaking)
+            writeBinaryFloat(dos, entry.selfInfluence)
+            writeBinaryFloat(dos, entry.belief)
+        })
+    }
+    
+    
+    def insertBatchMemoryConfidenceRoundData(entries: ArrayBuffer[MemoryConfidenceRound], tempTableName: String): Unit = {
+        createUnloggedTableMemoryConfidence(tempTableName)
+        insertBatchMemoryConfidence(tempTableName, entries)
+    }
+    
+    def insertBatchMemoryMajorityRoundData(entries: ArrayBuffer[MemoryMajorityRound], tempTableName: String): Unit = {
+        createUnloggedTableMemoryMajority(tempTableName)
+        insertBatchMemoryMajority(tempTableName, entries)
+    }
+    
+    def insertBatchMemoryLessConfidenceRoundData(entries: ArrayBuffer[MemoryLessConfidenceRound], tempTableName: String): Unit = {
+        createUnloggedTableMemorylessConfidence(tempTableName)
+        insertBatchMemoryLessConfidence(tempTableName, entries)
+    }
+    
+    def insertBatchMemoryLessMajorityRoundData(entries: ArrayBuffer[MemoryLessMajorityRound], tempTableName: String): Unit = {
+        createUnloggedTableMemorylessMajority(tempTableName)
+        insertBatchMemoryLessMajority(tempTableName, entries)
+    }
+    
+    // Cleaning temp tables
+    private def cleanTempTableGeneric(tempTableName: String, targetTable: String, columns: Seq[String]): Unit = {
+        val columnList = columns.mkString(", ")
+        val insertSql =
+            s"""
+            INSERT INTO public.$targetTable ($columnList)
+            SELECT $columnList
+            FROM public.$tempTableName
+            ON CONFLICT (agent_id, round) DO NOTHING
+            """
+        val dropSql = s"DROP TABLE IF EXISTS public.$tempTableName"
+        
         val conn = getConnection
         var stmt: Statement = null
         try {
-            conn.setAutoCommit(false) // Start transaction
+            conn.setAutoCommit(false)
             stmt = conn.createStatement()
-            // Copy data from the temp table to the main table
-            stmt.execute(
-                s"""
-            INSERT INTO public.round_data (
-                round, belief, is_speaking, confidence, opinion_climate, public_belief, self_influence, agent_id
-            )
-            SELECT round, belief, is_speaking, confidence, opinion_climate, public_belief, self_influence, agent_id
-            FROM public.$tableName
-            ON CONFLICT (agent_id, round) DO NOTHING;
-        """)
             
-            // Truncate the temp table to delete its data
-            stmt.execute(s"TRUNCATE TABLE public.$tableName;")
+            // Execute INSERT
+            stmt.execute(insertSql)
             
-            conn.commit() // Commit transaction
+            // Execute DROP TABLE
+            stmt.execute(dropSql)
+            
+            conn.commit()
         } catch {
             case e: Exception =>
+                conn.rollback()
                 e.printStackTrace()
-                if (conn != null) conn.rollback() // Rollback transaction so as to not lose data
         } finally {
             if (stmt != null) stmt.close()
             if (conn != null) conn.close()
         }
     }
     
+    def cleanTempTableMemoryMajority(tempTableName: String): Unit = {
+        cleanTempTableGeneric(
+            tempTableName,
+            "memory_majority_agents_data",
+            Seq("agent_id", "round", "is_speaking", "belief", "public_belief")
+        )
+    }
     
+    def cleanTempTableMemoryConfidence(tempTableName: String): Unit = {
+        cleanTempTableGeneric(
+            tempTableName,
+            "memory_confidence_agents_data",
+            Seq("agent_id", "round", "is_speaking", "confidence", "opinion_climate", "belief", "public_belief")
+        )
+    }
     
-    def insertBatchRoundData(roundDataEntries: ArrayBuffer[RoundData], tempTableName: String): Unit = {
-        createUnloggedTable(tempTableName)
-        insertBatchIntoUnloggedTable(tempTableName, roundDataEntries)
-        copyDataFromTempTable(tempTableName)
+    def cleanTempTableMemorylessMajority(tempTableName: String): Unit = {
+        cleanTempTableGeneric(
+            tempTableName,
+            "memoryless_majority_agents_data",
+            Seq("agent_id", "round", "is_speaking", "self_influence", "belief")
+        )
+    }
+    
+    def cleanTempTableMemorylessConfidence(tempTableName: String): Unit = {
+        cleanTempTableGeneric(
+            tempTableName,
+            "memoryless_confidence_agents_data",
+            Seq("agent_id", "round", "is_speaking", "confidence", "opinion_climate", "self_influence", "belief")
+        )
     }
     
     def cleanTempTable(tempTableName: String): Unit = {
         val conn = getConnection
         var stmt: Statement = null
         try {
+            conn.setAutoCommit(false)
             stmt = conn.createStatement()
+            
+            // Copy to round_data table
+            stmt.execute(
+                s"""
+                INSERT INTO public.round_data (
+                    round, belief, is_speaking, confidence, opinion_climate, public_belief,
+                    self_influence, agent_id
+                )
+                SELECT round, belief, is_speaking, confidence, opinion_climate, public_belief, self_influence, agent_id
+                FROM public.$tempTableName
+                ON CONFLICT (agent_id, round) DO NOTHING;
+                """
+            )
+            
+            // Drop temp table
             stmt.execute(s"DROP TABLE IF EXISTS public.$tempTableName;")
+            conn.commit()
         } catch {
             case e: Exception => e.printStackTrace()
         } finally {
@@ -293,39 +529,6 @@ class DatabaseManager {
             if (conn != null) conn.close()
         }
     }
-    
-//    def insertBatchRoundData(roundDataEntries: ArrayBuffer[RoundData]): Unit = {
-//        val conn = getConnection
-//        var stmt: PreparedStatement = null
-//        try {
-//            val sql =
-//                """
-//                INSERT INTO public.round_data (
-//                    round, belief, is_speaking, confidence, opinion_climate, public_belief, self_influence, agent_id
-//                ) VALUES (?, ?, ?, ?, ?, ?, ?, CAST(? AS uuid));
-//                """
-//            stmt = conn.prepareStatement(sql)
-//
-//            roundDataEntries.foreach { roundData =>
-//                stmt.setInt(1, roundData.round)
-//                stmt.setFloat(2, roundData.belief)
-//                stmt.setBoolean(3, roundData.isSpeaking)
-//                setPreparedStatementFloat(stmt, 4, roundData.confidence)
-//                setPreparedStatementFloat(stmt, 5, roundData.opinionClimate)
-//                setPreparedStatementFloat(stmt, 6, roundData.publicBelief)
-//                stmt.setFloat(7, roundData.selfInfluence)
-//                stmt.setString(8, roundData.agentId.toString)
-//                stmt.addBatch()
-//            }
-//
-//            stmt.executeBatch()
-//        } catch {
-//            case e: Exception => e.printStackTrace()
-//        } finally {
-//            if (stmt != null) stmt.close()
-//            if (conn != null) conn.close()
-//        }
-//    }
     
     //Updates
     def updateTimeField(id: Either[Int, UUID], timeValue: Long, table: String, field: String): Unit = {
@@ -372,4 +575,95 @@ class DatabaseManager {
             conn.close()
         }
     }
+    
+    //Queries
+    def reRunSpecificNetwork(id: UUID, agentType: AgentType): Array[AgentInitialState] = {
+        val conn = getConnection
+        var stmt: PreparedStatement = null
+        try {
+            val sql =
+                s"""
+                WITH InitialBeliefs AS (
+                    SELECT
+                        rd.agent_id,
+                        rd.belief AS initial_belief
+                    FROM
+                        public.combined_round_data rd
+                    JOIN
+                        public.agents a ON rd.agent_id = a.id
+                    WHERE
+                        a.network_id = ?::uuid
+                        AND rd.round = 0
+                ),
+                AgentTypes AS (
+                    SELECT
+                        id AS agent_id,
+                        cause_of_silence,
+                        effect_of_silence,
+                        belief_update_method
+                    FROM
+                        public.agents
+                    WHERE
+                        network_id = ?::uuid
+                ),
+                Neighbors AS (
+                    SELECT
+                        ns.target AS agent_id,
+                        STRING_AGG(ns.source::text, ',') AS neighbor_ids,
+                        STRING_AGG(ns.value::text, ',') AS neighbor_values
+                    FROM
+                        public.networks_structure ns
+                    JOIN
+                        public.agents a ON ns.target = a.id
+                    WHERE
+                        a.network_id = ?::uuid
+                    GROUP BY
+                        ns.target
+                )
+                SELECT
+                    ib.agent_id,
+                    ib.initial_belief,
+                    at.cause_of_silence,
+                    at.effect_of_silence,
+                    at.belief_update_method,
+                    n.neighbor_ids,
+                    n.neighbor_values
+                FROM
+                    InitialBeliefs ib
+                JOIN
+                    AgentTypes at ON ib.agent_id = at.agent_id
+                LEFT JOIN
+                    Neighbors n ON ib.agent_id = n.agent_id
+                ORDER BY
+                    ib.agent_id;
+                """
+            stmt = conn.prepareStatement(sql)
+            stmt.setString(1, id.toString)
+            stmt.setString(2, id.toString)
+            stmt.setString(3, id.toString)
+            val resultSet = stmt.executeQuery()
+            
+            val agentInitialStates = ArrayBuffer[AgentInitialState]()
+            while (resultSet.next()) {
+                val agentId = resultSet.getString("agent_id")
+                val initialBelief = resultSet.getFloat("initial_belief")
+                val neighborIds = Option(resultSet.getString("neighbor_ids")).getOrElse("").split(",").filter(_.nonEmpty)
+                val neighborValues = Option(resultSet.getString("neighbor_values")).getOrElse("").split(",").filter(_.nonEmpty).map(_.toFloat)
+                val neighbors = neighborIds.zip(neighborValues)
+                
+                val agentInitialState = AgentInitialState(agentId, initialBelief, agentType, neighbors)
+                
+                agentInitialStates += agentInitialState
+            }
+            
+            return agentInitialStates.toArray
+        } catch {
+            case e: Exception => e.printStackTrace()
+        } finally {
+            if (stmt != null) stmt.close()
+            if (conn != null) conn.close()
+        }
+        Array.empty[AgentInitialState]
+    }
+    
 }

@@ -47,7 +47,6 @@ class Monitor extends Actor {
     val analysisTimers = new CustomMultiTimer
     
     // Data saving
-    val dbManager = new DatabaseManager()
     val agentLimit = 100000
     
     // Batches
@@ -61,29 +60,50 @@ class Monitor extends Actor {
     
     // Load balancer
     val dbDataLoadBalancer: ActorRef = context.actorOf(Props(
-        new DBDataLoadBalancer(dbManager, 24)
-    ).withDispatcher("prio-mailbox"), name = s"LoadBalancer")
+        new DBDataLoadBalancer
+    ).withMailbox("monitored-prio-mailbox"), name = s"LoadBalancer")
+    
+    // load balancers
+    
+    val totalCores = Runtime.getRuntime.availableProcessors()
+    val limitPerDBSaver: Int = 1500000
+    val memoryMajorityLB: Unit = LoadBalancerSimple.initialize(
+        context,
+        totalCores,
+        (tableNumber: Int, threshold: Int) => new MemoryMajorityDBSaver(tableNumber, threshold),
+        limitPerDBSaver
+    )
+    
+    // Testing performance end
     
     def receive: Receive = {
         case AddSpecificNetwork(agents, stopThreshold, iterationLimit, name) =>
-            runId = dbManager.createRun(
+            runId = DatabaseManager.createRun(
                 1, None, None, stopThreshold, iterationLimit, CustomDistribution.toString, None, None
             )
-            globalTimers.start(s"Run")
+            globalTimers.start(s"Total_time")
+            
             val networkId: UUID = UUIDGenerator.generateUUID().unsafeRunSync() 
-            val network = context.actorOf(Props(new Network(networkId, agents.length, stopThreshold = stopThreshold,
-                monitor = self, dbManager = dbManager, iterationLimit = iterationLimit,
-                dbDataLoadBalancer = dbDataLoadBalancer)), name)
-            dbManager.createNetwork(networkId, name, runId.get, agents.length)
+            val network = context.actorOf(Props(new Network(
+                networkId,
+                agents.length,
+                stopThreshold = stopThreshold,
+                monitor = self,
+                iterationLimit = iterationLimit,
+                dbDataLoadBalancer = dbDataLoadBalancer,
+                agentTypeCount = None)), name)
+            DatabaseManager.createNetwork(networkId, name, runId.get, agents.length)
+            buildingTimers.start(network.path.name)
             networks += network
+            globalTimers.start("Building")
             network ! BuildCustomNetwork(agents)
             batches = 1
             networksPerBatch = 1
             numberOfNetworks = 1
             
         case AddNetworks(numberOfNetworks, numberOfAgents, density, degreeDistribution, stopThreshold, distribution,
-        iterationLimit) =>
-            runId = dbManager.createRun(
+        iterationLimit, agentTypeCount) =>
+            runId = DatabaseManager.createRun(
                 numberOfNetworks, Some(density), Some(degreeDistribution), stopThreshold, iterationLimit,
                 distribution.toString, None, None
             )
@@ -96,10 +116,19 @@ class Monitor extends Actor {
             globalTimers.start("Building")
             for (i <- 0 until numberOfNetworks) {
                 val networkId: UUID = UUIDGenerator.generateUUID().unsafeRunSync()
-                networks += context.actorOf(Props(new Network(networkId, numberOfAgents, density, degreeDistribution,
-                    stopThreshold, distribution, self, dbManager, iterationLimit, dbDataLoadBalancer)), s"N${i + 1}"
-                )
-                dbManager.createNetwork(networkId, s"N${i + 1}", runId.get, numberOfAgents)
+                networks += context.actorOf(Props(new Network(
+                    networkId,
+                    numberOfAgents,
+                    density,
+                    degreeDistribution,
+                    stopThreshold,
+                    distribution,
+                    self,
+                    iterationLimit,
+                    dbDataLoadBalancer,
+                    Some(agentTypeCount)
+                )), s"N${i + 1}")
+                DatabaseManager.createNetwork(networkId, s"N${i + 1}", runId.get, numberOfAgents)
             }
             self ! RunBatch
         
@@ -116,9 +145,9 @@ class Monitor extends Actor {
             val networkName = network.path.name
             networksBuilt += 1
             if (networksBuilt == 1) globalTimers.start("Running")
-            dbManager.updateTimeField(Right(networkId), buildingTimers.stop(networkName), "networks","build_time")
+            DatabaseManager.updateTimeField(Right(networkId), buildingTimers.stop(networkName), "networks","build_time")
             if (networksBuilt == numberOfNetworks)
-                dbManager.updateTimeField(Left(runId.get), globalTimers.stop("Building"), "runs", "build_time")
+                DatabaseManager.updateTimeField(Left(runId.get), globalTimers.stop("Building"), "runs", "build_time")
                 
             runningTimers.start(networkName)
             
@@ -128,13 +157,15 @@ class Monitor extends Actor {
             val network = sender()
             val networkName = network.path.name
             numberOfNetworksFinished += 1
-            dbManager.updateTimeField(Right(networkId), runningTimers.stop(networkName), "networks","run_time")
+            DatabaseManager.updateTimeField(Right(networkId), runningTimers.stop(networkName), "networks","run_time")
             if (numberOfNetworksFinished == numberOfNetworks) {
-                dbManager.updateTimeField(Left(runId.get), globalTimers.stop("Running"), "runs", "run_time")
+                DatabaseManager.updateTimeField(Left(runId.get), globalTimers.stop("Running"), "runs", "run_time")
                 networks.foreach(network =>
                     analysisTimers.start(networkName)
                     network ! StartAnalysis
                 )
+                println("Saving to DB...")
+                dbDataLoadBalancer ! SaveRemainingData
             } else if (numberOfNetworksFinished % networksPerBatch == 0) {
                 self ! RunBatch
             }

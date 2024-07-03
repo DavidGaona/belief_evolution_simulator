@@ -17,7 +17,7 @@ case class StaticAgentData
 )
 case object AgentsSaved
 
-class AgentStaticDataSaver(dbManager: DatabaseManager, numberOfAgents: Int) extends Actor {
+class AgentStaticDataSaver(numberOfAgents: Int) extends Actor {
     var staticAgentData: Array[StaticAgentData] = Array.ofDim[StaticAgentData](numberOfAgents)
     var agentsSaved: Int = 0
     
@@ -26,7 +26,7 @@ class AgentStaticDataSaver(dbManager: DatabaseManager, numberOfAgents: Int) exte
             this.staticAgentData(agentsSaved) = staticAgentData
             agentsSaved += 1
             if (agentsSaved == numberOfAgents) {
-                dbManager.insertAgentsBatch(this.staticAgentData)
+                DatabaseManager.insertAgentsBatch(this.staticAgentData)
                 this.staticAgentData = Array.ofDim[StaticAgentData](0)
                 context.parent ! RunRound
             }

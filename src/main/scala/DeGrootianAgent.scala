@@ -1,4 +1,5 @@
 import akka.actor.{Actor, ActorRef, Stash}
+import akka.dispatch.ControlMessage
 import akka.util.Timeout
 import akka.pattern.ask
 
@@ -7,7 +8,7 @@ import scala.concurrent.duration.*
 import scala.collection.mutable
 import scala.concurrent.Future
 import scala.concurrent.ExecutionContext.Implicits.global
-import scala.util.{Success, Failure}
+import scala.util.{Failure, Success}
 
 // DeGroot based Agent base
 
@@ -17,12 +18,12 @@ case class AddToNeighborhood(neighbor: ActorRef) // Agent -> self
 case class RequestBelief(roundSentFrom: Int) // self -> Agent
 case class SendBelief(belief: Float, senderAgent: ActorRef) // Agent -> self
 
-case class AgentUpdated(hasNextIter: Boolean, belief: Float) // Agent -> network
+case class AgentUpdated(hasNextIter: Boolean, belief: Float, isStable: Boolean, 
+                        updatedBelief: Boolean) // Agent -> network
 
 // Data saving messages
 case class SendNeighbors(neighbors: mutable.Map[ActorRef, Float]) // Agent -> NetworkSaver
-case class SendAgentData(roundData: RoundData) // Agent -> AgentDataSaver
-case class SendStaticData(staticData: StaticAgentData)
+case class SendStaticData(staticData: StaticAgentData) // Agent -> 
 
 // Actor
 class DeGrootianAgent extends Actor with Stash {
@@ -90,6 +91,7 @@ class DeGrootianAgent extends Actor with Stash {
         case setNeighborInfluence(neighbor, influence) =>
             neighbors.put(neighbor, influence)
             selfInfluence -= influence
+            hasUpdatedInfluences = true
         
         case setInitialState(initialBelief) =>
             belief = initialBelief
