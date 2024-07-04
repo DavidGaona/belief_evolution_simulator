@@ -9,7 +9,7 @@ import java.util.UUID
 
 // Actor
 class MemLessMajorityAgent(id: UUID, stopThreshold: Float, distribution: Distribution, networkSaver: ActorRef,
-                             staticAgentDataSaver: ActorRef, agentRoundDataSaver: ActorRef, networkId: UUID)
+                             staticAgentDataSaver: ActorRef, networkId: UUID)
   extends DeGrootianAgent {
     // Belief update
     var speaking: Boolean = true
@@ -97,7 +97,8 @@ class MemLessMajorityAgent(id: UUID, stopThreshold: Float, distribution: Distrib
     
     private def snapshotAgentState(selfInfluence: Float = selfInfluence, forceSnapshot: Boolean = false): Unit = {
         if (prevBelief != belief || forceSnapshot) {
-            agentRoundDataSaver ! MemoryLessMajorityRound(
+            val dbSaver = RoundDataRouters.getDBSaver(MemoryLessMajority)
+            dbSaver ! MemoryLessMajorityRound(
                 id, round, speaking, selfInfluence, belief
             )
         }

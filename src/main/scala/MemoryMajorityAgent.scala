@@ -8,7 +8,7 @@ import java.util.UUID
 
 // Actor
 class MemoryMajorityAgent(id: UUID, stopThreshold: Float, distribution: Distribution, networkSaver: ActorRef,
-                            staticAgentDataSaver: ActorRef, agentRoundDataSaver: ActorRef, networkId: UUID)
+                            staticAgentDataSaver: ActorRef, networkId: UUID)
   extends DeGrootianAgent {
     // Belief related
     var publicBelief: Float = -1f
@@ -106,7 +106,7 @@ class MemoryMajorityAgent(id: UUID, stopThreshold: Float, distribution: Distribu
     
     private def snapshotAgentState(forceSnapshot: Boolean = false): Unit = {
         if (prevBelief != belief || forceSnapshot) {
-            val dbSaver = LoadBalancerSimple.getNextSaver
+            val dbSaver = RoundDataRouters.getDBSaver(MemoryMajority)
             dbSaver ! MemoryMajorityRound(
                 id, round, speaking, belief, publicBelief
             )

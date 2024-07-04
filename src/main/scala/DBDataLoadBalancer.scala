@@ -2,8 +2,13 @@ import akka.actor.{Actor, ActorContext, ActorLogging, ActorRef, Props}
 
 import scala.util.control.Breaks.*
 import scala.util.Random
-import java.util.UUID
 import scala.reflect.ClassTag
+import scala.jdk.CollectionConverters._
+
+import java.util.concurrent.ConcurrentLinkedQueue
+import java.util.concurrent.atomic.{AtomicInteger, AtomicReference}
+import java.util.UUID
+
 
 // Data Storing
 case object FinishedSaving
@@ -19,46 +24,6 @@ case class RoundData
   selfInfluence: Float,
   agentId: UUID
 ) // ~225 bits
-
-case class MemoryConfidenceRound
-(
-  agentId: UUID,
-  round: Int,
-  isSpeaking: Boolean,
-  confidence: Float,
-  opinionClimate: Float,
-  belief: Option[Float],
-  publicBelief: Option[Float]
-) // ~193 bits
-
-case class MemoryMajorityRound
-(
-  agentId: UUID,
-  round: Int,
-  isSpeaking: Boolean,
-  belief: Float,
-  publicBelief: Float
-)
-
-case class MemoryLessConfidenceRound
-(
-  agentId: UUID,
-  round: Int,
-  isSpeaking: Boolean,
-  confidence: Float,
-  opinionClimate: Float,
-  selfInfluence: Float,
-  belief: Option[Float]
-)
-
-case class MemoryLessMajorityRound
-(
-  agentId: UUID,
-  round: Int,
-  isSpeaking: Boolean,
-  selfInfluence: Float,
-  belief: Float,
-)
 
 // Actor
 @Deprecated
@@ -206,11 +171,45 @@ class DBDataLoadBalancer extends Actor with ActorLogging {
     }
 }
 
-import java.util.concurrent.ConcurrentLinkedQueue
-import java.util.concurrent.atomic.{AtomicInteger, AtomicReference}
-import scala.jdk.CollectionConverters._
+object RoundDataRouters {
+    private val memoryConfidenceRouter: RoundDataBaseRouter = new RoundDataBaseRouter()
+    private val memoryMajorityRouter: RoundDataBaseRouter = new RoundDataBaseRouter()
+    private val memoryLessConfidenceRouter: RoundDataBaseRouter = new RoundDataBaseRouter()
+    private val memoryLessMajorityRouter: RoundDataBaseRouter = new RoundDataBaseRouter()
 
-object LoadBalancerSimple {
+    def createRouters(context: ActorContext, numberOfSavers: Int, limitPerDBSaver: Int): Unit = {
+        memoryConfidenceRouter.initialize(context, numberOfSavers, limitPerDBSaver,
+            (tableNumber: Int, threshold: Int) => new MemoryConfidenceDBSaver(tableNumber, threshold))
+        
+        memoryMajorityRouter.initialize(context, numberOfSavers, limitPerDBSaver,
+            (tableNumber: Int, threshold: Int) => new MemoryMajorityDBSaver(tableNumber, threshold))
+        
+        memoryLessConfidenceRouter.initialize(context, numberOfSavers, limitPerDBSaver,
+            (tableNumber: Int, threshold: Int) => new MemoryLessConfidenceDBSaver(tableNumber, threshold))
+        
+        memoryLessMajorityRouter.initialize(context, numberOfSavers, limitPerDBSaver,
+            (tableNumber: Int, threshold: Int) => new MemoryLessMajorityDBSaver(tableNumber, threshold))
+    }
+    
+    def getDBSaver(agentType: AgentType): ActorRef = {
+        agentType match {
+            case MemoryConfidence => memoryConfidenceRouter.getNextSaver
+            case MemoryMajority => memoryMajorityRouter.getNextSaver
+            case MemoryLessConfidence => memoryLessConfidenceRouter.getNextSaver
+            case MemoryLessMajority => memoryLessMajorityRouter.getNextSaver
+        }
+    }
+    
+    def saveRemainingData(): Unit = {
+        memoryConfidenceRouter.saveRemainingData()
+        memoryMajorityRouter.saveRemainingData()
+        memoryLessConfidenceRouter.saveRemainingData()
+        memoryLessMajorityRouter.saveRemainingData()
+    }
+    
+}
+
+class RoundDataBaseRouter {
     private val dbSavers = new ConcurrentLinkedQueue[ActorRef]()
     private val counter = new AtomicInteger(0)
     private val threshold = new AtomicInteger(0)
@@ -220,18 +219,15 @@ object LoadBalancerSimple {
     (
       context: ActorContext,
       numberOfSavers: Int,
-      saverType: (Int, Int) => T,
-      threshold: Int
+      threshold: Int,
+      saverType: (Int, Int) => T
     )(implicit classTag: ClassTag[T]): Unit = {
-        
-        val savers: Seq[ActorRef] = null
         dbSavers.clear()
         for (i <- 0 until numberOfSavers)
             val actorRef = context.actorOf(
                 Props(classTag.runtimeClass, i + 1, threshold).withMailbox("priority-mailbox"),
-                s"DB${i + 1}"
+                s"${classTag.runtimeClass.toString.split(" ")(1)}_${i + 1}"
             )
-            classTag.runtimeClass.toString
             dbSavers.add(actorRef)
         currentSaver.set(dbSavers.peek())
         this.threshold.set(threshold)
@@ -251,6 +247,10 @@ object LoadBalancerSimple {
             currentSaver.set(dbSavers.peek())
             counter.set(0)
         }
+    }
+    
+    def saveRemainingData(): Unit = {
+        dbSavers.forEach(_ ! SaveRemainingData)
     }
     
     def updateSavers(savers: Seq[ActorRef]): Unit = {

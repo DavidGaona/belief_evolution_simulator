@@ -28,8 +28,7 @@ case object RunRound //self -> self
 // Actor
 class Network(networkId: UUID, numberOfAgents: Int, density: Int = -1, degreeDistributionParameter: Float = -0.1f,
               stopThreshold: Float, distribution: Distribution = CustomDistribution, monitor: ActorRef,
-              iterationLimit: Int, dbDataLoadBalancer: ActorRef,
-              agentTypeCount: Option[Map[AgentType, Int]]) extends Actor {
+              iterationLimit: Int, agentTypeCount: Option[Map[AgentType, Int]]) extends Actor {
     // Agents
     val agents: Array[ActorRef] = Array.ofDim[ActorRef](numberOfAgents)
     val bimodal = new BimodalDistribution(0.25, 0.75)
@@ -174,7 +173,7 @@ class Network(networkId: UUID, numberOfAgents: Int, density: Int = -1, degreeDis
         
         context.actorOf(Props(
             agentClass,
-            agentId, stopThreshold, distribution, networkSaver, agentStaticDataSaver, dbDataLoadBalancer, networkId
+            agentId, stopThreshold, distribution, networkSaver, agentStaticDataSaver, networkId
         ), agentName)
     }
     

@@ -9,7 +9,7 @@ import java.util.UUID
 
 // Actor
 class MemLessConfidenceAgent(id: UUID, stopThreshold: Float, distribution: Distribution, networkSaver: ActorRef,
-                             staticAgentDataSaver: ActorRef, agentRoundDataSaver: ActorRef, networkId: UUID)
+                             staticAgentDataSaver: ActorRef, networkId: UUID)
   extends DeGrootianAgent {
     // Confidence related
     var beliefExpressionThreshold: Float = -1f
@@ -123,8 +123,9 @@ class MemLessConfidenceAgent(id: UUID, stopThreshold: Float, distribution: Distr
         var localBelief: Option[Float] = Some(belief)
         if (belief == prevBelief || !forceSnapshot) localBelief = None
         if (localBelief.isEmpty & (confidence == prevConfidence)) return
-
-        agentRoundDataSaver ! MemoryLessConfidenceRound(
+        
+        val dbSaver = RoundDataRouters.getDBSaver(MemoryLessConfidence)
+        dbSaver ! MemoryLessConfidenceRound(
             id, round, confidence >= beliefExpressionThreshold, confidence, perceivedOpinionClimate,
             selfInfluence, localBelief
         )

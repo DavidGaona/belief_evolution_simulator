@@ -52,13 +52,14 @@ object Distribution {
 // Agent types
 sealed trait AgentType
 
-case object MemoryLessConfidence extends AgentType
-
 case object MemoryConfidence extends AgentType
+
+case object MemoryMajority extends AgentType
+
+case object MemoryLessConfidence extends AgentType
 
 case object MemoryLessMajority extends AgentType
 
-case object MemoryMajority extends AgentType
 
 // Global control
 case class AddNetworks
@@ -148,25 +149,25 @@ object Mains extends App {
     val monitor = system.actorOf(Props(new Monitor), "Monitor")
     
     val density = 1
-    val numberOfAgents = 1000
-    val numberOfNetworks = 1000
+    val numberOfAgents = 25
+    val numberOfNetworks = 1
     
     
-//    monitor ! AddNetworks(
-//        numberOfNetworks,
-//        numberOfAgents,
-//        density,
-//        2.5f,
-//        0.001,
-//        Uniform,
-//        1500,
-//        Map(
-//            MemoryLessConfidence -> 0,
-//            MemoryConfidence -> 0,
-//            MemoryLessMajority -> 0,
-//            MemoryMajority -> numberOfAgents
-//        )
-//    )
+    monitor ! AddNetworks(
+        numberOfNetworks,
+        numberOfAgents,
+        density,
+        2.5f,
+        0.001,
+        Uniform,
+        1500,
+        Map(
+            MemoryLessConfidence -> 0,
+            MemoryConfidence -> 0,
+            MemoryLessMajority -> 0,
+            MemoryMajority -> numberOfAgents
+        )
+    )
     
     
     val msg = simulateFromPreviousNetwork(

@@ -58,21 +58,11 @@ class Monitor extends Actor {
     var networksBuilt = 0
     var networksAnalyzed = 0
     
-    // Load balancer
-    val dbDataLoadBalancer: ActorRef = context.actorOf(Props(
-        new DBDataLoadBalancer
-    ).withMailbox("monitored-prio-mailbox"), name = s"LoadBalancer")
-    
-    // load balancers
-    
+    // Router
     val totalCores = Runtime.getRuntime.availableProcessors()
-    val limitPerDBSaver: Int = 1500000
-    val memoryMajorityLB: Unit = LoadBalancerSimple.initialize(
-        context,
-        totalCores,
-        (tableNumber: Int, threshold: Int) => new MemoryMajorityDBSaver(tableNumber, threshold),
-        limitPerDBSaver
-    )
+    val saveThreshold = 1500000
+    RoundDataRouters.createRouters(context, totalCores, saveThreshold)
+    
     
     // Testing performance end
     
@@ -90,7 +80,6 @@ class Monitor extends Actor {
                 stopThreshold = stopThreshold,
                 monitor = self,
                 iterationLimit = iterationLimit,
-                dbDataLoadBalancer = dbDataLoadBalancer,
                 agentTypeCount = None)), name)
             DatabaseManager.createNetwork(networkId, name, runId.get, agents.length)
             buildingTimers.start(network.path.name)
@@ -125,7 +114,6 @@ class Monitor extends Actor {
                     distribution,
                     self,
                     iterationLimit,
-                    dbDataLoadBalancer,
                     Some(agentTypeCount)
                 )), s"N${i + 1}")
                 DatabaseManager.createNetwork(networkId, s"N${i + 1}", runId.get, numberOfAgents)
@@ -165,7 +153,7 @@ class Monitor extends Actor {
                     network ! StartAnalysis
                 )
                 println("Saving to DB...")
-                dbDataLoadBalancer ! SaveRemainingData
+                RoundDataRouters.saveRemainingData()
             } else if (numberOfNetworksFinished % networksPerBatch == 0) {
                 self ! RunBatch
             }
