@@ -440,7 +440,7 @@ object DatabaseManager {
             INSERT INTO public.$targetTable ($columnList)
             SELECT $columnList
             FROM public.$tempTableName
-            ON CONFLICT (agent_id, round) DO NOTHING
+            ON CONFLICT (agent_id, round, created_at) DO NOTHING
             """
         val dropSql = s"DROP TABLE IF EXISTS public.$tempTableName"
         
@@ -515,7 +515,7 @@ object DatabaseManager {
                 )
                 SELECT round, belief, is_speaking, confidence, opinion_climate, public_belief, self_influence, agent_id
                 FROM public.$tempTableName
-                ON CONFLICT (agent_id, round) DO NOTHING;
+                ON CONFLICT (agent_id, round, created_at) DO NOTHING;
                 """
             )
             
