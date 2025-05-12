@@ -114,4 +114,6 @@ object CognitiveBiases {
         case "Insular" => Some(CognitiveBiasType.Insular)
         case _ => None
     }
+    
+    
 }

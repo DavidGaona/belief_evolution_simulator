@@ -6,7 +6,7 @@ import core.model.agent.behavior.bias.CognitiveBiasType
 import core.model.agent.behavior.silence.{SilenceEffectType, SilenceStrategyType}
 import core.simulation.actors.{AddNetworks, Monitor}
 import core.simulation.config.{Agentless, Debug}
-import io.websocket.WebSocketServer
+import io.web.Server
 import utils.rng.distributions.Uniform
 
 import java.lang
@@ -21,8 +21,7 @@ object Main extends App {
     // Initialize actor system and monitor
     val system = ActorSystem("original", ConfigFactory.load().getConfig("app-dispatcher"))
     val monitor = system.actorOf(Props(new Monitor), "Monitor")
-    
-    WebSocketServer.initialize(system)
+    Server.initialize(system, monitor)
     
     val cli = new CLI(system, monitor)
     cli.start()

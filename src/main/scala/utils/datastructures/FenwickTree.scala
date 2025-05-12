@@ -2,14 +2,14 @@ package utils.datastructures
 
 import scala.util.Random
 
-class FenwickTree(size: Int, density: Int, setValue: Double, countFreqs: Boolean = false) {
+class FenwickTree(size: Int, density: Int, setValue: Double, seed: Long, countFreqs: Boolean = false) {
     private val tree = Array.ofDim[Double](size + 1) //Array.fill(8)(0)
     private val scoresArr = Array.ofDim[Double](size + 1)
     private val freqs = Array.ofDim[Double](size + 1)
     private val minScore: Double = density + (density * setValue)
     private var curMax: Double = (density + 1) * minScore
     private var curLength: Int = density + 1
-    private val random = new Random(41)
+    private val random = new Random(seed)
     
     for (i <- 0 until (density + 1)) {
         update(i: Int, minScore: Double)
@@ -117,7 +117,7 @@ class FenwickTree(size: Int, density: Int, setValue: Double, countFreqs: Boolean
 
 
 object FenwickTest extends App {
-    val fenwickTree = new FenwickTree(5, 3, 2.5)
+    val fenwickTree = new FenwickTree(5, 3, 2.5, 41)
 //    println(fenwickTree.tree.mkString("Array(", ", ", ")"))
 //    println(fenwickTree.scoresArr.mkString("Array(", ", ", ")"))
 //    println(fenwickTree.query(0))

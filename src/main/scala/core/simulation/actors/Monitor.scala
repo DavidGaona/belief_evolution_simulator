@@ -27,6 +27,7 @@ case class RunMetadata(
     numberOfNetworks: Int,
     agentsPerNetwork: Int,
     iterationLimit: Int,
+    seed: Long,
     stopThreshold: Float
 )
 
@@ -41,13 +42,14 @@ case object GetStatus
 
 case class AddNetworks(
     agentTypeCount: Array[(SilenceStrategyType, SilenceEffectType, Int)],
-    agentBiases: Array[(CognitiveBiasType, Float)],
+    agentBiases: Array[(Byte, Int)],
     distribution: Distribution,
     saveMode: SaveMode,
     recencyFunction: Option[(Float, Int) => Float],
     numberOfNetworks: Int,
     density: Int,
     iterationLimit: Int,
+    seed: Option[Long],
     degreeDistribution: Float,
     stopThreshold: Float
 )
@@ -137,13 +139,29 @@ class Monitor extends Actor {
                 optionalMetadata,
                 None,
                 agentLimit,
-                1, agents.length, iterationLimit, stopThreshold)
+                1, agents.length, iterationLimit, 0, stopThreshold)
             val actor = context.actorOf(Props(new Run(runMetadata, agents, neighbors, name)), s"R$totalRuns")
             activeRuns += (actor.path.name -> (actor, 1L, agents.length))
         
+        case RunComplete =>
+            println("\nThe run has been complete\n")
+            val senderActor = sender().path.name
+            simulationTimers.stop(senderActor)
+            totalActiveNetworks -= activeRuns(senderActor)._2
+            totalActiveAgents -= activeRuns(senderActor)._3
+            activeRuns -= senderActor
+            
+        case GetStatus =>
+            println(f"\nTotal runs: $totalRuns\n" +
+                      f"Active runs: ${activeRuns.size}\n" +
+                      f"Total active networks: $totalActiveNetworks\n" +
+                      f"Total active agents: $totalActiveAgents\n")
+        
         case AddNetworks(agentTypeCount, agentBiases, distribution, saveMode, recencyFunction, numberOfNetworks,
-                         density, iterationLimit, degreeDistribution, stopThreshold) =>
+                         density, iterationLimit, seed, degreeDistribution, stopThreshold) =>
             val optionalMetadata = Some(OptionalMetadata(recencyFunction, Some(density), Some(degreeDistribution)))
+            // Here we transform the seed to some random seed based on the current time and some run parameters
+            val revisedSeed: Long = if (seed.isEmpty) System.nanoTime() + numberOfNetworks + agentBiases(0)._2 else seed.get
             val runMetadata = RunMetadata(
                 RunMode.Generated,
                 saveMode,
@@ -152,7 +170,7 @@ class Monitor extends Actor {
                 optionalMetadata,
                 None,
                 agentLimit,
-                numberOfNetworks, agentTypeCount.map(_._3).sum, iterationLimit, stopThreshold)
+                numberOfNetworks, agentTypeCount.map(_._3).sum, iterationLimit, revisedSeed, stopThreshold)
             totalRuns += 1
             totalActiveNetworks += runMetadata.numberOfNetworks
             totalActiveAgents += runMetadata.agentsPerNetwork * runMetadata.numberOfNetworks
@@ -162,70 +180,6 @@ class Monitor extends Actor {
               runMetadata.agentsPerNetwork * runMetadata.numberOfNetworks))
             simulationTimers.start(s"${actor.path.name}")
             actor ! StartRun
-        
-//        case AddNetworksFromExistingRun(runId, agentTypeCount, agentBiases, recencyFunction, saveMode,
-//                      stopThreshold, iterationLimit) =>
-//            val baseRun = DatabaseManager.getRun(runId)
-//            baseRun match {
-//                case Some(DatabaseManager.RunQueryResult(numberOfNetworks, iterationLimit, stopThreshold, distribution,
-//                                         density, degreeDistribution)) =>
-//                    val optionalMetadata = Some(OptionalMetadata(recencyFunction, density, degreeDistribution))
-//                    val runMetadata = RunMetadata(
-//                        RunMode.Generated,
-//                        saveMode,
-//                        Distribution.fromString(distribution).get,
-//                        System.currentTimeMillis(),
-//                        optionalMetadata,
-//                        None,
-//                        agentLimit,
-//                        numberOfNetworks,
-//                        agentTypeCount.map(_._3).sum,
-//                        iterationLimit,
-//                        stopThreshold)
-//                    
-//                    activeRuns += context.actorOf(Props(new Run(runMetadata, agentTypeCount, agentBiases,
-//                                                                runId)), s"R$totalRuns")
-//                    activeRuns.last ! StartRun
-//                case None => println("Error: Run not found")
-//            }
-        
-//        case AddNetworksFromExistingNetwork(networkId, agentTypeCount, agentBiases, recencyFunction, saveMode,
-//                          stopThreshold, iterationLimit) =>
-//            val baseRun = DatabaseManager.getRunInfo(networkId)
-//            baseRun match
-//                case Some((distribution, density, degreeDistribution)) =>
-//                    val optionalMetadata = Some(simulation.OptionalMetadata(recencyFunction, density, degreeDistribution))
-//                    val runMetadata = RunMetadata(
-//                        RunMode.Generated,
-//                        saveMode,
-//                        Distribution.fromString(distribution).get,
-//                        System.currentTimeMillis(),
-//                        optionalMetadata,
-//                        None,
-//                        agentLimit,
-//                        1,
-//                        agentTypeCount.map(_._3).sum,
-//                        iterationLimit,
-//                        stopThreshold)
-//                    activeRuns += context.actorOf(Props(new Run(runMetadata, agentTypeCount, agentBiases,
-//                                                                networkId)), s"R$totalRuns")
-//                    activeRuns.last ! StartRun
-//                case _ => println("Error: Network not found")
-            
-            
-        case RunComplete =>
-            println("\nThe run has been complete\n")
-            val senderActor = sender().path.name
-            simulationTimers.stop(senderActor)
-            totalActiveNetworks -= activeRuns(senderActor)._2
-            totalActiveAgents -= activeRuns(senderActor)._3
-            activeRuns -= senderActor
-        
-        case GetStatus =>
-            println(f"\nTotal runs: $totalRuns\n" +
-                      f"Active runs: ${activeRuns.size}\n" +
-                      f"Total active networks: $totalActiveNetworks\n" +
-                      f"Total active agents: $totalActiveAgents\n")
             
             
     }

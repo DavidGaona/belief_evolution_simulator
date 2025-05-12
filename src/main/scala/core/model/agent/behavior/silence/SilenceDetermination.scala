@@ -60,7 +60,7 @@ enum SilenceStrategyType:
     case Confidence(threshold: Float, openMindedness: Int)
 
 
-object SilenceStrategyType:
+object SilenceStrategyType {
     def fromString(string: String): SilenceStrategyType = {
         val parts = string.toLowerCase.trim.split("\\(", 2)
         
@@ -83,6 +83,18 @@ object SilenceStrategyType:
                     Confidence(0.5f, 1) // Default values
             case _ => Majority
     }
+    
+    def fromByte(code: Byte, thresholdValue: Float = 0.5f, confidenceValue: Float = 0.5f, updateValue: Int = 1): SilenceStrategyType = {
+        code match {
+            case 0 => DeGroot
+            case 1 => Majority
+            case 2 => Threshold(thresholdValue)
+            case 3 => Confidence(confidenceValue, updateValue)
+            case _ => Majority
+        }
+    }
+}
+    
 
 object SilenceStrategyFactory:
     def create(strategyType: SilenceStrategyType): SilenceStrategy = strategyType match

@@ -1,12 +1,11 @@
 package CLI
 
-import akka.actor.{ActorRef, ActorSystem, Props}
-import com.typesafe.config.ConfigFactory
+import akka.actor.{ActorRef, ActorSystem}
 import core.model.agent.behavior.bias.*
 import core.model.agent.behavior.silence.*
 import core.simulation.actors.*
 import core.simulation.config.*
-import utils.datastructures.{ArrayList, ArrayListInt}
+import utils.datastructures.ArrayList
 import utils.rng.distributions.*
 
 import scala.io.StdIn
@@ -72,79 +71,13 @@ class CLI(system: ActorSystem, monitor: ActorRef) {
         val tokens = cmd.split("\\s+")
 
         tokens(0) match {
-            case "run" =>
-                if (tokens.length < 6) {
-                    println("Error: Not enough parameters")
-                    println("Usage: run-basic [numNetworks] [agentTypesPerNetwork] [density] " +
-                              "[iterationLimit] [stopThreshold] [saveMode]")
-                    return
-                }
-
-                try {
-
-                    var tokenOffset = 0
-                    val agentTypeCount = ArrayList[(SilenceStrategyType, SilenceEffectType, Int)]()
-                    var hasNext = true
-                    while (hasNext) {
-                        hasNext = false
-                        val parts = tokens(2 + tokenOffset).split(":")
-                        if (parts.length == 3) {
-                            tokenOffset += 1
-                            hasNext = true
-                            agentTypeCount.add((
-                              SilenceStrategyType.fromString(parts(0)),
-                              SilenceEffectType.fromString(parts(1)),
-                              parts(2).toInt
-                            ))
-                        }
-                    }
-                    tokenOffset -= 1
-                    if (tokenOffset == -1) {
-                        tokenOffset = 0
-                        agentTypeCount.add((
-                          SilenceStrategyType.fromString("default"),
-                          SilenceEffectType.fromString("default"),
-                          tokens(2).toInt
-                        ))
-                    }
-                    
-                    val numNetworks = tokens(1).toInt
-                    val density = tokens(3 + tokenOffset).toInt
-                    val iterLimit = tokens(4 + tokenOffset).toInt
-                    val stopThreshold = tokens(5 + tokenOffset).toFloat
-                    val saveModeStr = tokens(6 + tokenOffset)
-                    val saveMode = stringToSaveMode(saveModeStr) match {
-                        case Some(mode) => mode
-                        case None =>
-                            println(s"Error: Invalid save mode '$saveModeStr'")
-                            printSaveModeHelp()
-                            return
-                    }
-                    
-                    println(s"Starting generated run with $numNetworks networks, density $density...")
-
-                    monitor ! AddNetworks(
-                        agentTypeCount = agentTypeCount.toArray,
-                        agentBiases = Array((CognitiveBiasType.DeGroot, 1.0f)),
-                        distribution = Uniform,
-                        saveMode = saveMode,
-                        recencyFunction = None,
-                        numberOfNetworks = numNetworks,
-                        density = density,
-                        iterationLimit = iterLimit,
-                        degreeDistribution = 2.5f,
-                        stopThreshold = stopThreshold
-                        )
-                } catch {
-                    case e: Exception => println(s"Error parsing parameters: ${e.getMessage}")
-                }
-
             case "run-specific" =>
                 println("This will guide you through creating a specific network configuration.")
                 try {
                     // Collect agent information
                     println("How many agents do you want to create?")
                     val numAgents = StdIn.readLine().toInt
+                    // ToDo use use defined seed for this random else use current approach
                     val random = Random(System.nanoTime())
                     val agents = new Array[AgentInitialState](numAgents)
                     val neighbors = new scala.collection.mutable.ArrayBuffer[Neighbors]()
@@ -169,12 +102,12 @@ class CLI(system: ActorSystem, monitor: ActorRef) {
                             println("Insert a valid tolerance offset (Belief - radius to belief + radius):")
                             offset = StdIn.readLine().toFloat
                         }
-
+                        
                         println("Silence strategy (1=Majority, 2=Confidence):")
                         val strategyType = StdIn.readLine().toInt match {
                             case 1 => SilenceStrategyType.Majority
                             case 2 => {
-                                println("Belief expression threshold (0.0-1.0 or R/r for random):")
+                                println("Belief expression threshold (0.0-1.0 or R/r for random uses seed if provided):")
 
                                 val betInput = StdIn.readLine().trim
                                 var threshold: Float = 0f
@@ -265,6 +198,76 @@ class CLI(system: ActorSystem, monitor: ActorRef) {
 
                 } catch {
                     case e: Exception => println(s"Error creating specific network: ${e.getMessage}")
+                }
+
+            case "run" =>
+                if (tokens.length < 6) {
+                    println("Error: Not enough parameters")
+                    println("Usage: run-basic [numNetworks] [agentTypesPerNetwork] [density] " +
+                              "[iterationLimit] [stopThreshold] [saveMode]")
+                    return
+                }
+
+                try {
+
+                    var tokenOffset = 0
+                    val agentTypeCount = ArrayList[(SilenceStrategyType, SilenceEffectType, Int)]()
+                    var hasNext = true
+                    while (hasNext) {
+                        hasNext = false
+                        val parts = tokens(2 + tokenOffset).split(":")
+                        if (parts.length == 3) {
+                            tokenOffset += 1
+                            hasNext = true
+                            agentTypeCount.add((
+                              SilenceStrategyType.fromString(parts(0)),
+                              SilenceEffectType.fromString(parts(1)),
+                              parts(2).toInt
+                            ))
+                        }
+                    }
+                    tokenOffset -= 1
+                    if (tokenOffset == -1) {
+                        tokenOffset = 0
+                        agentTypeCount.add((
+                          SilenceStrategyType.fromString("default"),
+                          SilenceEffectType.fromString("default"),
+                          tokens(2).toInt
+                        ))
+                    }
+                    
+                    val numNetworks = tokens(1).toInt
+                    val density = tokens(3 + tokenOffset).toInt
+                    val iterLimit = tokens(4 + tokenOffset).toInt
+                    val stopThreshold = tokens(5 + tokenOffset).toFloat
+                    val saveModeStr = tokens(6 + tokenOffset)
+                    val saveMode = stringToSaveMode(saveModeStr) match {
+                        case Some(mode) => mode
+                        case None =>
+                            println(s"Error: Invalid save mode '$saveModeStr'")
+                            printSaveModeHelp()
+                            return
+                    }
+                    
+                    val seed: Option[Long] = if (tokens(7) == "--seed") Some(tokens(8 + tokenOffset).toLong) else None
+                    
+                    println(s"Starting generated run with $numNetworks networks, density $density...")
+                    
+                    monitor ! AddNetworks(
+                        agentTypeCount = agentTypeCount.toArray,
+                        agentBiases = Array((0.toByte, 0)),
+                        distribution = Uniform,
+                        saveMode = saveMode,
+                        recencyFunction = None,
+                        numberOfNetworks = numNetworks,
+                        density = density,
+                        iterationLimit = iterLimit,
+                        seed = seed,
+                        degreeDistribution = 2.5f,
+                        stopThreshold = stopThreshold
+                    )
+                } catch {
+                    case e: Exception => println(s"Error parsing parameters: ${e.getMessage}")
                 }
                 
             case "status" =>

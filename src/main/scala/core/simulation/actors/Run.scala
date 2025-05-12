@@ -52,7 +52,7 @@ class Run extends Actor {
     var networks: Array[ActorRef] = null
     var times: Array[Long] = null
     var agentTypeCount: Array[(SilenceStrategyType, SilenceEffectType, Int)] = null
-    var agentBiases: Array[(CognitiveBiasType, Float)] = null
+    var agentBiases: Array[(Byte, Int)] = null
     
     // Local stats
     val percentagePoints = Seq(10, 25, 50, 75, 90)
@@ -134,7 +134,7 @@ class Run extends Actor {
     // Run generated networks
     def this(runMetadata: RunMetadata,
         agentTypeCount: Array[(SilenceStrategyType, SilenceEffectType, Int)],
-        agentBiases: Array[(CognitiveBiasType, Float)]
+        agentBiases: Array[(Byte, Int)]
     ) = {
         this()
         this.runMetadata = runMetadata
@@ -159,33 +159,33 @@ class Run extends Actor {
         the initial round
     */
     // Re-run a past run with different parameters
-    def this(runMetadata: RunMetadata,
-        agentTypeCount: Array[(SilenceStrategyType, SilenceEffectType, Int)],
-        agentBiases: Array[(CognitiveBiasType, Float)],
-        runId: Int
-    ) = {
-        this()
-        this.runMetadata = runMetadata
-        this.agentTypeCount = agentTypeCount
-        this.agentBiases = agentBiases
-        initializeGeneratedRun()
-        loadType = LoadType.NetworkLoad
-        BuildMessage = BuildNetworkFromRun(runId)
-    }
-    // Re-run a past network with different parameters
-    def this(runMetadata: RunMetadata,
-        agentTypeCount: Array[(SilenceStrategyType, SilenceEffectType, Int)],
-        agentBiases: Array[(CognitiveBiasType, Float)],
-        networkId: UUID
-    ) = {
-        this()
-        this.runMetadata = runMetadata
-        this.agentTypeCount = agentTypeCount
-        this.agentBiases = agentBiases
-        initializeGeneratedRun()
-        BuildMessage = BuildNetworkFromNetwork(networkId)
-        BuildMessage = LoadType.FullRunLoad
-    }
+//    def this(runMetadata: RunMetadata,
+//        agentTypeCount: Array[(SilenceStrategyType, SilenceEffectType, Int)],
+//        agentBiases: Array[(CognitiveBiasType, Float)],
+//        runId: Int
+//    ) = {
+//        this()
+//        this.runMetadata = runMetadata
+//        this.agentTypeCount = agentTypeCount
+//        this.agentBiases = agentBiases
+//        initializeGeneratedRun()
+//        loadType = LoadType.NetworkLoad
+//        BuildMessage = BuildNetworkFromRun(runId)
+//    }
+//    // Re-run a past network with different parameters
+//    def this(runMetadata: RunMetadata,
+//        agentTypeCount: Array[(SilenceStrategyType, SilenceEffectType, Int)],
+//        agentBiases: Array[(CognitiveBiasType, Float)],
+//        networkId: UUID
+//    ) = {
+//        this()
+//        this.runMetadata = runMetadata
+//        this.agentTypeCount = agentTypeCount
+//        this.agentBiases = agentBiases
+//        initializeGeneratedRun()
+//        BuildMessage = BuildNetworkFromNetwork(networkId)
+//        BuildMessage = LoadType.FullRunLoad
+//    }
     
     private def initializeGeneratedRun(): Unit = {
         globalTimers.start(s"Total_time")

@@ -74,7 +74,7 @@ enum SilenceEffectType:
     case Peers(baseEffect: SilenceEffectType)
 
 
-object SilenceEffectType:
+object SilenceEffectType{
     def fromString(string: String): SilenceEffectType = {
         val parts = string.toLowerCase.trim.split("\\(", 2)
         parts(0) match
@@ -83,7 +83,17 @@ object SilenceEffectType:
             case "memoryless" => SilenceEffectType.Memoryless
             case _ => SilenceEffectType.Memoryless
     }
-
+    
+    def fromByte(code: Byte): SilenceEffectType = {
+        code match {
+            case 0 => SilenceEffectType.DeGroot
+            case 1 => SilenceEffectType.Memory
+            case 2 => SilenceEffectType.Memoryless
+            case _ => SilenceEffectType.Memoryless
+        }
+    }
+}
+    
 object SilenceEffectFactory:
     def create(effectType: SilenceEffectType): SilenceEffect = effectType match
         case SilenceEffectType.DeGroot => DeGrootSilenceEffect()

@@ -5,16 +5,17 @@ import akka.util.Timeout
 import core.model.agent.behavior.bias.*
 import core.model.agent.behavior.silence.*
 import core.simulation.*
+import io.web.Server
 import io.persistence.RoundRouter
 import io.persistence.actors.{AgentState, AgentStatesSilent, AgentStatesSpeaking, NeighborStructure, SendNeighbors, SendStaticAgentData}
 import io.serialization.binary.Encoder
-import io.websocket.WebSocketServer
 import utils.datastructures.ArrayListInt
 import utils.rng.distributions.*
 
-import java.lang
+import java.{lang, util}
 import java.nio.ByteBuffer
 import java.util.UUID
+import scala.collection.mutable
 import scala.collection.mutable.ArrayBuffer
 import scala.concurrent.duration.*
 import scala.util.Random
@@ -59,6 +60,7 @@ case class StaticAgentData(
 ) // Agent -> Agent static data saver SendStaticData
 
 
+// Containers
 
 // Estimate size
 // 16 + 8 + 8 + (4 * 2) + 0.25 + 4 + (4 * m * 2) * 3 + 32 + (4 * 4) + (4 * 4) + 2
@@ -74,6 +76,7 @@ class Agent(
     speakingBuffer1: Array[Byte], speakingBuffer2: Array[Byte], belief: Array[Float],
     tolRadius: Array[Float], tolOffset: Array[Float], indexOffset: Array[Int], timesStable: Array[Int],
     neighborsRefs: Array[Int], neighborsWeights: Array[Float], neighborBiases: Array[Byte],
+    neighborsBiasesToAssign: Option[mutable.HashMap[Byte, Int]],
     networkId: UUID, numberOfAgents: Int, startsAt: Int, names: Array[String]
 )
   extends Actor {
@@ -94,7 +97,7 @@ class Agent(
         FloatVector.SPECIES_512 // 2^4 = 16 elements
         )
     //val vectorSpecies = FloatVector.SPECIES_512
-    val random = new Random(41)
+    val random = new Random(runMetadata.seed + startsAt)
     
     // Pre-allocated temp arrays for vectorization
     val tempBeliefs = new Array[Float](16)
@@ -327,7 +330,7 @@ class Agent(
     }
     
     //
-    private def snapshotAgentState(forceSnapshot: Boolean, pastBeliefs: Array[Float], 
+    private def snapshotAgentState(forceSnapshot: Boolean, pastBeliefs: Array[Float],
         speakingState: Array[Byte]): Unit = {
         val roundDataSpeaking: ArrayBuffer[AgentState] = new ArrayBuffer[AgentState](numberOfAgents * 3 / 2)
         val roundDataSilent: ArrayBuffer[AgentState] = new ArrayBuffer[AgentState](numberOfAgents / 4)
@@ -357,7 +360,7 @@ class Agent(
         buffer.putInt(runMetadata.runId.get)
         buffer.putInt(numberOfAgents)
         buffer.putInt(round)
-
+        
         // Put the uuids
         var i = 0
         val uuidLongs = new Array[Long](numberOfAgents * 2)
@@ -377,8 +380,8 @@ class Agent(
         
         buffer.flip()
         
-        WebSocketServer.sendBinaryData(buffer)
-    } 
+        Server.sendSimulationBinaryData(buffer)
+    }
     
     @inline
     def neighborsSize(i: Int): Int = {
@@ -387,6 +390,9 @@ class Agent(
     }
     
     private def generateInfluencesAndBiases(): Unit = {
+        val indexes = neighborsBiasesToAssign.get.keys.toArray
+        var currentIndex: Int = 0
+        
         var i = startsAt
         while (i < (startsAt + numberOfAgents)) {
             val randomNumbers = Array.fill(neighborsSize(i) + 1)(random.nextFloat())
@@ -396,16 +402,39 @@ class Agent(
             var k = 0
             while (j < indexOffset(i)) {
                 neighborsWeights(j) = randomNumbers(k) / sum
-                neighborBiases(j) = 3
+                neighborBiases(j) = indexes(currentIndex)
                 j += 1
                 k += 1
+                neighborsBiasesToAssign.get(indexes(currentIndex)) -= 1
+                if (neighborsBiasesToAssign.get(indexes(currentIndex)) == 0) {
+                    currentIndex += 1
+                }
             }
             i += 1
         }
+        
+        if (indexes.length > 1) {
+            // In-place Fisher-Yates shuffle of the entire neighborBiases array
+            val startIdx = if (startsAt != 0) indexOffset(startsAt - 1) else 0
+            val endIdx = indexOffset(startsAt + numberOfAgents - 1)
+            
+            var idx = endIdx - 1
+            while (idx > startIdx) {
+                val j = startIdx + random.nextInt(idx - startIdx + 1)
+                // Swap values
+                val temp = neighborBiases(idx)
+                neighborBiases(idx) = neighborBiases(j)
+                neighborBiases(j) = temp
+                idx -= 1
+            }
+        }
+        
         hasUpdatedInfluences = true
-//        println(indexOffset.mkString("offset(", ", ", ")"))
-//        println(neighborsRefs.mkString("Neighbors(", ", ", ")"))
-//        println(neighborsWeights.mkString("Influences(", ", ", ")\n"))
+        println(s"seed: ${runMetadata.seed}")
+        println(indexOffset.mkString("offset(", ", ", ")"))
+        println(neighborsRefs.mkString("Neighbors(", ", ", ")"))
+        println(neighborsWeights.mkString("Influences(", ", ", ")"))
+        println(neighborBiases.mkString("Biases(", ", ", ")\n"))
     }
     
     override def preStart(): Unit = {

@@ -2,8 +2,6 @@ package core.simulation.actors
 
 import akka.actor.{Actor, ActorRef, Props}
 import akka.util.Timeout
-import cats.effect.unsafe.implicits.global
-import core.model.agent.behavior.bias.*
 import core.model.agent.behavior.silence.*
 import io.db.DatabaseManager
 import io.persistence.actors.{AgentStaticDataSaver, NeighborSaver}
@@ -11,6 +9,7 @@ import utils.datastructures.{FenwickTree, UUIDS}
 import utils.rng.distributions.BimodalDistribution
 
 import java.util.UUID
+import scala.collection.mutable
 import scala.concurrent.duration.*
 // Network
 
@@ -21,14 +20,20 @@ case class BuildCustomNetwork(
 ) // Monitor -> network
 
 case object BuildNetwork // Monitor -> network
+
 case class BuildNetworkByGroups(groups: Int)
+
 case object RunNetwork // Monitor -> network
+
 case object RunFirstRound // Agent -> Network
+
 case class BuildNetworkFromRun(runId: Int)
+
 case class BuildNetworkFromNetwork(networkId: UUID)
 
 
 case class AgentUpdated(maxBelief: Float, minBelief: Float, isStable: Boolean) // Agent -> network
+
 case object SaveRemainingData // Network -> AgentRoundDataSaver
 
 
@@ -38,9 +43,9 @@ case object ActorFinished // Agent -> Network
 
 // Actor
 class Network(networkId: UUID,
-              runMetadata: RunMetadata,
-              agentTypeCount: Array[(SilenceStrategyType, SilenceEffectType, Int)],
-              agentBiases: Array[(CognitiveBiasType, Float)]) extends Actor {
+    runMetadata: RunMetadata,
+    agentTypeCount: Array[(SilenceStrategyType, SilenceEffectType, Int)],
+    agentBiases: Array[(Byte, Int)]) extends Actor {
     // Agents
     val numberOfAgentActors: Int = math.min(32, (runMetadata.agentsPerNetwork + 31) / 32)
     val agentsPerActor: Array[Int] = new Array[Int](numberOfAgentActors)
@@ -60,8 +65,8 @@ class Network(networkId: UUID,
     // ToDoo change to 0 or 1 values
     val speakingBuffer1: Array[Byte] = Array.fill(runMetadata.agentsPerNetwork)(1)
     val speakingBuffer2: Array[Byte] = Array.fill(runMetadata.agentsPerNetwork)(1)
-//    val speakingBuffer1: AgentStates = AgentStates(runMetadata.agentsPerNetwork)
-//    val speakingBuffer2: AgentStates = AgentStates(runMetadata.agentsPerNetwork)
+    //    val speakingBuffer1: AgentStates = AgentStates(runMetadata.agentsPerNetwork)
+    //    val speakingBuffer2: AgentStates = AgentStates(runMetadata.agentsPerNetwork)
     
     // Neighbors
     var neighborsRefs: Array[Int] = null // Size = -m^2 - m + 2mn or m(m-1) + (n - m) * 2m
@@ -96,13 +101,13 @@ class Network(networkId: UUID,
         finishState += 1
         neighborSaver = context.actorOf(Props(
             new NeighborSaver(numberOfAgentActors)
-            ), name = s"NeighborSaver${self.path.name}")
+        ), name = s"NeighborSaver${self.path.name}")
     }
     if (runMetadata.saveMode.includesAgents) {
         finishState += 1
         agentStaticDataSaver = context.actorOf(Props(
             new AgentStaticDataSaver(numberOfAgentActors, networkId)
-            ), name = s"StaticSaver_${self.path.name}")
+        ), name = s"StaticSaver_${self.path.name}")
     }
     var finishedIterating: Boolean = false
     var minBelief: Float = 2.0f
@@ -143,27 +148,14 @@ class Network(networkId: UUID,
                 val index = i
                 this.agents(i) = context.actorOf(Props(
                     new Agent(
-                        agentsIds,
-                        silenceStrategy,
-                        silenceEffect,
-                        runMetadata,
-                        beliefBuffer1,
-                        beliefBuffer2,
-                        speakingBuffer1,
-                        speakingBuffer2,
-                        privateBeliefs,
-                        tolRadius,
-                        tolOffset,
-                        indexOffset,
-                        timesStable,
-                        neighborsRefs,
-                        neighborsWeights,
-                        neighborBiases,
-                        networkId,
-                        agentsPerActor(index),
-                        bucketStart(index),
-                        names)
-                    ), s"${self.path.name}_A$i")
+                        agentsIds, silenceStrategy, silenceEffect, runMetadata,
+                        beliefBuffer1, beliefBuffer2, speakingBuffer1, speakingBuffer2,
+                        privateBeliefs, tolRadius, tolOffset, indexOffset,
+                        timesStable, neighborsRefs, neighborsWeights, neighborBiases,
+                        None, networkId, agentsPerActor(index), bucketStart(index),
+                        names
+                    )
+                ), s"${self.path.name}_A$i")
                 this.agents(i) ! MarkAsCustomRun
                 i += 1
             }
@@ -174,13 +166,13 @@ class Network(networkId: UUID,
                 val source: Int = agentMap.get(neighbor.source)
                 val target: Int = agentMap.get(neighbor.target)
                 
-                indexOffset(source) = i + 1 
+                indexOffset(source) = i + 1
                 neighborsRefs(i) = target
                 neighborsWeights(i) = neighbor.influence
                 neighborBiases(i) = neighbor.bias.toBiasCode
                 i += 1
             }
-
+            
             context.become(running)
             context.parent ! BuildingComplete(networkId)
         
@@ -192,10 +184,13 @@ class Network(networkId: UUID,
             neighborsWeights = new Array[Float](size)
             neighborBiases = new Array[Byte](size)
             
+            
             val fenwickTree = new FenwickTree(
                 runMetadata.agentsPerNetwork,
                 runMetadata.optionalMetaData.get.density.get,
-                runMetadata.optionalMetaData.get.degreeDistribution.get - 2)
+                runMetadata.optionalMetaData.get.degreeDistribution.get - 2,
+                runMetadata.seed
+            )
             
             // Create the Actors
             uuids.v7Bulk(agentsIds)
@@ -225,17 +220,19 @@ class Network(networkId: UUID,
                     j += 1
                 }
                 agentRemainingCount -= agentsPerActor(i)
+                val biasCounts = new mutable.HashMap[Byte, Int]()
+                agentBiases.foreach((key, value) => biasCounts.put(key, value))
                 // Create the agent actor
                 val index = i
                 agents(i) = context.actorOf(Props(
                     new Agent(
-                        agentsIds, 
-                        silenceStrategy, 
-                        silenceEffect, 
-                        runMetadata, 
-                        beliefBuffer1, 
+                        agentsIds,
+                        silenceStrategy,
+                        silenceEffect,
+                        runMetadata,
+                        beliefBuffer1,
                         beliefBuffer2,
-                        speakingBuffer1, 
+                        speakingBuffer1,
                         speakingBuffer2,
                         privateBeliefs,
                         tolRadius,
@@ -245,11 +242,12 @@ class Network(networkId: UUID,
                         neighborsRefs,
                         neighborsWeights,
                         neighborBiases,
+                        Some(biasCounts),
                         networkId,
                         agentsPerActor(index),
                         bucketStart(index),
                         null)
-                    ), s"${self.path.name}_A$i")
+                ), s"${self.path.name}_A$i")
                 i += 1
             }
             
@@ -355,37 +353,37 @@ class Network(networkId: UUID,
         case RunFirstRound =>
             pendingResponses -= 1
             if (pendingResponses == 0) {
-//                println(s"Round: $round")
-//                println(privateBeliefs.mkString("Private(", ", ", ")"))
-//                if (bufferSwitch) println(beliefBuffer2.mkString("Public(", ", ", ")"))
-//                else println(beliefBuffer1.mkString("Public(", ", ", ")"))
-//                println()
+                //                println(s"Round: $round")
+                //                println(privateBeliefs.mkString("Private(", ", ", ")"))
+                //                if (bufferSwitch) println(beliefBuffer2.mkString("Public(", ", ", ")"))
+                //                else println(beliefBuffer1.mkString("Public(", ", ", ")"))
+                //                println()
                 round += 1
                 runRound()
                 pendingResponses = agents.length
             }
-            
-        case AgentUpdated(maxActorBelief, minActorBelief, isStable) => 
+        
+        case AgentUpdated(maxActorBelief, minActorBelief, isStable) =>
             pendingResponses -= 1
             // If isStable true then we don't continue as we are stable
             if (!isStable) shouldContinue = true
             maxBelief = math.max(maxBelief, maxActorBelief)
             minBelief = math.min(minBelief, minActorBelief)
             if (pendingResponses == 0) {
-//                println(s"Round: $round")
-//                println(privateBeliefs.mkString("Private(", ", ", ")"))
-//                if (bufferSwitch) println(beliefBuffer2.mkString("Public(", ", ", ")"))
-//                else println(beliefBuffer1.mkString("Public(", ", ", ")"))
-//                if (bufferSwitch) println(speakingBuffer2.mkString("Speaking(", ", ", ")"))
-//                else println(speakingBuffer1.mkString("Speaking(", ", ", ")"))
-//                println()
-//                if (bufferSwitch) println(String.format("%32s", (speakingBuffer2.states(0) << 28).toBinaryString).replace(' ', '0').grouped(8).mkString(" "))
-//                else println(String.format("%32s", (speakingBuffer1.states(0) << 28).toBinaryString).replace(' ', '0').grouped(8).mkString(" "))
-//                println()
+                //                println(s"Round: $round")
+                //                println(privateBeliefs.mkString("Private(", ", ", ")"))
+                //                if (bufferSwitch) println(beliefBuffer2.mkString("Public(", ", ", ")"))
+                //                else println(beliefBuffer1.mkString("Public(", ", ", ")"))
+                //                if (bufferSwitch) println(speakingBuffer2.mkString("Speaking(", ", ", ")"))
+                //                else println(speakingBuffer1.mkString("Speaking(", ", ", ")"))
+                //                println()
+                //                if (bufferSwitch) println(String.format("%32s", (speakingBuffer2.states(0) << 28).toBinaryString).replace(' ', '0').grouped(8).mkString(" "))
+                //                else println(String.format("%32s", (speakingBuffer1.states(0) << 28).toBinaryString).replace(' ', '0').grouped(8).mkString(" "))
+                //                println()
                 
                 if ((maxBelief - minBelief) < runMetadata.stopThreshold) {
-//                    println(s"Consensus! \nFinal round: $round\n" +
-//                              s"Belief diff: of ${maxBelief - minBelief} ($maxBelief - $minBelief)")
+                    //                    println(s"Consensus! \nFinal round: $round\n" +
+                    //                              s"Belief diff: of ${maxBelief - minBelief} ($maxBelief - $minBelief)")
                     context.parent ! RunningComplete(networkId, round, 1)
                     if (runMetadata.saveMode.includesNetworks) DatabaseManager.updateNetworkFinalRound(networkId, round, true)
                     if (runMetadata.saveMode.includesLastRound) agents.foreach { agent => agent ! SnapShotAgent }
@@ -393,8 +391,8 @@ class Network(networkId: UUID,
                     finishedIterating = true
                 }
                 else if (round == runMetadata.iterationLimit || !shouldContinue) {
-//                    println(s"Dissensus \nFinal round: $round\n" +
-//                              s"Belief diff: of ${maxBelief - minBelief} ($maxBelief - $minBelief)")
+                    //                    println(s"Dissensus \nFinal round: $round\n" +
+                    //                              s"Belief diff: of ${maxBelief - minBelief} ($maxBelief - $minBelief)")
                     context.parent ! RunningComplete(networkId, round, 0)
                     if (runMetadata.saveMode.includesNetworks) DatabaseManager.updateNetworkFinalRound(networkId, round, false)
                     if (runMetadata.saveMode.includesLastRound) agents.foreach { agent => agent ! SnapShotAgent }
