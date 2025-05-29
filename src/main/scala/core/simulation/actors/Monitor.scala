@@ -5,7 +5,8 @@ import core.model.agent.behavior.silence.*
 import core.model.agent.behavior.bias.*
 import core.simulation.config.*
 import io.persistence.RoundRouter
-import utils.rng.distributions.Distribution
+import io.web.CustomRunInfo
+import utils.rng.distributions.{CustomDistribution, Distribution}
 import utils.timers.CustomMultiTimer
 
 import java.util.UUID
@@ -101,6 +102,8 @@ case class Neighbors(
     bias: CognitiveBiasType
 )
 
+case class RunCustomNetwork(customInfo: CustomRunInfo)
+
 case object RunComplete // Monitor -> Run
 
 // Actor
@@ -123,6 +126,27 @@ class Monitor extends Actor {
     val simulationTimers = new CustomMultiTimer
     
     def receive: Receive = {
+        case RunCustomNetwork(customInfo) =>
+            totalRuns += 1
+            
+            val runMetadata = RunMetadata(
+                RunMode.Custom,
+                customInfo.saveMode,
+                CustomDistribution,
+                System.currentTimeMillis(),
+                None,
+                None,
+                agentLimit,
+                1, 
+                customInfo.agentBeliefs.length, 
+                customInfo.iterationLimit, 
+                0,
+                customInfo.stopThreshold
+            )
+            val runActor = context.actorOf(Props(new Run(runMetadata, customInfo)), s"R$totalRuns")
+            activeRuns += (runActor.path.name -> (runActor, 1L, runMetadata.agentsPerNetwork))
+            simulationTimers.start(s"${runActor.path.name}")
+        
         case AddSpecificNetwork(agents, neighbors, distribution, saveMode, stopThreshold, iterationLimit, 
                                 name, recencyFunction) =>
             totalRuns += 1
@@ -139,7 +163,8 @@ class Monitor extends Actor {
                 optionalMetadata,
                 None,
                 agentLimit,
-                1, agents.length, iterationLimit, 0, stopThreshold)
+                1, agents.length, iterationLimit, 0, stopThreshold
+            )
             val actor = context.actorOf(Props(new Run(runMetadata, agents, neighbors, name)), s"R$totalRuns")
             activeRuns += (actor.path.name -> (actor, 1L, agents.length))
         

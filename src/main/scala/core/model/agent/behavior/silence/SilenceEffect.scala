@@ -4,14 +4,12 @@ import io.serialization.binary.Encoder
 trait SilenceEffect {
     def getPublicValue(belief: Float, isSpeaking: Boolean): Float
     def encodeOptionalValues(encoder: Encoder): Unit
-    def hasMemory: Int
 }
 
 class DeGrootSilenceEffect extends SilenceEffect {
     inline override def getPublicValue(belief: Float, isSpeaking: Boolean): Float = belief
     override def toString: String = "DeGroot"
     inline override def encodeOptionalValues(encoder: Encoder): Unit = {}
-    final def hasMemory: Int = 1
 }
 
 class MemoryEffect extends SilenceEffect {
@@ -29,7 +27,6 @@ class MemoryEffect extends SilenceEffect {
     @inline override def encodeOptionalValues(encoder: Encoder): Unit = {
         encoder.encodeFloat("publicBelief", publicBelief)
     }
-    final def hasMemory: Int = 1
 }
 
 class MemorylessEffect extends SilenceEffect {
@@ -37,7 +34,6 @@ class MemorylessEffect extends SilenceEffect {
     
     override def toString: String = "Memoryless"
     override def encodeOptionalValues(encoder: Encoder): Unit = {}
-    final def hasMemory: Int = 0
 }
 
 class RecencyEffect(recencyFunction: (Float, Int) => Float) extends SilenceEffect {
@@ -48,7 +44,6 @@ class RecencyEffect(recencyFunction: (Float, Int) => Float) extends SilenceEffec
     
     override def toString: String = "Recency"
     override def encodeOptionalValues(encoder: Encoder): Unit = {}
-    final def hasMemory: Int = 0
 }
 
 class PeersEffect(silenceEffect: SilenceEffect) extends SilenceEffect {
@@ -63,7 +58,6 @@ class PeersEffect(silenceEffect: SilenceEffect) extends SilenceEffect {
     
     override def toString: String = "Peers"
     override def encodeOptionalValues(encoder: Encoder): Unit = {}
-    final def hasMemory: Int = 0
 }
 
 enum SilenceEffectType:
@@ -95,9 +89,12 @@ object SilenceEffectType{
 }
     
 object SilenceEffectFactory:
-    def create(effectType: SilenceEffectType): SilenceEffect = effectType match
-        case SilenceEffectType.DeGroot => DeGrootSilenceEffect()
-        case SilenceEffectType.Memory => MemoryEffect()
-        case SilenceEffectType.Memoryless => MemorylessEffect()
-        case SilenceEffectType.Recency(recencyFunction) => RecencyEffect(recencyFunction)
-        case SilenceEffectType.Peers(baseEffect) => PeersEffect(create(baseEffect))
+    def create(effectType: SilenceEffectType): (SilenceEffect, Byte) = effectType match
+        case SilenceEffectType.DeGroot => (DeGrootSilenceEffect(), 1)
+        case SilenceEffectType.Memory => (MemoryEffect(), 1)
+        case SilenceEffectType.Memoryless => (MemorylessEffect(), 0)
+        case SilenceEffectType.Recency(recencyFunction) => (RecencyEffect(recencyFunction), 1)
+        case SilenceEffectType.Peers(baseEffect) =>
+            val effect = create(baseEffect)
+            (PeersEffect(effect._1), effect._2)
+        

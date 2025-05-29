@@ -6,6 +6,7 @@ import core.model.agent.behavior.silence.*
 import core.simulation.config.RunMode
 import io.db.DatabaseManager
 import io.persistence.RoundRouter
+import io.web.CustomRunInfo
 import utils.datastructures.UUIDS
 import utils.rng.distributions.CustomDistribution
 import utils.timers.CustomMultiTimer
@@ -89,6 +90,37 @@ class Run extends Actor {
     var totalLoaded: Int = 0
     val preFetchThreshold: Float = 0.75
     
+    // Run a custom network
+    def this (runMetadata: RunMetadata, customRunInfo: CustomRunInfo) = {
+        this()
+        
+        globalTimers.start(s"Total_time")
+        
+        runMetadata.runId = if (runMetadata.saveMode.savesToDB) DatabaseManager.createRun(
+            runMetadata.runMode, runMetadata.saveMode, 1, None, None, 
+            runMetadata.stopThreshold, runMetadata.iterationLimit,
+            CustomDistribution.toString
+        ) else Option(1)
+        
+        this.runMetadata = runMetadata
+        globalTimers.start("Building")
+        val networkId: UUID = uuids.v7()
+        val network = context.actorOf(
+            Props(new Network(networkId, runMetadata, null, null)) // customRunInfo.networkName
+        )
+        if (runMetadata.saveMode.includesNetworks) {
+            DatabaseManager.createNetwork(networkId, customRunInfo.networkName, runMetadata.runId.get, 
+                runMetadata.agentsPerNetwork)
+        }
+        networks = Array(network)
+        BuildMessage = BuildCustomNetwork(customRunInfo)
+        loadType = LoadType.NoLoad
+        networkRunTimes = Array.fill[Long](1)(-1L)
+        networkBuildTimes = Array.fill[Long](1)(-1L)
+        buildingTimers.start(network.path.name)
+        calculateBatches()
+    }
+    
     // Run a specific network
     def this(
         runMetadata: RunMetadata,
@@ -101,29 +133,19 @@ class Run extends Actor {
         globalTimers.start(s"Total_time")
         
         runMetadata.runId = if (runMetadata.saveMode.savesToDB) DatabaseManager.createRun(
-            runMetadata.runMode,
-            runMetadata.saveMode,
-            1,
-            None,
-            None,
-            runMetadata.stopThreshold,
-            runMetadata.iterationLimit,
+            runMetadata.runMode, runMetadata.saveMode, 1, None, None,
+            runMetadata.stopThreshold, runMetadata.iterationLimit,
             CustomDistribution.toString
             ) else Option(1)
         
         this.runMetadata = runMetadata
         globalTimers.start("Building")
         val networkId: UUID = uuids.v7()
-        val network = context.actorOf(Props(new Network(
-            networkId,
-            runMetadata,
-            null,
-            null
-            )), name)
+        val network = context.actorOf(Props(new Network(networkId, runMetadata, null, null)), name)
         if (runMetadata.saveMode.includesNetworks)
             DatabaseManager.createNetwork(networkId, name, runMetadata.runId.get, agents.length)
         networks = Array(network)
-        BuildMessage = BuildCustomNetwork(agents, neighbors)
+        BuildMessage = BuildSpecificNetwork(agents, neighbors)
         loadType = LoadType.NoLoad
         buildingTimers.start(network.path.name)
         calculateBatches()

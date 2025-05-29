@@ -42,6 +42,7 @@ object CognitiveBiases {
     // x - (x * math.abs(x) * e2)
     val confirmation: BiasFunction = x => x - (x * math.abs(x) * INV_EPSILON_PLUS_ONE)
     
+    // -x^3
     val backfire: BiasFunction = x => -x * (x * x)
     
     // Authority

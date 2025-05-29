@@ -30,6 +30,11 @@ object Main extends App {
 //    val numberOfNetworks = 1
 //    val numberOfAgents = 4 /// 4_194_304 2_097_152 1_048_576
 //
+//    Header
+//
+
+
+
 //    monitor ! AddNetworks(
 //        agentTypeCount = Array((SilenceStrategyType.Majority, SilenceEffectType.Memoryless, numberOfAgents)), // .Confidence(0.001, 1)
 //        agentBiases = Array((CognitiveBiasType.DeGroot, 1.0f)),
@@ -55,6 +60,30 @@ object Main extends App {
 //        degreeDistribution = 2.5f,
 //        stopThreshold = 0.001f
 //        )
+    
+    
+    //      Header
+    //      StopThreshold 4 bytes
+    //      iteration limit 4 bytes
+    //      name string 0 bytes to 64 bytes (0-64 characters name)
+    //      SaveMode 1 byte
+    //
+    //      padding to start at 4 byte boundary
+    //      Agent initial state varying length part
+    //      initialBelief   f32 4 bytes
+    //      toleranceRadius f32 4 bytes
+    //      toleranceOffset f32 4 bytes
+    //      silenceStrategy i8  1 byte
+    //      silenceEffect   i8  1 byte
+    //      2 padding bytes, meaning 16 bytes per round
+    //
+    //      neighbors
+    //      source    str 1-32 characters
+    //      target    srt 1-32 characters
+    //      influence f32 4 bytes
+    //      bias      i8  1 byte
+    //
+    //      w
     
     //DatabaseManager.exportToMaudeTXT(s"${numberOfAgents}_agents_memoryless.txt", numberOfAgents)
 //    val customRun = AddSpecificNetwork(
