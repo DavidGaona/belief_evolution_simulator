@@ -312,7 +312,7 @@ class Network(networkId: UUID,
             // Link the first n=density agents
             var count = 0
             i = 0
-            while (i < density + 1) { // 
+            while (i < density + 1) { 
                 var j = 0
                 while (j < (density + 1)) {
                     if (j != i) {
@@ -407,11 +407,11 @@ class Network(networkId: UUID,
         case RunFirstRound =>
             pendingResponses -= 1
             if (pendingResponses == 0) {
-                println(s"Round: $round")
-                println(privateBeliefs.mkString("Private(", ", ", ")"))
-                if (bufferSwitch) println(beliefBuffer2.mkString("Public(", ", ", ")"))
-                else println(beliefBuffer1.mkString("Public(", ", ", ")"))
-                println()
+//                println(s"Round: $round")
+//                println(privateBeliefs.mkString("Private(", ", ", ")"))
+//                if (bufferSwitch) println(beliefBuffer2.mkString("Public(", ", ", ")"))
+//                else println(beliefBuffer1.mkString("Public(", ", ", ")"))
+//                println()
                 round += 1
                 runRound()
                 pendingResponses = agents.length
@@ -424,13 +424,13 @@ class Network(networkId: UUID,
             maxBelief = math.max(maxBelief, maxActorBelief)
             minBelief = math.min(minBelief, minActorBelief)
             if (pendingResponses == 0) {
-                println(s"Round: $round")
-                println(privateBeliefs.mkString("Private(", ", ", ")"))
-                if (bufferSwitch) println(beliefBuffer2.mkString("Public(", ", ", ")"))
-                else println(beliefBuffer1.mkString("Public(", ", ", ")"))
-                if (bufferSwitch) println(speakingBuffer2.mkString("Speaking(", ", ", ")"))
-                else println(speakingBuffer1.mkString("Speaking(", ", ", ")"))
-                println()
+//                println(s"Round: $round")
+//                println(privateBeliefs.mkString("Private(", ", ", ")"))
+//                if (bufferSwitch) println(beliefBuffer2.mkString("Public(", ", ", ")"))
+//                else println(beliefBuffer1.mkString("Public(", ", ", ")"))
+//                if (bufferSwitch) println(speakingBuffer2.mkString("Speaking(", ", ", ")"))
+//                else println(speakingBuffer1.mkString("Speaking(", ", ", ")"))
+//                println()
                 //                if (bufferSwitch) println(String.format("%32s", (speakingBuffer2.states(0) << 28).toBinaryString).replace(' ', '0').grouped(8).mkString(" "))
                 //                else println(String.format("%32s", (speakingBuffer1.states(0) << 28).toBinaryString).replace(' ', '0').grouped(8).mkString(" "))
                 //                println()

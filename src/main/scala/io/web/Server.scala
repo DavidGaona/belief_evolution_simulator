@@ -7,7 +7,7 @@ import akka.http.scaladsl.model.headers.*
 import akka.http.scaladsl.model.ws.{BinaryMessage, Message}
 import akka.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCodes}
 import akka.http.scaladsl.server.Directives.*
-import akka.http.scaladsl.server.Route
+import akka.http.scaladsl.server.{Directive0, Route}
 import akka.http.scaladsl.unmarshalling.{FromEntityUnmarshaller, Unmarshaller}
 import akka.stream.Materializer
 import akka.stream.scaladsl.{BroadcastHub, Flow, Keep, MergeHub, Sink, Source}
@@ -50,6 +50,7 @@ object BinaryProtocol {
 }
 
 object Server {
+    
     import BinaryProtocol.*
     
     private var initialized = false
@@ -72,75 +73,87 @@ object Server {
           .toMat(BroadcastHub.sink[Message])(Keep.both)
           .run()
         
-        // Store the sink for later use
         messagePublisher = Some(sink)
         
         // Create a WebSocket flow that will handle our WebSocket connections
         val websocketFlow = Flow.fromSinkAndSourceMat(
             Sink.ignore, // Ignore incoming messages from clients
-            source       // Broadcast our messages to all clients
+            source // Broadcast our messages to all clients
         )(Keep.right)
         
-        // CORS headers
+        // Enhanced CORS headers
         val corsResponseHeaders = List(
             `Access-Control-Allow-Origin`.*,
             `Access-Control-Allow-Methods`(POST, GET, OPTIONS),
-            `Access-Control-Allow-Headers`("Content-Type", "Authorization", "X-Requested-With")
+            `Access-Control-Allow-Headers`("Content-Type", "Authorization", "X-Requested-With", "Accept", "Origin"),
+            `Access-Control-Max-Age`(86400), // 24 hours preflight cache
+            `Access-Control-Allow-Credentials`(false)
         )
         
-        // CORS handler
-        val corsHandler: Route = options {
-            complete(HttpResponse(StatusCodes.OK).withHeaders(corsResponseHeaders))
+        // Enhanced CORS directive that applies to all routes
+        def addCorsHeaders: Directive0 = {
+            respondWithHeaders(corsResponseHeaders)
         }
         
-        // WebSocket route
-        val webSocketRoute: Route =
+        // Universal CORS preflight handler
+        val corsHandler: Route = addCorsHeaders {
+            options {
+                complete(HttpResponse(StatusCodes.OK))
+            }
+        }
+        
+        val webSocketRoute: Route = addCorsHeaders {
             path("ws") {
                 get {
-                    handleWebSocketMessages(websocketFlow)
+                    optionalHeaderValueByName("Origin") { origin =>
+                        // ToDo add origin validation here
+                        handleWebSocketMessages(websocketFlow)
+                    }
                 }
             }
+        }
         
-        // API route
-        val apiRoute: Route = respondWithHeaders(corsResponseHeaders) {
-            post {
-                pathPrefix("run") {
+        val apiRoute: Route = addCorsHeaders {
+            pathPrefix("run") {
+                post {
                     entity(as[Payload]) { payload =>
                         runGeneratedRun(payload.data)
                         complete(s"Received payload successfully")
                     }
                 }
-                
-                pathPrefix("custom") {
-                    entity(as[Payload]) { payload =>
-                        runCustomRun(payload.data)
-                        complete(s"Received payload successfully")
-                    }
-                }
-            }
+            } ~
+              pathPrefix("custom") {
+                  post {
+                      entity(as[Payload]) { payload =>
+                          parseCustomRun(payload.data)
+                          complete(s"Received payload successfully")
+                      }
+                  }
+              }
         }
         
-        // Home page route
-        val homeRoute: Route =
+        val homeRoute: Route = addCorsHeaders {
             pathEndOrSingleSlash {
                 get {
                     complete(HttpEntity(ContentTypes.`text/html(UTF-8)`,
                         """
                           |<html>
+                          |  <head>
+                          |    <title>Simulation Server</title>
+                          |  </head>
                           |  <body>
                           |    <h1>Simulation Server</h1>
                           |    <p>API endpoint: POST /run</p>
+                          |    <p>Custom API endpoint: POST /custom</p>
                           |    <p>WebSocket endpoint: ws://localhost:8080/ws</p>
                           |  </body>
                           |</html>
-                        """.stripMargin))
+                            """.stripMargin))
                 }
             }
+        }
         
-        // Combine all routes with CORS
         val routes: Route = corsHandler ~ webSocketRoute ~ apiRoute ~ homeRoute
-        
-        // Bind to port - using one port for both services
         val bindingFuture = Http().newServerAt("0.0.0.0", 8080).bind(routes)
         
         bindingFuture.onComplete {
@@ -148,6 +161,7 @@ object Server {
                 val address = binding.localAddress
                 println(s"Server online at http://${address.getHostString}:${address.getPort}/")
                 println(s"API endpoint: http://${address.getHostString}:${address.getPort}/run")
+                println(s"Custom API endpoint: http://${address.getHostString}:${address.getPort}/custom")
                 println(s"WebSocket endpoint: ws://${address.getHostString}:${address.getPort}/ws")
             case scala.util.Failure(ex) =>
                 println(s"Failed to bind server: ${ex.getMessage}")
@@ -264,7 +278,7 @@ object Server {
         )
     }
     
-    private def runCustomRun(data: Array[Byte]): Unit = {
+    private def parseCustomRun(data: Array[Byte]): Unit = {
         // Header
         val stopThreshold = bytesToFloat(data, 0)
         val iterationLimit = bytesToInt(data, 4)
@@ -310,7 +324,6 @@ object Server {
             agentIndexes.put(agentNames(i), i)
             offset += strByteLength
         }
-        println(s"All agentNames: ${agentNames.mkString("[", ", ", "]")}")
         
         // Align to 4 bytes
         while (offset % 4 != 0) offset += 1
@@ -318,7 +331,6 @@ object Server {
         // Neighbor section
         val numberOfNeighbors = bytesToInt(data, offset)
         
-        println(s"numberOfNeighbors: $numberOfNeighbors")
         offset += 4
         
         val influences = byteArrayToFloatArray(data, offset, numberOfNeighbors)
@@ -345,7 +357,6 @@ object Server {
             offset += strByteLength
         }
         
-        // tuple (name, index)
         val sortedIndices = source.indices.sortBy(source(_))
         
         val sortedInfluences = sortedIndices.map(influences(_)).toArray

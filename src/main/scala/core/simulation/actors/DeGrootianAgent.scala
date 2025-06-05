@@ -149,7 +149,7 @@ class Agent(
                 val radius = tolRadius(i)
                 tolRadius(i) = math.min(1f, radius + tolOffset(i)) // Become upper
                 tolOffset(i) = math.max(0f, tolOffset(i) - radius) // Become lower
-                println(s"New radius: ${tolRadius(i)}, new offset(lower): ${tolOffset(i)}")
+                // println(s"New radius: ${tolRadius(i)}, new offset(lower): ${tolOffset(i)}")
                 if (runMetadata.saveMode.includesNeighbors) {
                     var j = indexOffset(math.max(0, i - 1))
                     while (j < indexOffset(i)) {
@@ -348,7 +348,7 @@ class Agent(
             //print(s"= ${belief(i)}\n")
             
             // Handle speaking and belief buffer updates
-            println(s"For: $inFavor, Against: $against")
+            // println(s"For: $inFavor, Against: $against")
             val isSpeaking = silenceStrategy(i).determineSilence(inFavor, against)
             writeSpeakingBuffer(i) = isSpeaking
             writeBeliefBuffer(i) = silenceEffect(i).getPublicValue(belief(i), isSpeaking == 1)
@@ -375,7 +375,7 @@ class Agent(
         // (D - L | U - D) >>> 31, mask yields 1 for against 0 for in favor
         val mask = (java.lang.Float.floatToRawIntBits(beliefDifference - lower) |
           java.lang.Float.floatToRawIntBits(upper - beliefDifference)) >>> 31
-        println(s"Mask: $mask, status: $speaking, upper: $upper, lower: $lower, diff: $beliefDifference")
+        // println(s"Mask: $mask, status: $speaking, upper: $upper, lower: $lower, diff: $beliefDifference")
         against += mask & speaking
         inFavor += (mask ^ 1) & speaking
     }
@@ -469,49 +469,8 @@ class Agent(
             j = indexOffset(i - 1)
         }
         
-        
-        // In-place Fisher-Yates shuffle
-        //        val startIdx = if (startsAt != 0) indexOffset(startsAt - 1) else 0
-        //        val endIdx = indexOffset(startsAt + numberOfAgents - 1)
-        //
-        //        var idx = endIdx - 1
-        //        while (idx > startIdx) {
-        //            val j = startIdx + random.nextInt(idx - startIdx + 1)
-        //            val temp = neighborBiases(idx)
-        //            neighborBiases(idx) = neighborBiases(j)
-        //            neighborBiases(j) = temp
-        //            idx -= 1
-        //        }
-        
-        // Now re-order in memory
-        //        var indexShuffle = Array(0, 1, 2, 3, 4)
-        //        i = startsAt
-        //        while (i < (startsAt + numberOfAgents - 1)) {
-        //            var j = if (i != 0) indexOffset(i - 1) else 0
-        //            if (neighborBiases(j) != neighborBiases(indexOffset(i))) {
-        //                val counts = new Array[Int](5)
-        //                while (j < indexOffset(i)) {
-        //                    counts(neighborBiases(j)) += 1
-        //                    j += 1
-        //                }
-        //
-        //                j -= indexOffset(i)
-        //                var index = 0
-        //                indexShuffle = random.shuffle(indexShuffle)
-        //                while (j < indexOffset(i)) {
-        //                    while (counts(indexShuffle(index)) == 0) {
-        //                        index += 1
-        //                    }
-        //                    neighborBiases(j) = index.toByte
-        //                    counts(indexShuffle(index)) -= 1
-        //                    j += 1
-        //                }
-        //            }
-        //            i += 1
-        //        }
-        
         hasUpdatedInfluences = true
-        println(s"seed: ${runMetadata.seed}")
+//        println(s"seed: ${runMetadata.seed}")
 //        println(indexOffset.mkString("offset(", ", ", ")"))
 //        println(neighborsRefs.mkString("Neighbors(", ", ", ")"))
 //        println(neighborsWeights.mkString("Influences(", ", ", ")"))

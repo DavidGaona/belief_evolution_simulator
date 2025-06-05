@@ -24,7 +24,7 @@ class UUIDS {
         val timestamp = System.currentTimeMillis
         val version = 0x7000
         val variant = 0b10L << 62
-        val high = (timestamp << 12) | version | (rand.xoshiro256StarStar() & 0x3FF)
+        val high = (timestamp << 12) | version | (rand.xoshiro256StarStar() & 0xFFF)
         val low = (rand.xoshiro256StarStar() >>> 2) | variant
         UUID(high, low)
     }
@@ -35,7 +35,7 @@ class UUIDS {
         val version = 0x7000
         val variant = 0b10L << 62
         while (i < uuidsArr.length) {
-            uuidsArr(i) = (timestamp << 12) | version | (rand.xoshiro256StarStar() & 0x3FF)
+            uuidsArr(i) = (timestamp << 16) | version | (rand.xoshiro256StarStar() & 0xFFF) 
             uuidsArr(i + 1) = (rand.xoshiro256StarStar() >>> 2) | variant
             timestamp += 1
             i += 2
@@ -48,7 +48,7 @@ class UUIDS {
         val version = 0x7000
         val variant = 0b10L << 62
         while (i < uuidsArr.length) {
-            val high = (timestamp << 12) | version | (rand.xoshiro256StarStar() & 0x3FF)
+            val high = (timestamp << 16) | version | (rand.xoshiro256StarStar() & 0xFFF) // 0x3FF
             val low = (rand.xoshiro256StarStar() >>> 2) | variant
             uuidsArr(i) = UUID(high, low)
             timestamp += 1
