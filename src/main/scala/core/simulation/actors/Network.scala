@@ -4,14 +4,19 @@ import akka.actor.{Actor, ActorRef, Props}
 import akka.util.Timeout
 import core.model.agent.behavior.silence.*
 import io.db.DatabaseManager
+import io.web.Server
 import io.persistence.actors.{AgentStaticDataSaver, NeighborSaver}
 import io.web.CustomRunInfo
 import utils.datastructures.{FenwickTree, UUIDS}
 import utils.rng.distributions.BimodalDistribution
 
+import java.io.PrintWriter
+import java.net.InetAddress
+import java.nio.ByteBuffer
 import java.util.UUID
 import scala.collection.mutable
 import scala.concurrent.duration.*
+import scala.util.Using
 // Network
 
 // Messages
@@ -281,28 +286,11 @@ class Network(networkId: UUID,
                 val index = i
                 agents(i) = context.actorOf(Props(
                     new Agent(
-                        agentsIds,
-                        silenceStrategy,
-                        silenceEffect,
-                        runMetadata,
-                        beliefBuffer1,
-                        beliefBuffer2,
-                        speakingBuffer1,
-                        speakingBuffer2,
-                        privateBeliefs,
-                        tolRadius,
-                        tolOffset,
-                        indexOffset,
-                        timesStable,
-                        neighborsRefs,
-                        neighborsWeights,
-                        neighborBiases,
-                        hasMemory,
-                        Some(biasCounts),
-                        networkId,
-                        agentsPerActor(index),
-                        bucketStart(index),
-                        null
+                        agentsIds, silenceStrategy, silenceEffect, runMetadata,
+                        beliefBuffer1, beliefBuffer2, speakingBuffer1, speakingBuffer2,
+                        privateBeliefs, tolRadius, tolOffset, indexOffset, timesStable, 
+                        neighborsRefs, neighborsWeights, neighborBiases, hasMemory,
+                        Some(biasCounts), networkId, agentsPerActor(index), bucketStart(index), null
                     )
                 ), s"${self.path.name}_A$i")
                 i += 1
@@ -386,6 +374,11 @@ class Network(networkId: UUID,
                 i += 1
             }
             
+            // var neighborsRefs: Array[Int] = null // Size = -m^2 - m + 2mn or m(m-1) + (n - m) * 2m
+            //    var neighborsWeights: Array[Float] = null
+            //    var neighborBiases: Array[Byte] = null
+            //    val indexOffset: Array[Int] = new Array[Int](runMetadata.agentsPerNetwork)
+            
             context.become(running)
             context.parent ! BuildingComplete(networkId)
         
@@ -413,6 +406,22 @@ class Network(networkId: UUID,
 //                else println(beliefBuffer1.mkString("Public(", ", ", ")"))
 //                println()
                 round += 1
+                //sendNeighbors()
+//                Using(new PrintWriter("agent_influences.csv")) { writer =>
+//                    // Write CSV header
+//                    writer.println("From,To,Influence")
+//
+//                    var i = 0
+//                    var j = 0
+//                    while (i < runMetadata.agentsPerNetwork) {
+//                        while (j < indexOffset(i)) {
+//                            println(s"From Agent${neighborsRefs(j)}, to Agent$i, influence:${neighborsWeights(j)}")
+//                            writer.println(s"Agent${neighborsRefs(j)},Agent$i,${neighborsWeights(j)}")
+//                            j += 1
+//                        }
+//                        i += 1
+//                    }
+//                }
                 runRound()
                 pendingResponses = agents.length
             }
@@ -434,7 +443,7 @@ class Network(networkId: UUID,
                 //                if (bufferSwitch) println(String.format("%32s", (speakingBuffer2.states(0) << 28).toBinaryString).replace(' ', '0').grouped(8).mkString(" "))
                 //                else println(String.format("%32s", (speakingBuffer1.states(0) << 28).toBinaryString).replace(' ', '0').grouped(8).mkString(" "))
                 //                println()
-                
+                println(s"Round: $round, Max: $maxBelief, Min: $minBelief")
                 if ((maxBelief - minBelief) < runMetadata.stopThreshold) {
                     //                    println(s"Consensus! \nFinal round: $round\n" +
                     //                              s"Belief diff: of ${maxBelief - minBelief} ($maxBelief - $minBelief)")
@@ -531,4 +540,28 @@ class Network(networkId: UUID,
         agents(i)
     }
     
+    private def sendNeighbors(): Unit = {
+        // NetworkId
+        // RunId
+        // Number of agents
+        // Number of neighbors
+        val numberOfAgents = indexOffset.length
+        val numberOfNeighbors = neighborsRefs.length
+        val buffer = ByteBuffer.allocate(24 + (numberOfAgents * 4) + (numberOfNeighbors * 8))
+        
+        // Header 28 bytes
+        buffer.putLong(networkId.getMostSignificantBits)
+        buffer.putLong(networkId.getLeastSignificantBits)
+        buffer.putInt(runMetadata.runId.get)
+        buffer.putInt(indexOffset.length)
+        buffer.putInt(neighborsRefs.length)
+        
+        // Body variable bytes
+        buffer.asIntBuffer().put(indexOffset)
+        buffer.asIntBuffer().put(neighborsRefs)
+        buffer.asFloatBuffer().put(neighborsWeights)
+        // buffer.put(neighborBiases)
+       
+        Server.sendNeighborBinaryData(runMetadata.channelId, buffer)
+    }
 }

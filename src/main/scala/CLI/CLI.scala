@@ -254,6 +254,7 @@ class CLI(system: ActorSystem, monitor: ActorRef) {
                     println(s"Starting generated run with $numNetworks networks, density $density...")
                     
                     monitor ! AddNetworks(
+                        channelId = "1",
                         agentTypeCount = agentTypeCount.toArray,
                         agentBiases = Array((0.toByte, 0)),
                         distribution = Uniform,

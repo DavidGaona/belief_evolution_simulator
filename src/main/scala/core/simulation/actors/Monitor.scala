@@ -18,6 +18,7 @@ import scala.collection.mutable.ArrayBuffer
 // Containers
 
 case class RunMetadata(
+    channelId: String,
     runMode: RunMode,
     saveMode: SaveMode,
     distribution: Distribution,
@@ -42,6 +43,7 @@ case class OptionalMetadata(
 case object GetStatus
 
 case class AddNetworks(
+    channelId: String,
     agentTypeCount: Array[(SilenceStrategyType, SilenceEffectType, Int)],
     agentBiases: Array[(Byte, Int)],
     distribution: Distribution,
@@ -107,8 +109,18 @@ case class RunCustomNetwork(customInfo: CustomRunInfo)
 case object RunComplete // Monitor -> Run
 
 // Actor
+
+/**
+ * Monitor actor.
+ * The actor in charge of allocating and coordinating runs, it receives the input from
+ * the user and acts accordingly. This is the sole point of communication between user
+ * input and the actor system. It handles the 3 types of RunMode s. Termination of this
+ * actor means termination of the entire system. The system is composed of the hierarchy:
+ * Monitor -> Run -> Network -> DeGrootianAgentManager
+ * */
 class Monitor extends Actor {
-    // Limits
+    // Memory Limits
+    var memoryLeft: Long = (Runtime.getRuntime.maxMemory() * 0.95).toLong
     val agentLimit: Int = 16_777_216 // 16_777_216 10_485_760 4_194_304 1_048_576 8_388_608 2_097_152
     var currentUsage: Int = agentLimit
     
@@ -117,7 +129,7 @@ class Monitor extends Actor {
     RoundRouter.setSavers(context, saveThreshold)
     
     // Runs
-    val activeRuns: mutable.HashMap[String, (ActorRef, Long, Long)] = mutable.HashMap.empty[String, (ActorRef, Long, Long)]
+    val activeRuns: mutable.HashMap[String, (ActorRef, Long)] = mutable.HashMap.empty[String, (ActorRef, Long)]
     var totalRuns: Int = 0
     var totalActiveNetworks: Long = 0L
     var totalActiveAgents: Long = 0L
@@ -130,6 +142,7 @@ class Monitor extends Actor {
             totalRuns += 1
             
             val runMetadata = RunMetadata(
+                customInfo.channelId,
                 RunMode.Custom,
                 customInfo.saveMode,
                 CustomDistribution,
@@ -144,50 +157,37 @@ class Monitor extends Actor {
                 customInfo.stopThreshold
             )
             val runActor = context.actorOf(Props(new Run(runMetadata, customInfo)), s"R$totalRuns")
-            activeRuns += (runActor.path.name -> (runActor, 1L, runMetadata.agentsPerNetwork))
+            trackRunMemory(runActor, 1, customInfo.agentBeliefs.length, customInfo.target.length)
             simulationTimers.start(s"${runActor.path.name}")
         
-        case AddSpecificNetwork(agents, neighbors, distribution, saveMode, stopThreshold, iterationLimit, 
-                                name, recencyFunction) =>
-            totalRuns += 1
-            val optionalMetadata = {
-                if (recencyFunction.isEmpty) None
-                else Some(OptionalMetadata(recencyFunction, None, None))
-            }
-            
-            val runMetadata = RunMetadata(
-                RunMode.Custom,
-                saveMode,
-                distribution,
-                System.currentTimeMillis(),
-                optionalMetadata,
-                None,
-                agentLimit,
-                1, agents.length, iterationLimit, 0, stopThreshold
-            )
-            val actor = context.actorOf(Props(new Run(runMetadata, agents, neighbors, name)), s"R$totalRuns")
-            activeRuns += (actor.path.name -> (actor, 1L, agents.length))
+//        case AddSpecificNetwork(agents, neighbors, distribution, saveMode, stopThreshold, iterationLimit, 
+//                                name, recencyFunction) =>
+//            totalRuns += 1
+//            val optionalMetadata = {
+//                if (recencyFunction.isEmpty) None
+//                else Some(OptionalMetadata(recencyFunction, None, None))
+//            }
+//            
+//            val runMetadata = RunMetadata(
+//                RunMode.Custom,
+//                saveMode,
+//                distribution,
+//                System.currentTimeMillis(),
+//                optionalMetadata,
+//                None,
+//                agentLimit,
+//                1, agents.length, iterationLimit, 0, stopThreshold
+//            )
+//            val actor = context.actorOf(Props(new Run(runMetadata, agents, neighbors, name)), s"R$totalRuns")
+//            trackRunMemory(actor, 1, agents.length, neighbors.length)
+
         
-        case RunComplete =>
-            println("\nThe run has been complete\n")
-            val senderActor = sender().path.name
-            simulationTimers.stop(senderActor)
-            totalActiveNetworks -= activeRuns(senderActor)._2
-            totalActiveAgents -= activeRuns(senderActor)._3
-            activeRuns -= senderActor
-            
-        case GetStatus =>
-            println(f"\nTotal runs: $totalRuns\n" +
-                      f"Active runs: ${activeRuns.size}\n" +
-                      f"Total active networks: $totalActiveNetworks\n" +
-                      f"Total active agents: $totalActiveAgents\n")
-        
-        case AddNetworks(agentTypeCount, agentBiases, distribution, saveMode, recencyFunction, numberOfNetworks,
-                         density, iterationLimit, seed, degreeDistribution, stopThreshold) =>
+        case AddNetworks(channelId, agentTypeCount, agentBiases, distribution, saveMode, recencyFunction, numberOfNetworks,
+        density, iterationLimit, seed, degreeDistribution, stopThreshold) =>
             val optionalMetadata = Some(OptionalMetadata(recencyFunction, Some(density), Some(degreeDistribution)))
-            // Here we transform the seed to some random seed based on the current time and some run parameters
             val revisedSeed: Long = if (seed.isEmpty) System.nanoTime() + numberOfNetworks + agentBiases(0)._2 else seed.get
             val runMetadata = RunMetadata(
+                channelId,
                 RunMode.Generated,
                 saveMode,
                 distribution,
@@ -197,20 +197,48 @@ class Monitor extends Actor {
                 agentLimit,
                 numberOfNetworks, agentTypeCount.map(_._3).sum, iterationLimit, revisedSeed, stopThreshold)
             totalRuns += 1
-            totalActiveNetworks += runMetadata.numberOfNetworks
-            totalActiveAgents += runMetadata.agentsPerNetwork * runMetadata.numberOfNetworks
+            val n = runMetadata.agentsPerNetwork
+            val m = density
             
             val actor = context.actorOf(Props(new Run(runMetadata, agentTypeCount, agentBiases)), s"R$totalRuns")
-            activeRuns += (actor.path.name -> (actor, runMetadata.numberOfNetworks,
-              runMetadata.agentsPerNetwork * runMetadata.numberOfNetworks))
+            val numberOfNeighbors = (m * (m-1)) + (n - m) * (2 * m)
+            trackRunMemory(actor, numberOfNetworks, runMetadata.agentsPerNetwork, numberOfNeighbors)
+            
             simulationTimers.start(s"${actor.path.name}")
             actor ! StartRun
+            
+        case RunComplete =>
+            println("\nThe run has been complete\n")
+            val senderActor = sender().path.name
+            simulationTimers.stop(senderActor)
+            memoryLeft += activeRuns(senderActor)._2
+            activeRuns -= senderActor
+            
+        case GetStatus =>
+            println(f"\nTotal runs: $totalRuns\n" +
+                      f"Active runs: ${activeRuns.size}\n" +
+                      f"Total active networks: $totalActiveNetworks\n" +
+                      f"Total active agents: $totalActiveAgents\n")
             
             
     }
     
-    def reBalanceUsage(): Unit = {
+    
+    private def trackRunMemory(runActor: ActorRef, numberOfNetworks: Int, agentsPerNetwork: Int, neighborsPerNetwork: Int):
+    Unit = {
+        // 64 bytes per agent
+        // 9 bytes per neighbor
+        // 95% memory max
+        val runMemoryUsage = (numberOfNetworks * agentsPerNetwork * 64) +
+          (numberOfNetworks * neighborsPerNetwork * 9)
         
+        if (memoryLeft >= runMemoryUsage) {
+        
+        } else {
+            println(s"Exceeding memory limits: ${memoryLeft}")
+        }
+        memoryLeft -= runMemoryUsage
+        activeRuns += (runActor.path.name -> (runActor, runMemoryUsage))
     }
     
     

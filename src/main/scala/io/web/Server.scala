@@ -12,17 +12,20 @@ import akka.http.scaladsl.unmarshalling.{FromEntityUnmarshaller, Unmarshaller}
 import akka.stream.Materializer
 import akka.stream.scaladsl.{BroadcastHub, Flow, Keep, MergeHub, Sink, Source}
 import akka.util.ByteString
+import akka.http.scaladsl.marshallers.sprayjson.SprayJsonSupport._
 import core.model.agent.behavior.silence.{SilenceEffectType, SilenceStrategyType}
 import core.simulation.actors.{AddNetworks, RunCustomNetwork}
 import core.simulation.config.*
+import io.db.DatabaseManager
 import utils.rng.distributions.Uniform
 
 import java.nio.{ByteBuffer, ByteOrder}
 import scala.collection.mutable
-import scala.concurrent.ExecutionContextExecutor
+import scala.concurrent.{ExecutionContext, ExecutionContextExecutor}
 
 // Data containers:
 case class CustomRunInfo(
+    channelId: String,
     stopThreshold: Float,
     iterationLimit: Int,
     saveMode: SaveMode,
@@ -56,7 +59,12 @@ object Server {
     private var initialized = false
     private var system: Option[ActorSystem] = None
     private var monitor: Option[ActorRef] = None
-    private var messagePublisher: Option[Sink[Message, Any]] = None
+    
+    private val channelPublishers = mutable.Map[String, Sink[Message, Any]]()
+    private val channelSources = mutable.Map[String, Source[Message, Any]]()
+    private var channels: Long = 0L
+    
+    case class UserSyncRequest(firebaseUid: String, email: String, name: String)
     
     def initialize(actorSystem: ActorSystem, monitor: ActorRef): Unit = {
         if (initialized) return
@@ -64,38 +72,34 @@ object Server {
         system = Some(actorSystem)
         this.monitor = Some(monitor)
         
-        implicit val sys: ActorSystem = actorSystem
+        implicit val systenImplicit: ActorSystem = actorSystem
         implicit val executionContext: ExecutionContextExecutor = actorSystem.dispatcher
         implicit val materializer: Materializer = Materializer(actorSystem)
         
-        // Create a hub for broadcasting messages to all connected clients
+        val serverHost = sys.env.getOrElse("SERVER_HOST", "0.0.0.0")
+        val serverPort = sys.env.getOrElse("SERVER_PORT", "8080").toInt
+        
         val (sink, source) = MergeHub.source[Message]
           .toMat(BroadcastHub.sink[Message])(Keep.both)
           .run()
         
-        messagePublisher = Some(sink)
-        
-        // Create a WebSocket flow that will handle our WebSocket connections
         val websocketFlow = Flow.fromSinkAndSourceMat(
-            Sink.ignore, // Ignore incoming messages from clients
-            source // Broadcast our messages to all clients
+            Sink.ignore, 
+            source
         )(Keep.right)
         
-        // Enhanced CORS headers
         val corsResponseHeaders = List(
             `Access-Control-Allow-Origin`.*,
             `Access-Control-Allow-Methods`(POST, GET, OPTIONS),
             `Access-Control-Allow-Headers`("Content-Type", "Authorization", "X-Requested-With", "Accept", "Origin"),
-            `Access-Control-Max-Age`(86400), // 24 hours preflight cache
+            `Access-Control-Max-Age`(86400),
             `Access-Control-Allow-Credentials`(false)
         )
         
-        // Enhanced CORS directive that applies to all routes
         def addCorsHeaders: Directive0 = {
             respondWithHeaders(corsResponseHeaders)
         }
         
-        // Universal CORS preflight handler
         val corsHandler: Route = addCorsHeaders {
             options {
                 complete(HttpResponse(StatusCodes.OK))
@@ -103,11 +107,12 @@ object Server {
         }
         
         val webSocketRoute: Route = addCorsHeaders {
-            path("ws") {
+            path("ws" / Segment) { channelId =>
                 get {
                     optionalHeaderValueByName("Origin") { origin =>
                         // ToDo add origin validation here
-                        handleWebSocketMessages(websocketFlow)
+                        val channelFlow = createChannelFlow(channelId)
+                        handleWebSocketMessages(channelFlow)
                     }
                 }
             }
@@ -117,19 +122,70 @@ object Server {
             pathPrefix("run") {
                 post {
                     entity(as[Payload]) { payload =>
-                        runGeneratedRun(payload.data)
-                        complete(s"Received payload successfully")
+                        val channelId = parseGeneratedRun(payload.data)
+                        complete(channelId) 
                     }
                 }
-            } ~
-              pathPrefix("custom") {
-                  post {
-                      entity(as[Payload]) { payload =>
-                          parseCustomRun(payload.data)
-                          complete(s"Received payload successfully")
+            } ~ pathPrefix("custom") {
+                post {
+                    entity(as[Payload]) { payload =>
+                        val channelId = parseCustomRun(payload.data)
+                        complete(channelId)
+                    }
+                }
+            } ~ pathPrefix("neighbors") {
+                get {
+                    entity(as[Payload]) { payload =>
+                        val channelId = parseCustomRun(payload.data)
+                        complete(channelId)
+                    }
+                }
+            }
+        }
+        
+        val userRoutes: Route = addCorsHeaders {
+            pathPrefix("api" / "users") {
+                path("sync") {
+                    post {
+                        entity(as[String]) { jsonString =>
+                            parseUserSyncRequest(jsonString) match {
+                                case Some(userRequest) =>
+                                    DatabaseManager.createOrUpdateUser(
+                                        userRequest.firebaseUid,
+                                        userRequest.email,
+                                        userRequest.name
+                                    ) match {
+                                        case Some(user) =>
+                                            complete(StatusCodes.OK -> s"User synced: ${user.email}")
+                                        case None =>
+                                            complete(StatusCodes.InternalServerError -> "Failed to sync user")
+                                    }
+                                case None =>
+                                    complete(StatusCodes.BadRequest -> "Invalid user data")
+                            }
+                        }
+                    }
+                } ~
+                  path("info" / Segment) { firebaseUid =>
+                      get {
+                          DatabaseManager.getUserByFirebaseUid(firebaseUid) match {
+                              case Some(user) =>
+                                  complete(StatusCodes.OK -> s"User: ${user.email}, Role: ${user.role}")
+                              case None =>
+                                  complete(StatusCodes.NotFound -> "User not found")
+                          }
+                      }
+                  } ~
+                  path("role" / Segment / Segment) { (firebaseUid, newRole) =>
+                      put {
+                          if (DatabaseManager.updateUserRole(firebaseUid, newRole)) {
+                              complete(StatusCodes.OK -> s"Role updated to: $newRole")
+                          } else {
+                              complete(StatusCodes.InternalServerError -> "Failed to update role")
+                          }
                       }
                   }
-              }
+            }
         }
         
         val homeRoute: Route = addCorsHeaders {
@@ -153,8 +209,8 @@ object Server {
             }
         }
         
-        val routes: Route = corsHandler ~ webSocketRoute ~ apiRoute ~ homeRoute
-        val bindingFuture = Http().newServerAt("0.0.0.0", 8080).bind(routes)
+        val routes: Route = corsHandler ~ webSocketRoute ~ apiRoute ~ userRoutes ~ homeRoute
+        val bindingFuture = Http().newServerAt(serverHost, serverPort).bind(routes)
         
         bindingFuture.onComplete {
             case scala.util.Success(binding) =>
@@ -171,57 +227,85 @@ object Server {
         initialized = true
     }
     
-    // Method to send data to all WebSocket clients
-    def sendSimulationBinaryData(buffer: ByteBuffer): Unit = {
-        if (!initialized || messagePublisher.isEmpty || system.isEmpty) {
+    private def parseUserSyncRequest(jsonString: String): Option[UserSyncRequest] = {
+        try {
+            val firebaseUidPattern = """"firebaseUid"\s*:\s*"([^"]+)"""".r
+            val emailPattern = """"email"\s*:\s*"([^"]+)"""".r
+            val namePattern = """"name"\s*:\s*"([^"]+)"""".r
+            
+            val firebaseUid = firebaseUidPattern.findFirstMatchIn(jsonString).map(_.group(1)).getOrElse("")
+            val email = emailPattern.findFirstMatchIn(jsonString).map(_.group(1)).getOrElse("")
+            val name = namePattern.findFirstMatchIn(jsonString).map(_.group(1)).getOrElse("")
+            
+            if (firebaseUid.nonEmpty) {
+                Some(UserSyncRequest(firebaseUid, email, name))
+            } else {
+                None
+            }
+        } catch {
+            case _: Exception => None
+        }
+    }
+    
+    private def createChannelFlow(channelId: String): Flow[Message, Message, Any] = {
+        implicit val systenImplicit: ActorSystem = system.get
+        implicit val materializer: Materializer = Materializer(system.get)
+        
+        val (sink, source) = channelPublishers.get(channelId) match {
+            case Some(existingSink) =>
+                (existingSink, channelSources(channelId))
+            case None =>
+                val (newSink, newSource) = MergeHub.source[Message]
+                  .toMat(BroadcastHub.sink[Message])(Keep.both)
+                  .run()
+                
+                channelPublishers(channelId) = newSink
+                channelSources(channelId) = newSource
+                (newSink, newSource)
+        }
+        
+        Flow.fromSinkAndSourceMat(
+            Sink.ignore,
+            source
+        )(Keep.right)
+    }
+    
+    // Send data to all WebSocket clients ToDo make this send data to a specific channel
+    def sendSimulationBinaryData(channelId: String, buffer: ByteBuffer): Unit = {
+        if (!initialized || system.isEmpty) {
             println("Error: WebSocket server not initialized properly")
             return
         }
         
-        implicit val materializer: Materializer = Materializer(system.get)
-        
-        // Create a copy of the buffer to ensure thread safety
-        val bytes = new Array[Byte](buffer.remaining())
-        buffer.get(bytes)
-        buffer.position(buffer.position() - bytes.length) // Reset position
-        
-        // Create a binary message from the buffer
-        val message = BinaryMessage(ByteString(bytes))
-        
-        // Send the message to all clients
-        Source.single(message).runWith(messagePublisher.get)
+        channelPublishers.get(channelId) match {
+            case Some(publisher) =>
+                if (GlobalState.APP_MODE == AppMode.DEBUG_SERVER) logBufferDebugInfo(buffer)
+                
+                implicit val materializer: Materializer = Materializer(system.get)
+                implicit val ec: ExecutionContext = system.get.dispatcher
+                val message = BinaryMessage(ByteString(buffer))
+                Source.single(message).runWith(publisher)
+            case None =>
+                println(s"Error: No WebSocket clients connected to channel $channelId")
+        }
     }
     
-    // Remaining methods from Api class
-    private def bytesToInt(bytes: Array[Byte], offset: Int): Int = {
-        ByteBuffer.wrap(bytes, offset, 4).order(ByteOrder.LITTLE_ENDIAN).getInt()
+    def sendNeighborBinaryData(channelId: String, buffer: ByteBuffer): Unit = {
+        if (!initialized || system.isEmpty) {
+            println("Error: WebSocket server not initialized properly")
+            return
+        }
+        channelPublishers.get(channelId) match {
+            case Some(publisher) =>
+                if (GlobalState.APP_MODE == AppMode.DEBUG_SERVER) logBufferDebugInfo(buffer)
+                
+                implicit val materializer: Materializer = Materializer(system.get)
+                val message = BinaryMessage(ByteString(buffer))
+                Source.single(message).runWith(publisher)
+        }
     }
     
-    private def bytesToFloat(bytes: Array[Byte], offset: Int): Float = {
-        ByteBuffer.wrap(bytes, offset, 4).order(ByteOrder.LITTLE_ENDIAN).getFloat()
-    }
-    
-    private def bytesToLong(bytes: Array[Byte], offset: Int): Long = {
-        ByteBuffer.wrap(bytes, offset, 8).order(ByteOrder.LITTLE_ENDIAN).getLong()
-    }
-    
-    private def byteArrayToFloatArray(source: Array[Byte], offset: Int, length: Int): Array[Float] = {
-        val dest = new Array[Float](length)
-        ByteBuffer.wrap(source, offset, length * 4).order(ByteOrder.LITTLE_ENDIAN).asFloatBuffer().get(dest)
-        dest
-    }
-    
-    private def byteArrayToIntArray(source: Array[Byte], offset: Int, length: Int): Array[Int] = {
-        val dest = new Array[Int](length)
-        ByteBuffer.wrap(source, offset, length * 4).order(ByteOrder.LITTLE_ENDIAN).asIntBuffer().get(dest)
-        dest
-    }
-    
-    private def byteArrToString(bytes: Array[Byte], start: Int, length: Int): String = {
-        new String(bytes, start, length, "UTF-8")
-    }
-    
-    private def runGeneratedRun(data: Array[Byte]): Unit = {
+    private def parseGeneratedRun(data: Array[Byte]): String = {
         val saveMode = data(1)
         val agentTypeCount = data(2)
         val biasTypeCount = data(3)
@@ -263,22 +347,27 @@ object Server {
             curOffset += 5
         }
         
+        val channelId = takeChannel()
+        
         monitor.get ! AddNetworks(
-        agentTypes,
-        biases,
-        Uniform,
-        codeToSaveMode(saveMode).get,
-        None,
-        numberOfNetworks,
-        density,
-        iterationLimit,
-        seed,
-        2.5f,
-        stopThreshold
+            channelId,
+            agentTypes,
+            biases,
+            Uniform,
+            codeToSaveMode(saveMode).get,
+            None,
+            numberOfNetworks,
+            density,
+            iterationLimit,
+            seed,
+            2.5f,
+            stopThreshold
         )
+        
+        channelId
     }
     
-    private def parseCustomRun(data: Array[Byte]): Unit = {
+    private def parseCustomRun(data: Array[Byte]): String = {
         // Header
         val stopThreshold = bytesToFloat(data, 0)
         val iterationLimit = bytesToInt(data, 4)
@@ -295,23 +384,18 @@ object Server {
         offset += 4
         
         val initialBeliefs = byteArrayToFloatArray(data, offset, numberOfAgents)
-        println(s"initialBeliefs: ${(0 until numberOfAgents).map(initialBeliefs).mkString("[", ", ", "]")}")
         offset += 4 * numberOfAgents
         
         val toleranceRadii = byteArrayToFloatArray(data, offset, numberOfAgents)
-        println(s"toleranceRadii: ${(0 until numberOfAgents).map(toleranceRadii).mkString("[", ", ", "]")}")
         offset += 4 * numberOfAgents
         
         val toleranceOffset = byteArrayToFloatArray(data, offset, numberOfAgents)
-        println(s"toleranceOffset: ${(0 until numberOfAgents).map(toleranceOffset).mkString("[", ", ", "]")}")
         offset += 4 * numberOfAgents
         
         val silenceStrategies = data.slice(offset, offset + numberOfAgents)
-        println(s"silenceStrategies: ${silenceStrategies.mkString("[", ", ", "]")}")
         offset += numberOfAgents
         
         val silenceEffects = data.slice(offset, offset + numberOfAgents)
-        println(s"silenceEffects: ${silenceEffects.mkString("[", ", ", "]")}")
         offset += numberOfAgents
         
         // Read the agent names
@@ -346,8 +430,6 @@ object Server {
             source(i) = agentIndexes(byteArrToString(data, offset, strByteLength))
             offset += strByteLength
         }
-        println(s"All source: ${source.mkString("[", ", ", "]")}")
-        println(s"Indexes:")
         
         val target = new Array[Int](numberOfNeighbors)
         for (i <- 0 until numberOfNeighbors) {
@@ -374,33 +456,30 @@ object Server {
         }
         indexOffset(indexOffset.length - 1) = numberOfNeighbors - 1
         
-        println(indexOffset.mkString("Index offset: (", ", ", ")"))
-        println(sortedTarget.mkString("Targets: (", ", ", ")"))
-        println(sortedInfluences.mkString("Influences: (", ", ", ")"))
-        println(sortedBiases.mkString("Biases: (", ", ", ")"))
+        val channelId = takeChannel()
         
         val customRunInfo = CustomRunInfo(
-        stopThreshold = stopThreshold,
-        iterationLimit = iterationLimit,
-        saveMode = codeToSaveMode(saveMode).get,
-        networkName = networkName,
-        agentBeliefs = initialBeliefs,
-        agentToleranceRadii = toleranceRadii,
-        agentToleranceOffsets = toleranceOffset,
-        agentSilenceStrategy = silenceStrategies,
-        agentSilenceEffect = silenceEffects,
-        agentNames = agentNames,
-        indexOffset = indexOffset,
-        target = sortedTarget,
-        influences = sortedInfluences,
-        bias = sortedBiases
+            channelId = channelId,
+            stopThreshold = stopThreshold,
+            iterationLimit = iterationLimit,
+            saveMode = codeToSaveMode(saveMode).get,
+            networkName = networkName,
+            agentBeliefs = initialBeliefs,
+            agentToleranceRadii = toleranceRadii,
+            agentToleranceOffsets = toleranceOffset,
+            agentSilenceStrategy = silenceStrategies,
+            agentSilenceEffect = silenceEffects,
+            agentNames = agentNames,
+            indexOffset = indexOffset,
+            target = sortedTarget,
+            influences = sortedInfluences,
+            bias = sortedBiases
         )
         
         monitor.get ! RunCustomNetwork(customRunInfo)
         
-        println(s"Final offset: $offset, Total data length: ${data.length}")
+        channelId
     }
-    
     
     private def codeToSaveMode(code: Byte): Option[SaveMode] = {
         code match {
@@ -414,5 +493,73 @@ object Server {
             case 9 => Some(Debug)
             case _ => None
         }
+    }
+    
+    // Bit operation methods for channels
+    private def takeChannel(): String = {
+        val index = java.lang.Long.numberOfTrailingZeros(~channels).toString
+        channels = channels | (channels + 1)
+        createChannelFlow(index)
+        index
+    }
+    
+    def freeChannel(index: Int): Unit = {
+        channels = channels & ~(1L << index)
+    }
+    
+    // Utility methods for data transformation
+    private def bytesToInt(bytes: Array[Byte], offset: Int): Int = {
+        ByteBuffer.wrap(bytes, offset, 4).order(ByteOrder.LITTLE_ENDIAN).getInt()
+    }
+    
+    private def bytesToFloat(bytes: Array[Byte], offset: Int): Float = {
+        ByteBuffer.wrap(bytes, offset, 4).order(ByteOrder.LITTLE_ENDIAN).getFloat()
+    }
+    
+    private def bytesToLong(bytes: Array[Byte], offset: Int): Long = {
+        ByteBuffer.wrap(bytes, offset, 8).order(ByteOrder.LITTLE_ENDIAN).getLong()
+    }
+    
+    private def byteArrayToFloatArray(source: Array[Byte], offset: Int, length: Int): Array[Float] = {
+        val dest = new Array[Float](length)
+        ByteBuffer.wrap(source, offset, length * 4).order(ByteOrder.LITTLE_ENDIAN).asFloatBuffer().get(dest)
+        dest
+    }
+    
+    private def byteArrayToIntArray(source: Array[Byte], offset: Int, length: Int): Array[Int] = {
+        val dest = new Array[Int](length)
+        ByteBuffer.wrap(source, offset, length * 4).order(ByteOrder.LITTLE_ENDIAN).asIntBuffer().get(dest)
+        dest
+    }
+    
+    /*
+     * Converts a byte string representation in UTF-8 encoding to String
+     */
+    private def byteArrToString(bytes: Array[Byte], start: Int, length: Int): String = {
+        new String(bytes, start, length, "UTF-8")
+    }
+    
+    // Logging section methods only for server debug purposes
+    private def logBufferDebugInfo(buffer: ByteBuffer): Unit = {
+        val originalPosition = buffer.position()
+        val originalLimit = buffer.limit()
+        
+        println("--- SERVER SEND DEBUG ---")
+        println(s"Buffer state: position=$originalPosition, limit=$originalLimit, remaining=${buffer.remaining()}")
+        
+        // Read header for validation
+        buffer.rewind()
+        val networkIdMSB = buffer.getLong()
+        val networkIdLSB = buffer.getLong()
+        val runId = buffer.getInt()
+        val numberOfAgents = buffer.getInt()
+        val round = buffer.getInt()
+        val indexReference = buffer.getInt()
+        
+        println(s"Header: runId=$runId, agents=$numberOfAgents, round=$round, indexRef=$indexReference")
+        
+        // Restore original buffer state
+        buffer.position(originalPosition)
+        buffer.limit(originalLimit)
     }
 }

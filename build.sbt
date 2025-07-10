@@ -2,12 +2,13 @@ ThisBuild / version := "0.1.0-SNAPSHOT"
 
 ThisBuild / scalaVersion := "3.6.1"
 ThisBuild / fork := true
-ThisBuild / javaHome := Some(file("C:/Program Files/Java/jdk-24"))
+// ThisBuild / javaHome := Some(file("C:/Program Files/Java/jdk-24"))
+Compile / mainClass := Some("Main")
 run / connectInput := true
 
 // JVM options
 javaOptions ++= Seq(
-    "-Xmx32g",
+    //"-Xmx32g",
     "--add-modules=jdk.incubator.vector"
 )
 
@@ -39,8 +40,11 @@ libraryDependencies += "com.typesafe.akka" %% "akka-stream" % AkkaVersion
 
 // Logging
 libraryDependencies ++= Seq(
-    "org.apache.logging.log4j" % "log4j-api" % "2.24.1",
-    "org.apache.logging.log4j" % "log4j-core" % "2.24.1",
-    "org.apache.logging.log4j" % "log4j-slf4j2-impl" % "2.24.1",
+    "org.apache.logging.log4j" % "log4j-api" % "2.25.0",
+    "org.apache.logging.log4j" % "log4j-core" % "2.25.0",
+    "org.apache.logging.log4j" % "log4j-slf4j2-impl" % "2.25.0",
     "com.typesafe.akka" %% "akka-slf4j" % AkkaVersion
 )
+
+// Firebase
+libraryDependencies += "com.google.firebase" % "firebase-admin" % "9.5.0"

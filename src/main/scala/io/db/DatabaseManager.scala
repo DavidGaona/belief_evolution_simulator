@@ -11,16 +11,24 @@ import org.postgresql.core.BaseConnection
 
 import java.io.{ByteArrayInputStream, PrintWriter}
 import java.sql.{Connection, PreparedStatement, Statement}
+import java.time.LocalDateTime
 import java.util.UUID
 import scala.collection.mutable.ArrayBuffer
-import scala.collection.{IndexedSeqView, mutable}
+import scala.collection.mutable
 
 
 object DatabaseManager {
     private val hikariConfig = new HikariConfig()
-    hikariConfig.setJdbcUrl("jdbc:postgresql://localhost:5433/promueva_new")
-    hikariConfig.setUsername("postgres")
-    hikariConfig.setPassword("postgres")
+    
+    private val dbHost = sys.env.getOrElse("DB_HOST", "localhost")
+    private val dbPort = sys.env.getOrElse("DB_PORT", "5432") // 5433
+    private val dbName = sys.env.getOrElse("DB_NAME", "promueva") // promueva_new
+    private val dbUser = sys.env.getOrElse("DB_USER", "postgres")        
+    private val dbPassword = sys.env.getOrElse("DB_PASSWORD", "postgres") 
+    
+    hikariConfig.setJdbcUrl(s"jdbc:postgresql://$dbHost:$dbPort/$dbName")
+    hikariConfig.setUsername(dbUser)
+    hikariConfig.setPassword(dbPassword)
     
     // Parallel
     hikariConfig.setMaximumPoolSize(32)
@@ -76,6 +84,136 @@ object DatabaseManager {
         }
     }
     
+    case class UserData(
+        id: Long,
+        firebaseUid: String,
+        email: String,
+        name: String,
+        role: String,
+        isActive: Boolean,
+        createdAt: String,
+        updatedAt: String
+    )
+    
+    def createOrUpdateUser(firebaseUid: String, email: String, name: String, role: String = "Guest"): Option[UserData] = {
+        val connection = getConnection
+        try {
+            val sql =
+                """
+                   INSERT INTO users (firebase_uid, email, name, role, created_at, updated_at, is_active) 
+                   VALUES (?::uuid, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, true)
+                   ON CONFLICT (firebase_uid) 
+                   DO UPDATE SET 
+                       email = EXCLUDED.email,
+                       name = EXCLUDED.name,
+                       updated_at = CURRENT_TIMESTAMP
+                   RETURNING id, firebase_uid, created_at, updated_at, role, email, name, is_active
+               """
+            
+            val stmt = connection.prepareStatement(sql)
+            stmt.setString(1, firebaseUid)
+            stmt.setString(2, email)
+            stmt.setString(3, name)
+            stmt.setString(4, role)
+            
+            val resultSet = stmt.executeQuery()
+            
+            if (resultSet.next()) {
+                Some(UserData(
+                    id = resultSet.getLong("id"),
+                    firebaseUid = resultSet.getString("firebase_uid"),
+                    email = resultSet.getString("email"),
+                    name = resultSet.getString("name"),
+                    role = resultSet.getString("role"),
+                    isActive = resultSet.getBoolean("is_active"),
+                    createdAt = resultSet.getTimestamp("created_at").toString,
+                    updatedAt = resultSet.getTimestamp("updated_at").toString
+                ))
+            } else {
+                None
+            }
+        } catch {
+            case ex: Exception =>
+                println(s"Error creating/updating user: ${ex.getMessage}")
+                None
+        } finally {
+            connection.close()
+        }
+    }
+    
+    def getUserByFirebaseUid(firebaseUid: String): Option[UserData] = {
+        val connection = getConnection
+        try {
+            val sql =
+                """
+                   SELECT id, firebase_uid, created_at, updated_at, role, email, name, is_active 
+                   FROM users 
+                   WHERE firebase_uid = ?::uuid
+               """
+            
+            val stmt = connection.prepareStatement(sql)
+            stmt.setString(1, firebaseUid)
+            
+            val resultSet = stmt.executeQuery()
+            
+            if (resultSet.next()) {
+                Some(UserData(
+                    id = resultSet.getLong("id"),
+                    firebaseUid = resultSet.getString("firebase_uid"),
+                    email = resultSet.getString("email"),
+                    name = resultSet.getString("name"),
+                    role = resultSet.getString("role"),
+                    isActive = resultSet.getBoolean("is_active"),
+                    createdAt = resultSet.getTimestamp("created_at").toString,
+                    updatedAt = resultSet.getTimestamp("updated_at").toString
+                ))
+            } else {
+                None
+            }
+        } catch {
+            case ex: Exception =>
+                println(s"Error getting user: ${ex.getMessage}")
+                None
+        } finally {
+            connection.close()
+        }
+    }
+    
+    def updateUserRole(firebaseUid: String, newRole: String): Boolean = {
+        val connection = getConnection
+        try {
+            val sql =
+                """
+                   UPDATE users 
+                   SET role = ?, updated_at = CURRENT_TIMESTAMP 
+                   WHERE firebase_uid = ?::uuid
+               """
+            
+            val stmt = connection.prepareStatement(sql)
+            stmt.setString(1, newRole)
+            stmt.setString(2, firebaseUid)
+            
+            val rowsAffected = stmt.executeUpdate()
+            rowsAffected > 0
+        } catch {
+            case ex: Exception =>
+                println(s"Error updating user role: ${ex.getMessage}")
+                false
+        } finally {
+            connection.close()
+        }
+    }
+    
+    def saveGeneratedRun(): Unit = {
+        
+    }
+    
+    
+    /**
+     * Legacy code to save the entire state to database use can be used when
+     */
+    
+    // --------------------------------------------------------------
     def createRun(
                    runMode: RunMode,
                    saveMode: SaveMode,

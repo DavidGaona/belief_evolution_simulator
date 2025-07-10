@@ -13,7 +13,7 @@ import utils.datastructures.ArrayListInt
 import utils.rng.distributions.*
 
 import java.{lang, util}
-import java.nio.ByteBuffer
+import java.nio.{ByteBuffer, ByteOrder}
 import java.util.UUID
 import scala.collection.mutable
 import scala.collection.mutable.ArrayBuffer
@@ -97,19 +97,14 @@ class Agent(
     var bufferSwitch: Boolean = true // true = buffers 1, false = buffers 2
     var inFavor: Int = 0
     var against: Int = 0
-//    val floatSpeciesTable: Array[VectorSpecies[lang.Float]] = Array(
-//        FloatVector.SPECIES_64, // 2^0 = 1 element
-//        FloatVector.SPECIES_64, // 2^1 = 2 elements
-//        FloatVector.SPECIES_128, // 2^2 = 4 elements
-//        FloatVector.SPECIES_256, // 2^3 = 8 elements
-//        FloatVector.SPECIES_512 // 2^4 = 16 elements
-//    )
+
     val vectorSpecies: VectorSpecies[lang.Float] = FloatVector.SPECIES_PREFERRED
     val speciesLength = vectorSpecies.length()
     val INV_EPSILON_PLUS_ONE = 1 / (1f + 0.001f)
     //val vectorSpecies = FloatVector.SPECIES_512
     var marks = mutable.Map[Int, Byte]()
     val random = new Random(runMetadata.seed + startsAt)
+    val buffer = ByteBuffer.allocate((numberOfAgents * 9) + 32)
     
     def receive: Receive = {
         case MarkAsCustomRun =>
@@ -375,7 +370,9 @@ class Agent(
         // (D - L | U - D) >>> 31, mask yields 1 for against 0 for in favor
         val mask = (java.lang.Float.floatToRawIntBits(beliefDifference - lower) |
           java.lang.Float.floatToRawIntBits(upper - beliefDifference)) >>> 31
+        
         // println(s"Mask: $mask, status: $speaking, upper: $upper, lower: $lower, diff: $beliefDifference")
+        
         against += mask & speaking
         inFavor += (mask ^ 1) & speaking
     }
@@ -405,34 +402,26 @@ class Agent(
     }
     
     private def sendRoundToWebSocketServer(beliefBuffer: Array[Float], speakingBuffer: Array[Byte]): Unit = {
-        val buffer = ByteBuffer.allocate((numberOfAgents * 21) + 28)
+        buffer.clear()
+        buffer.order(ByteOrder.LITTLE_ENDIAN)
+        
         buffer.putLong(networkId.getMostSignificantBits)
         buffer.putLong(networkId.getLeastSignificantBits)
         buffer.putInt(runMetadata.runId.get)
         buffer.putInt(numberOfAgents)
         buffer.putInt(round)
+        buffer.putInt(startsAt)
         
-        // Put the uuids
-        var i = 0
-        val uuidLongs = new Array[Long](numberOfAgents * 2)
-        while (i < numberOfAgents * 2) {
-            val uuid = ids(startsAt + (i >> 1))
-            uuidLongs(i) = uuid.getMostSignificantBits
-            uuidLongs(i + 1) = uuid.getLeastSignificantBits
-            i += 2
-        }
+        val floatView = buffer.asFloatBuffer()
+        floatView.put(beliefBuffer, startsAt, numberOfAgents)
+        floatView.put(belief, startsAt, numberOfAgents)
         
-        buffer.asLongBuffer().put(uuidLongs)
-        buffer.position(buffer.position() + (numberOfAgents * 16))
-        
-        buffer.asFloatBuffer().put(beliefBuffer, startsAt, numberOfAgents)
-        buffer.position(buffer.position() + numberOfAgents * 4)
-        
+        buffer.position(buffer.position() + (numberOfAgents * 8))
         buffer.put(speakingBuffer, startsAt, numberOfAgents)
         
         buffer.flip()
         
-        Server.sendSimulationBinaryData(buffer)
+        Server.sendSimulationBinaryData(runMetadata.channelId, buffer)
     }
     
     @inline

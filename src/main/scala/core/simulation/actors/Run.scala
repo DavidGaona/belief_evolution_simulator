@@ -47,7 +47,17 @@ case class BuildingComplete(networkId: UUID) // Network -> Run
 case class RunningComplete(networkId: UUID, round: Int, result: Int) // Network -> Run
 case class ChangeAgentLimit(numberOfAgents: Int) // Monitor -> Run
 
-// Actor ToDo create logs
+// Actor
+
+/**
+ * Run Actor
+ * This actor corresponds to a single simulation, it coordinates the execution of
+ * its networks. Depending on the limit given by the Monitor actor, it can change
+ * the number of simultaneous executing networks. Each network goes through the
+ * process of building -> Running -> Stopping. After all networks have executed,
+ * some useful stats are shown if in Debug mode before terminating the actor and
+ * all of its children (networks).
+ **/
 class Run extends Actor {
     // Collections
     var networks: Array[ActorRef] = null
@@ -83,7 +93,7 @@ class Run extends Actor {
     var runMetadata: RunMetadata = null
     
     // Load from existing run
-    var agentStates: Option[Array[(UUID, Float, Float, Option[Float], Option[Integer], Float, 
+    var agentStates: Option[Array[(UUID, Float, Float, Option[Float], Option[Integer], Float,
       Option[Array[Byte]])]] = None
     var BuildMessage: Any = null
     var loadType: LoadType = null
@@ -291,40 +301,44 @@ class Run extends Actor {
                 DatabaseManager.updateTimeField(Left(runMetadata.runId.get), globalTimers.stop("Running"), 
                                                 "runs", "run_time")
                 RoundRouter.saveRemainingData()
-                // ToDo use quick select
-                scala.util.Sorting.quickSort(networkBuildTimes)
-                scala.util.Sorting.quickSort(networkRunTimes)
-                val n = networkRunTimes.length
-                println(
-                    f"""
-                    |----------------------------
-                    |Run ${runMetadata.runId.get} with ${
-                        runMetadata.runMode match
-                            case RunMode.Custom => "Custom network"
-                            case _ => f"density ${runMetadata.optionalMetaData.get.density.get}"
-                    } and ${runMetadata.numberOfNetworks} networks of ${runMetadata.agentsPerNetwork} agents
-                        |Max rounds: $maxRound
-                        |Min rounds: $minRound
-                        |Avg rounds: ${avgRounds / runMetadata.numberOfNetworks}
-                        |Max build time: ${globalTimers.formatDuration(networkBuildTimes.max)}
-                        |Min build time: ${globalTimers.formatDuration(networkBuildTimes.min)}
-                        |Avg build time: ${globalTimers.formatDuration(networkBuildTimes.sum / n)}
-                        |Median build time: ${globalTimers.formatDuration(
-                        if (networkBuildTimes.length % 2 == 0) (networkBuildTimes(n / 2 - 1) + networkBuildTimes(n / 2)) / 2
-                        else networkBuildTimes(n / 2))
+                // Show only on debug mode
+                if (!runMetadata.saveMode.savesToDB) {
+                    scala.util.Sorting.quickSort(networkBuildTimes)
+                    scala.util.Sorting.quickSort(networkRunTimes)
+                    val n = networkRunTimes.length
+                    println(
+                        f"""
+                           |----------------------------
+                           |Run ${runMetadata.runId.get} with ${
+                            runMetadata.runMode match
+                                case RunMode.Custom => "Custom network"
+                                case _ => f"density ${runMetadata.optionalMetaData.get.density.get}"
+                        } and ${runMetadata.numberOfNetworks} networks of ${runMetadata.agentsPerNetwork} agents
+                           |Max rounds: $maxRound
+                           |Min rounds: $minRound
+                           |Avg rounds: ${avgRounds / runMetadata.numberOfNetworks}
+                           |Max build time: ${globalTimers.formatDuration(networkBuildTimes.max)}
+                           |Min build time: ${globalTimers.formatDuration(networkBuildTimes.min)}
+                           |Avg build time: ${globalTimers.formatDuration(networkBuildTimes.sum / n)}
+                           |Median build time: ${
+                            globalTimers.formatDuration(
+                                if (networkBuildTimes.length % 2 == 0) (networkBuildTimes(n / 2 - 1) + networkBuildTimes(n / 2)) / 2
+                                else networkBuildTimes(n / 2))
                         }
-                        |Max run time: ${globalTimers.formatDuration(networkRunTimes.max)}
-                        |Min run time: ${globalTimers.formatDuration(networkRunTimes.min)}
-                        |Avg run time: ${globalTimers.formatDuration(networkRunTimes.sum / n)}
-                        |Median run time: ${globalTimers.formatDuration(
-                        if (networkRunTimes.length % 2 == 0) (networkRunTimes(n / 2 - 1) + networkRunTimes(n / 2)) / 2
-                        else networkRunTimes(n / 2))
+                           |Max run time: ${globalTimers.formatDuration(networkRunTimes.max)}
+                           |Min run time: ${globalTimers.formatDuration(networkRunTimes.min)}
+                           |Avg run time: ${globalTimers.formatDuration(networkRunTimes.sum / n)}
+                           |Median run time: ${
+                            globalTimers.formatDuration(
+                                if (networkRunTimes.length % 2 == 0) (networkRunTimes(n / 2 - 1) + networkRunTimes(n / 2)) / 2
+                                else networkRunTimes(n / 2))
                         }
-                        |Consensus runs: $networksConsensus
-                        |Dissensus runs: ${runMetadata.numberOfNetworks - networksConsensus}
-                        |----------------------------
-                    """.stripMargin
+                           |Consensus runs: $networksConsensus
+                           |Dissensus runs: ${runMetadata.numberOfNetworks - networksConsensus}
+                           |----------------------------
+                                        """.stripMargin
                     )
+                }
                 context.parent ! RunComplete
             }
             
