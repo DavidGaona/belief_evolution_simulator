@@ -1,100 +1,89 @@
 package core.model.agent.behavior.silence
-import io.serialization.binary.Encoder
 
-trait SilenceEffect {
-    def getPublicValue(belief: Float, isSpeaking: Boolean): Float
-    def encodeOptionalValues(encoder: Encoder): Unit
-}
+import scala.collection.mutable
 
-class DeGrootSilenceEffect extends SilenceEffect {
-    inline override def getPublicValue(belief: Float, isSpeaking: Boolean): Float = belief
-    override def toString: String = "DeGroot"
-    inline override def encodeOptionalValues(encoder: Encoder): Unit = {}
-}
-
-class MemoryEffect extends SilenceEffect {
-    var publicBelief: Float = 2f
-    def initialize(initValue: Float): Unit = {
-        publicBelief = initValue
-    }
+/**
+ * Represents different silence effects that determine how an agent's public belief
+ * is presented based on whether they are currently speaking or silent.
+ */
+object SilenceEffect {
+    /**
+     * DeGroot effect - public belief always matches private belief.
+     * No memory or modification of beliefs regardless of speaking status.
+     */
+    final val DEGROOT: Byte = 0x00
     
-    override def getPublicValue(belief: Float, isSpeaking: Boolean): Float = {
-        if (isSpeaking) publicBelief = belief
-        publicBelief
-    }
+    /**
+     * Memory effect - maintains last spoken belief when silent.
+     * When speaking, updates public belief to current private belief.
+     * When silent, retains the last belief that was publicly expressed.
+     */
+    final val MEMORY: Byte = 0x01
     
-    override def toString: String = "Memory"
-    @inline override def encodeOptionalValues(encoder: Encoder): Unit = {
-        encoder.encodeFloat("publicBelief", publicBelief)
-    }
-}
-
-class MemorylessEffect extends SilenceEffect {
-    final inline override def getPublicValue(belief: Float, isSpeaking: Boolean): Float = belief
+    /**
+     * Memoryless effect - identical to DeGroot, public belief equals private belief.
+     * Provided as separate type for semantic clarity in simulation configuration.
+     */
+    final val MEMORYLESS: Byte = 0x02
     
-    override def toString: String = "Memoryless"
-    override def encodeOptionalValues(encoder: Encoder): Unit = {}
-}
-
-class RecencyEffect(recencyFunction: (Float, Int) => Float) extends SilenceEffect {
-    private var roundsSilent: Int = 0
-    
-    // ToDo implement recency effect
-    inline override def getPublicValue(belief: Float, isSpeaking: Boolean): Float = belief
-    
-    override def toString: String = "Recency"
-    override def encodeOptionalValues(encoder: Encoder): Unit = {}
-}
-
-class PeersEffect(silenceEffect: SilenceEffect) extends SilenceEffect {
-    private var neighborsAgreement: Array[Boolean] = new Array[Boolean](16)
-    
-    def updateNeighborAgreement(index: Int, value: Boolean): Unit = {
-        neighborsAgreement(index) = value
-    }
-    
-    // ToDo implement peers effect
-    inline override def getPublicValue(belief: Float, isSpeaking: Boolean): Float = belief
-    
-    override def toString: String = "Peers"
-    override def encodeOptionalValues(encoder: Encoder): Unit = {}
-}
-
-enum SilenceEffectType:
-    case DeGroot
-    case Memory
-    case Memoryless
-    case Recency(recencyFunction: (Float, Int) => Float)
-    case Peers(baseEffect: SilenceEffectType)
-
-
-object SilenceEffectType{
-    def fromString(string: String): SilenceEffectType = {
-        val parts = string.toLowerCase.trim.split("\\(", 2)
-        parts(0) match
-            case "degroot" => SilenceEffectType.DeGroot
-            case "memory" => SilenceEffectType.Memory
-            case "memoryless" => SilenceEffectType.Memoryless
-            case _ => SilenceEffectType.Memoryless
-    }
-    
-    def fromByte(code: Byte): SilenceEffectType = {
-        code match {
-            case 0 => SilenceEffectType.DeGroot
-            case 1 => SilenceEffectType.Memory
-            case 2 => SilenceEffectType.Memoryless
-            case _ => SilenceEffectType.Memoryless
+    /**
+     * Determines the public belief value based on the silence effect.
+     * Works directly with SOA storage for memory efficiency.
+     *
+     * @param effect        The silence effect code (0-2)
+     * @param agentIndex    The index of the agent in the SOA arrays
+     * @param privateBelief The agent's current private belief
+     * @param isSpeaking    Whether the agent is currently speaking (1) or silent (0)
+     * @param publicBelief  Map containing stored public beliefs for agents using MEMORY effect
+     * @return The public belief value to be displayed/used
+     */
+    @inline def getPublicValue(
+        effect: Byte,
+        agentIndex: Int,
+        privateBelief: Float,
+        isSpeaking: Byte,
+        publicBelief: mutable.Map[Int, Float] = null
+    ): Float = {
+        effect match {
+            case DEGROOT => privateBelief
+            case MEMORY =>
+                if (isSpeaking == 1) publicBelief(agentIndex) = privateBelief
+                publicBelief(agentIndex)
+            case MEMORYLESS => privateBelief
+            case _ => privateBelief // Default to DeGroot for unknown effects
         }
     }
-}
     
-object SilenceEffectFactory:
-    def create(effectType: SilenceEffectType): (SilenceEffect, Byte) = effectType match
-        case SilenceEffectType.DeGroot => (DeGrootSilenceEffect(), 1)
-        case SilenceEffectType.Memory => (MemoryEffect(), 1)
-        case SilenceEffectType.Memoryless => (MemorylessEffect(), 0)
-        case SilenceEffectType.Recency(recencyFunction) => (RecencyEffect(recencyFunction), 1)
-        case SilenceEffectType.Peers(baseEffect) =>
-            val effect = create(baseEffect)
-            (PeersEffect(effect._1), effect._2)
+    /**
+     * Converts an effect name string to its corresponding byte code.
+     *
+     * @param effectName The name of the effect (case-insensitive)
+     * @return The effect byte code
+     * @throws IllegalArgumentException if the effect name is unknown
+     */
+    def fromString(effectName: String): Byte = {
+        val effectNameLower = effectName.toLowerCase.trim
+        
+        effectNameLower match {
+            case "degroot" => DEGROOT
+            case "memory" => MEMORY
+            case "memoryless" => MEMORYLESS
+            case _ => throw new IllegalArgumentException(s"Unknown silence effect: $effectName")
+        }
+    }
+    
+    /**
+     * Converts an effect code to its string representation.
+     *
+     * @param effectCode The effect type code
+     * @return The string name of the effect
+     * @throws IllegalArgumentException if the effect code is unknown
+     */
+    def toString(effectCode: Byte): String = effectCode match {
+        case DEGROOT => "DeGroot"
+        case MEMORY => "Memory"
+        case MEMORYLESS => "Memoryless"
+        case _ => throw new IllegalArgumentException(s"Unknown effect code: $effectCode")
+    }
+}
         

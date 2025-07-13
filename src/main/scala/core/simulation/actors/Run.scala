@@ -37,7 +37,7 @@ case class NeighborsLoad(
     source: UUID,
     target: UUID,
     influence: Float,
-    biasType: CognitiveBiasType
+    biasType: Byte
 )
 
 // Mesagges
@@ -62,7 +62,7 @@ class Run extends Actor {
     // Collections
     var networks: Array[ActorRef] = null
     var times: Array[Long] = null
-    var agentTypeCount: Array[(SilenceStrategyType, SilenceEffectType, Int)] = null
+    var agentTypeCount: Array[(Byte, Byte, Int)] = null
     var agentBiases: Array[(Byte, Int)] = null
     
     // Local stats
@@ -131,41 +131,9 @@ class Run extends Actor {
         calculateBatches()
     }
     
-    // Run a specific network
-    def this(
-        runMetadata: RunMetadata,
-        agents: Array[AgentInitialState],
-        neighbors: Array[Neighbors],
-        name: String
-    ) = {
-        this()
-        
-        globalTimers.start(s"Total_time")
-        
-        runMetadata.runId = if (runMetadata.saveMode.savesToDB) DatabaseManager.createRun(
-            runMetadata.runMode, runMetadata.saveMode, 1, None, None,
-            runMetadata.stopThreshold, runMetadata.iterationLimit,
-            CustomDistribution.toString
-            ) else Option(1)
-        
-        this.runMetadata = runMetadata
-        globalTimers.start("Building")
-        val networkId: UUID = uuids.v7()
-        val network = context.actorOf(Props(new Network(networkId, runMetadata, null, null)), name)
-        if (runMetadata.saveMode.includesNetworks)
-            DatabaseManager.createNetwork(networkId, name, runMetadata.runId.get, agents.length)
-        networks = Array(network)
-        BuildMessage = BuildSpecificNetwork(agents, neighbors)
-        loadType = LoadType.NoLoad
-        buildingTimers.start(network.path.name)
-        calculateBatches()
-        //network ! BuildCustomNetwork(agents, neighbors)
-        
-    }
-    
     // Run generated networks
     def this(runMetadata: RunMetadata,
-        agentTypeCount: Array[(SilenceStrategyType, SilenceEffectType, Int)],
+        agentTypeCount: Array[(Byte, Byte, Int)],
         agentBiases: Array[(Byte, Int)]
     ) = {
         this()
@@ -176,48 +144,6 @@ class Run extends Actor {
         BuildMessage = BuildNetwork
         loadType = LoadType.NoLoad
     }
-    
-    /* 
-        We want to change one of the following 
-            Agent Types count (total count stays the same)
-            Change Save mode
-            Change stop threshold
-            Change iteration limit
-            Change bias distribution
-        All but the first rerun the same exact run but with different stop threshold/mode/iteration limit
-        To do this I must reload 
-        all the neighbors  
-        all agents  
-        the initial round
-    */
-    // Re-run a past run with different parameters
-//    def this(runMetadata: RunMetadata,
-//        agentTypeCount: Array[(SilenceStrategyType, SilenceEffectType, Int)],
-//        agentBiases: Array[(CognitiveBiasType, Float)],
-//        runId: Int
-//    ) = {
-//        this()
-//        this.runMetadata = runMetadata
-//        this.agentTypeCount = agentTypeCount
-//        this.agentBiases = agentBiases
-//        initializeGeneratedRun()
-//        loadType = LoadType.NetworkLoad
-//        BuildMessage = BuildNetworkFromRun(runId)
-//    }
-//    // Re-run a past network with different parameters
-//    def this(runMetadata: RunMetadata,
-//        agentTypeCount: Array[(SilenceStrategyType, SilenceEffectType, Int)],
-//        agentBiases: Array[(CognitiveBiasType, Float)],
-//        networkId: UUID
-//    ) = {
-//        this()
-//        this.runMetadata = runMetadata
-//        this.agentTypeCount = agentTypeCount
-//        this.agentBiases = agentBiases
-//        initializeGeneratedRun()
-//        BuildMessage = BuildNetworkFromNetwork(networkId)
-//        BuildMessage = LoadType.FullRunLoad
-//    }
     
     private def initializeGeneratedRun(): Unit = {
         globalTimers.start(s"Total_time")
@@ -260,7 +186,7 @@ class Run extends Actor {
                 networkBuildTimes(index) = buildingTimers.stop(networkName, msg = " building")
             }
             
-            if (networksBuilt == runMetadata.numberOfNetworks) {
+            if (runMetadata.saveMode.savesToDB && networksBuilt == runMetadata.numberOfNetworks) {
                 DatabaseManager.updateTimeField(Left(runMetadata.runId.get), globalTimers.stop("Building"), "runs",
                     "build_time")
             }
@@ -298,8 +224,10 @@ class Run extends Actor {
                 if ((numberOfNetworksFinished + networksPerBatch) <= runMetadata.numberOfNetworks)
                     buildNetwork(numberOfNetworksFinished + networksPerBatch - 1)
             } else {
-                DatabaseManager.updateTimeField(Left(runMetadata.runId.get), globalTimers.stop("Running"), 
-                                                "runs", "run_time")
+                if (runMetadata.saveMode.savesToDB) {
+                    DatabaseManager.updateTimeField(Left(runMetadata.runId.get), globalTimers.stop("Running"),
+                        "runs", "run_time")
+                }
                 RoundRouter.saveRemainingData()
                 // Show only on debug mode
                 if (!runMetadata.saveMode.savesToDB) {

@@ -1,7 +1,7 @@
 package io.db
 
 import com.zaxxer.hikari.{HikariConfig, HikariDataSource}
-import core.model.agent.behavior.bias.{CognitiveBiasType, CognitiveBiases}
+import core.model.agent.behavior.bias.CognitiveBiases
 import core.simulation.actors.{AgentStateLoad, NeighborsLoad}
 import core.simulation.config.*
 import io.persistence.actors.{NeighborStructure, StaticData}
@@ -204,10 +204,74 @@ object DatabaseManager {
         }
     }
     
-    def saveGeneratedRun(): Unit = {
-        
+    def saveGeneratedRun(id: Long, seed: Long, density: Int, iterationLimit: Int, totalNetworks: Int,
+        agentsPerNetwork: Int, stopThreshold: Float, agentTypeDistributions: Array[(String, String, Int)],
+    cognitiveBiasDistributions: Array[(String, Int)]): Unit = {
+        val connection = getConnection
+        try {
+            connection.setAutoCommit(false)
+            val sql =
+                """
+                INSERT INTO generated_runs (id, seed, density, iteration_limit, total_networks,
+                                           agents_per_network, stop_threshold)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """
+            
+            val stmt = connection.prepareStatement(sql)
+            stmt.setLong(1, id)
+            stmt.setLong(2, seed)
+            stmt.setInt(3, density)
+            stmt.setInt(4, iterationLimit)
+            stmt.setInt(5, totalNetworks)
+            stmt.setInt(6, agentsPerNetwork)
+            stmt.setFloat(7, stopThreshold)
+            stmt.executeUpdate()
+            
+            val agentTypeSql =
+                """
+                INSERT INTO agent_type_distributions (run_id, silence_strategy, silence_effect, count)
+                VALUES (?, ?, ?, ?)
+                """
+            
+            val agentTypeStmt = connection.prepareStatement(agentTypeSql)
+            agentTypeDistributions.foreach { case (silenceStrategy, silenceEffect, count) =>
+                agentTypeStmt.setLong(1, id)
+                agentTypeStmt.setString(2, silenceStrategy)
+                agentTypeStmt.setString(3, silenceEffect)
+                agentTypeStmt.setInt(4, count)
+                agentTypeStmt.addBatch()
+            }
+            agentTypeStmt.executeBatch()
+            
+            val cognitiveBiasSql =
+                """
+                INSERT INTO cognitive_bias_distributions (run_id, cognitive_bias, count)
+                VALUES (?, ?, ?)
+                """
+            
+            val cognitiveBiasStmt = connection.prepareStatement(cognitiveBiasSql)
+            cognitiveBiasDistributions.foreach { case (cognitiveBias, count) =>
+                cognitiveBiasStmt.setLong(1, id)
+                cognitiveBiasStmt.setString(2, cognitiveBias)
+                cognitiveBiasStmt.setInt(3, count)
+                cognitiveBiasStmt.addBatch()
+            }
+            cognitiveBiasStmt.executeBatch()
+            
+            connection.commit()
+        } catch {
+            case ex: Exception =>
+                connection.rollback()
+                println(s"Error saving the run: ${ex.getMessage}")
+        } finally {
+            connection.setAutoCommit(true)
+            connection.close()
+        }
     }
     
+    def saveCustomRun(id: Long, iterationLimit: Int, stopThreshold: Float, runName: String): Unit = {
+    
+    }
     
     /**
      * Legacy code to save the entire state to database use can be used when
@@ -382,7 +446,7 @@ object DatabaseManager {
                 stmt.setObject(1, networkStructure.source)
                 stmt.setObject(2, networkStructure.target)
                 stmt.setFloat(3, networkStructure.value)
-                stmt.setString(4, networkStructure.bias.toString)
+                stmt.setString(4, CognitiveBiases.toString(networkStructure.bias))
                 stmt.addBatch()
                 i += 1
             }
@@ -706,7 +770,7 @@ object DatabaseManager {
     }
     
     def getNeighbors(networkId: UUID, numberOfAgents: Int): Option[Array[(UUID, UUID, Float, 
-      Option[CognitiveBiasType])]] = {
+      Option[Byte])]] = {
         val conn = getConnection
         var stmt: PreparedStatement = null
         try {
@@ -722,7 +786,7 @@ object DatabaseManager {
             stmt = conn.prepareStatement(sql)
             stmt.setObject(1, networkId)
             val queryResult = stmt.executeQuery()
-            val resultArray = new ArrayBuffer[(UUID, UUID, Float, Option[CognitiveBiasType])](numberOfAgents)
+            val resultArray = new ArrayBuffer[(UUID, UUID, Float, Option[Byte])](numberOfAgents)
             var i = 0
             while (queryResult.next()) {
                 val bytes = queryResult.getBytes(7)

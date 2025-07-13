@@ -12,8 +12,8 @@ import akka.http.scaladsl.unmarshalling.{FromEntityUnmarshaller, Unmarshaller}
 import akka.stream.Materializer
 import akka.stream.scaladsl.{BroadcastHub, Flow, Keep, MergeHub, Sink, Source}
 import akka.util.ByteString
-import akka.http.scaladsl.marshallers.sprayjson.SprayJsonSupport._
-import core.model.agent.behavior.silence.{SilenceEffectType, SilenceStrategyType}
+import akka.http.scaladsl.marshallers.sprayjson.SprayJsonSupport.*
+import core.model.agent.behavior.silence.SilenceStrategy
 import core.simulation.actors.{AddNetworks, RunCustomNetwork}
 import core.simulation.config.*
 import io.db.DatabaseManager
@@ -270,7 +270,7 @@ object Server {
         )(Keep.right)
     }
     
-    // Send data to all WebSocket clients ToDo make this send data to a specific channel
+    // Send data to all WebSocket clients
     def sendSimulationBinaryData(channelId: String, buffer: ByteBuffer): Unit = {
         if (!initialized || system.isEmpty) {
             println("Error: WebSocket server not initialized properly")
@@ -315,24 +315,27 @@ object Server {
         val stopThreshold = bytesToFloat(data, 16)
         val seed: Option[Long] = if (bytesToLong(data, 20) == -1) None else Some(bytesToLong(data, 20))
         
-        val agentTypes = new Array[(SilenceStrategyType, SilenceEffectType, Int)](agentTypeCount)
+        val agentTypes = new Array[(Byte, Byte, Int)](agentTypeCount)
+        val confidenceParams: mutable.Map[Int, (Float, Float)] = mutable.Map()
         var curOffset = 28
         for (i <- 0 until agentTypeCount) {
             val count = bytesToInt(data, curOffset)
             val strategyByte = data(curOffset + 4)
-            val silenceEffectType = SilenceEffectType.fromByte(data(curOffset + 5))
+            val silenceEffectType = data(curOffset + 5)
             val (silenceStrategyType, additionalOffset) = strategyByte match {
-                case 2 =>
+                case SilenceStrategy.THRESHOLD =>
                     val threshold = bytesToFloat(data, curOffset + 6)
-                    (SilenceStrategyType.fromByte(strategyByte, thresholdValue = threshold), 4)
+                    confidenceParams += (i -> (threshold, -1.0f))
+                    (strategyByte, 4)
                     
-                case 3 =>
+                case SilenceStrategy.CONFIDENCE =>
                     val confidence = bytesToFloat(data, curOffset + 6)
-                    val update = bytesToInt(data, curOffset + 10)
-                    (SilenceStrategyType.fromByte(strategyByte, confidenceValue = confidence, updateValue = update), 8)
+                    val threshold = bytesToFloat(data, curOffset + 10)
+                    confidenceParams += (i -> (threshold, confidence))
+                    (strategyByte, 8)
                     
                 case _ =>
-                    (SilenceStrategyType.fromByte(strategyByte), 0)
+                    (strategyByte, 0)
             }
             agentTypes(i) = (silenceStrategyType, silenceEffectType, count)
             curOffset += 6 + additionalOffset
@@ -353,9 +356,9 @@ object Server {
             channelId,
             agentTypes,
             biases,
+            confidenceParams,
             Uniform,
             codeToSaveMode(saveMode).get,
-            None,
             numberOfNetworks,
             density,
             iterationLimit,

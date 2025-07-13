@@ -10,41 +10,20 @@ import io.web.CustomRunInfo
 import utils.datastructures.{FenwickTree, UUIDS}
 import utils.rng.distributions.BimodalDistribution
 
-import java.io.PrintWriter
-import java.net.InetAddress
 import java.nio.ByteBuffer
 import java.util.UUID
 import scala.collection.mutable
 import scala.concurrent.duration.*
-import scala.util.Using
 // Network
 
 // Messages
-case class BuildCustomNetwork(customRunInfo: CustomRunInfo)
-
-case class BuildSpecificNetwork(
-    agents: Array[AgentInitialState],
-    neighbors: Array[Neighbors]
-) // Monitor -> network
-
-case object BuildNetwork // Monitor -> network
-
-case class BuildNetworkByGroups(groups: Int)
-
-case object RunNetwork // Monitor -> network
-
-case object RunFirstRound // Agent -> Network
-
-case class BuildNetworkFromRun(runId: Int)
-
-case class BuildNetworkFromNetwork(networkId: UUID)
-
-
+case class BuildCustomNetwork(customRunInfo: CustomRunInfo) // Monitor -> Network
 case class AgentUpdated(maxBelief: Float, minBelief: Float, isStable: Boolean) // Agent -> network
 
+case object BuildNetwork // Monitor -> network
+case object RunNetwork // Monitor -> network
+case object RunFirstRound // Agent -> Network
 case object SaveRemainingData // Network -> AgentRoundDataSaver
-
-
 case object ActorFinished // Agent -> Network
 
 // Agent types
@@ -52,7 +31,7 @@ case object ActorFinished // Agent -> Network
 // Actor
 class Network(networkId: UUID,
     runMetadata: RunMetadata,
-    agentTypeCount: Array[(SilenceStrategyType, SilenceEffectType, Int)],
+    agentTypeCount: Array[(Byte, Byte, Int)],
     agentBiases: Array[(Byte, Int)]) extends Actor {
     // Agents
     val numberOfAgentActors: Int = math.min(32, (runMetadata.agentsPerNetwork + 31) / 32)
@@ -78,12 +57,16 @@ class Network(networkId: UUID,
     
     // Agent Statics
     val tolRadius: Array[Float] = Array.fill(runMetadata.agentsPerNetwork)(0.1f)
-    val tolOffset: Array[Float] = new Array[Float](runMetadata.agentsPerNetwork)
+    val tolOffset: Array[Float] = Array.fill(runMetadata.agentsPerNetwork)(0.05f)
     
     // Behaviors
-    val silenceStrategy: Array[SilenceStrategy] = new Array[SilenceStrategy](runMetadata.agentsPerNetwork)
-    val silenceEffect: Array[SilenceEffect] = new Array[SilenceEffect](runMetadata.agentsPerNetwork)
+    val silenceStrategy: Array[Byte] = new Array[Byte](runMetadata.agentsPerNetwork)
+    val silenceEffect: Array[Byte] = new Array[Byte](runMetadata.agentsPerNetwork)
     val hasMemory: Array[Byte] = new Array[Byte](runMetadata.agentsPerNetwork)
+    val threshold: mutable.Map[Int, Float] = mutable.Map[Int, Float]()
+    // (Threshold, Unbounded Confidence)
+    val confidenceState: mutable.Map[Int, (Float, Float)] = mutable.Map[Int, (Float, Float)]()
+    val publicBelief: mutable.Map[Int, Float] = mutable.Map[Int, Float]()
     
     // Optional
     var names: Array[String] = null
@@ -145,14 +128,9 @@ class Network(networkId: UUID,
             Array.copy(customRunInfo.agentBeliefs, 0, beliefBuffer1, 0, arrayLength)
             Array.copy(customRunInfo.agentBeliefs, 0, beliefBuffer1, 0, arrayLength)
             for (i <- 0 until runMetadata.agentsPerNetwork) {
-                silenceStrategy(i) = SilenceStrategyFactory.create(
-                    SilenceStrategyType.fromByte(customRunInfo.agentSilenceStrategy(i))
-                )
-                val (effect, memory) = SilenceEffectFactory.create(
-                    SilenceEffectType.fromByte(customRunInfo.agentSilenceEffect(i))
-                )
-                silenceEffect(i) = effect
-                hasMemory(i) = memory
+                silenceStrategy(i) = customRunInfo.agentSilenceStrategy(i)
+                silenceEffect(i) = customRunInfo.agentSilenceEffect(i)
+                hasMemory(i) = if (silenceEffect(i) == SilenceEffect.MEMORY) 1 else 0
             }
             
             // Neighbors
@@ -166,9 +144,10 @@ class Network(networkId: UUID,
                 val index = i
                 agents(i) = context.actorOf(Props(
                     new Agent(
-                        agentsIds, silenceStrategy, silenceEffect, runMetadata,
-                        beliefBuffer1, beliefBuffer2, speakingBuffer1, speakingBuffer2,
-                        privateBeliefs, tolRadius, tolOffset, indexOffset, timesStable,
+                        agentsIds, silenceStrategy, silenceEffect, threshold,
+                        confidenceState, runMetadata, beliefBuffer1, beliefBuffer2,
+                        speakingBuffer1, speakingBuffer2, privateBeliefs, publicBelief,
+                        tolRadius, tolOffset, indexOffset, timesStable,
                         neighborsRefs, neighborsWeights, neighborBiases, hasMemory, None,
                         networkId, agentsPerActor(index), bucketStart(index), names
                     )
@@ -179,65 +158,7 @@ class Network(networkId: UUID,
             
             context.become(running)
             context.parent ! BuildingComplete(networkId)
-        
-        
-        case BuildSpecificNetwork(agents, neighbors) =>
-            val agentMap = new java.util.HashMap[String, Int](agents.length)
-            neighborsRefs = new Array[Int](neighbors.length)
-            neighborsWeights = new Array[Float](neighbors.length)
-            neighborBiases = new Array[Byte](neighbors.length)
             
-            names = new Array[String](agents.length)
-            var i = 0
-            var j = 0
-            while (i < agentsPerActor.length) {
-                while (j < agentsPerActor(i)) {
-                    //agentsIds(j + bucketStart(i)) = UUIDGenerator.generateUUID().unsafeRunSync()
-                    silenceStrategy(j + bucketStart(i)) = SilenceStrategyFactory.create(agents(j).silenceStrategy)
-                    val (effect, hasMem) = SilenceEffectFactory.create(agents(j).silenceEffect)
-                    silenceEffect(j + bucketStart(i)) = effect
-                    hasMemory(j + bucketStart(i)) = hasMem
-                    names(j) = agents(j).name
-                    agentMap.put(agents(j).name, j + bucketStart(i))
-                    
-                    privateBeliefs(j + bucketStart(i)) = agents(j).initialBelief
-                    tolRadius(j + bucketStart(i)) = agents(j).toleranceRadius
-                    tolOffset(j + bucketStart(i)) = agents(j).toleranceOffset
-                    
-                    j += 1
-                }
-                uuids.v7Bulk(agentsIds)
-                val index = i
-                this.agents(i) = context.actorOf(Props(
-                    new Agent(
-                        agentsIds, silenceStrategy, silenceEffect, runMetadata,
-                        beliefBuffer1, beliefBuffer2, speakingBuffer1, speakingBuffer2,
-                        privateBeliefs, tolRadius, tolOffset, indexOffset,
-                        timesStable, neighborsRefs, neighborsWeights, neighborBiases, hasMemory,
-                        None, networkId, agentsPerActor(index), bucketStart(index),
-                        names
-                    )
-                ), s"${self.path.name}_A$i")
-                this.agents(i) ! MarkAsCustomRun
-                i += 1
-            }
-            
-            i = 0
-            while (i < neighbors.length) {
-                val neighbor = neighbors(i)
-                val source: Int = agentMap.get(neighbor.source)
-                val target: Int = agentMap.get(neighbor.target)
-                
-                indexOffset(source) = i + 1
-                neighborsRefs(i) = target
-                neighborsWeights(i) = neighbor.influence
-                neighborBiases(i) = neighbor.bias.toBiasCode
-                i += 1
-            }
-            
-            context.become(running)
-            context.parent ! BuildingComplete(networkId)
-        
         case BuildNetwork =>
             val density = runMetadata.optionalMetaData.get.density.get
             // Declare arrays of size -m^2 - m + 2mn <->  m(m-1) + (n - m) * 2m
@@ -270,10 +191,10 @@ class Network(networkId: UUID,
                 while (j < agentTypes.length) {
                     var k = 0
                     while (k < agentTypes(j)) {
-                        silenceStrategy(total + bucketStart(i)) = SilenceStrategyFactory.create(agentTypeCount(j)._1)
-                        val (effect, hasMem) = SilenceEffectFactory.create(agentTypeCount(j)._2)
+                        silenceStrategy(total + bucketStart(i)) = agentTypeCount(j)._1
+                        val effect = agentTypeCount(j)._2
                         silenceEffect(total + bucketStart(i)) = effect
-                        hasMemory(total + bucketStart(i)) = hasMem
+                        hasMemory(total + bucketStart(i)) = if (effect == SilenceEffect.MEMORY) 1 else 0
                         k += 1
                         total += 1
                     }
@@ -286,9 +207,10 @@ class Network(networkId: UUID,
                 val index = i
                 agents(i) = context.actorOf(Props(
                     new Agent(
-                        agentsIds, silenceStrategy, silenceEffect, runMetadata,
-                        beliefBuffer1, beliefBuffer2, speakingBuffer1, speakingBuffer2,
-                        privateBeliefs, tolRadius, tolOffset, indexOffset, timesStable, 
+                        agentsIds, silenceStrategy, silenceEffect, threshold,
+                        confidenceState,runMetadata, beliefBuffer1, beliefBuffer2,
+                        speakingBuffer1, speakingBuffer2, privateBeliefs, publicBelief,
+                        tolRadius, tolOffset, indexOffset, timesStable,
                         neighborsRefs, neighborsWeights, neighborBiases, hasMemory,
                         Some(biasCounts), networkId, agentsPerActor(index), bucketStart(index), null
                     )
@@ -381,8 +303,7 @@ class Network(networkId: UUID,
             
             context.become(running)
             context.parent ! BuildingComplete(networkId)
-        
-        case BuildNetworkByGroups(numberOfGroups) =>
+            
         
     }
     
@@ -443,7 +364,7 @@ class Network(networkId: UUID,
                 //                if (bufferSwitch) println(String.format("%32s", (speakingBuffer2.states(0) << 28).toBinaryString).replace(' ', '0').grouped(8).mkString(" "))
                 //                else println(String.format("%32s", (speakingBuffer1.states(0) << 28).toBinaryString).replace(' ', '0').grouped(8).mkString(" "))
                 //                println()
-                println(s"Round: $round, Max: $maxBelief, Min: $minBelief")
+                //println(s"Round: $round, Max: $maxBelief, Min: $minBelief")
                 if ((maxBelief - minBelief) < runMetadata.stopThreshold) {
                     //                    println(s"Consensus! \nFinal round: $round\n" +
                     //                              s"Belief diff: of ${maxBelief - minBelief} ($maxBelief - $minBelief)")

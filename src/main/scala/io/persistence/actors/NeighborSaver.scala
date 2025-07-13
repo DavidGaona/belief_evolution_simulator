@@ -17,7 +17,7 @@ case class NeighborStructure(
     source: UUID,
     target: UUID,
     value: Float,
-    bias: CognitiveBiasType
+    bias: Byte
 )
 
 class NeighborSaver(numberOfAgents: Int) extends Actor {

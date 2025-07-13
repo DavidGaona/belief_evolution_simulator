@@ -34,7 +34,6 @@ case class RunMetadata(
 )
 
 case class OptionalMetadata(
-    recencyFunction: Option[(Float, Int) => Float],
     density: Option[Int],
     degreeDistribution: Option[Float]
 )
@@ -44,11 +43,11 @@ case object GetStatus
 
 case class AddNetworks(
     channelId: String,
-    agentTypeCount: Array[(SilenceStrategyType, SilenceEffectType, Int)],
+    agentTypeCount: Array[(Byte, Byte, Int)],
     agentBiases: Array[(Byte, Int)],
+    optionalParams: mutable.Map[Int, (Float, Float)],
     distribution: Distribution,
     saveMode: SaveMode,
-    recencyFunction: Option[(Float, Int) => Float],
     numberOfNetworks: Int,
     density: Int,
     iterationLimit: Int,
@@ -65,14 +64,12 @@ case class AddSpecificNetwork(
     stopThreshold: Float,
     iterationLimit: Int,
     name: String,
-    recencyFunction: Option[(Float, Int) => Float]
 )
 
 case class AddNetworksFromExistingRun(
     runId: Int,
-    agentTypeCount: Array[(SilenceStrategyType, SilenceEffectType, Int)],
-    agentBiases: Array[(CognitiveBiasType, Float)],
-    recencyFunction: Option[(Float, Int) => Float],
+    agentTypeCount: Array[(Byte, Byte, Int)],
+    agentBiases: Array[(Byte, Float)],
     saveMode: SaveMode,
     stopThreshold: Float,
     iterationLimit: Int
@@ -80,9 +77,8 @@ case class AddNetworksFromExistingRun(
 
 case class AddNetworksFromExistingNetwork(
     networkId: UUID,
-    agentTypeCount: Array[(SilenceStrategyType, SilenceEffectType, Int)],
-    agentBiases: Array[(CognitiveBiasType, Float)],
-    recencyFunction: Option[(Float, Int) => Float],
+    agentTypeCount: Array[(Byte, Byte, Int)],
+    agentBiases: Array[(Byte, Float)],
     saveMode: SaveMode,
     stopThreshold: Float,
     iterationLimit: Int
@@ -93,15 +89,15 @@ case class AgentInitialState(
     initialBelief: Float,
     toleranceRadius: Float,
     toleranceOffset: Float,
-    silenceStrategy: SilenceStrategyType,
-    silenceEffect: SilenceEffectType
+    silenceStrategy: Byte,
+    silenceEffect: Byte
 )
 
 case class Neighbors(
     source: String,
     target: String,
     influence: Float,
-    bias: CognitiveBiasType
+    bias: Byte
 )
 
 case class RunCustomNetwork(customInfo: CustomRunInfo)
@@ -159,32 +155,11 @@ class Monitor extends Actor {
             val runActor = context.actorOf(Props(new Run(runMetadata, customInfo)), s"R$totalRuns")
             trackRunMemory(runActor, 1, customInfo.agentBeliefs.length, customInfo.target.length)
             simulationTimers.start(s"${runActor.path.name}")
-        
-//        case AddSpecificNetwork(agents, neighbors, distribution, saveMode, stopThreshold, iterationLimit, 
-//                                name, recencyFunction) =>
-//            totalRuns += 1
-//            val optionalMetadata = {
-//                if (recencyFunction.isEmpty) None
-//                else Some(OptionalMetadata(recencyFunction, None, None))
-//            }
-//            
-//            val runMetadata = RunMetadata(
-//                RunMode.Custom,
-//                saveMode,
-//                distribution,
-//                System.currentTimeMillis(),
-//                optionalMetadata,
-//                None,
-//                agentLimit,
-//                1, agents.length, iterationLimit, 0, stopThreshold
-//            )
-//            val actor = context.actorOf(Props(new Run(runMetadata, agents, neighbors, name)), s"R$totalRuns")
-//            trackRunMemory(actor, 1, agents.length, neighbors.length)
 
         
-        case AddNetworks(channelId, agentTypeCount, agentBiases, distribution, saveMode, recencyFunction, numberOfNetworks,
-        density, iterationLimit, seed, degreeDistribution, stopThreshold) =>
-            val optionalMetadata = Some(OptionalMetadata(recencyFunction, Some(density), Some(degreeDistribution)))
+        case AddNetworks(channelId, agentTypeCount, agentBiases, optionalParams, distribution, saveMode, 
+        numberOfNetworks, density, iterationLimit, seed, degreeDistribution, stopThreshold) =>
+            val optionalMetadata = Some(OptionalMetadata(Some(density), Some(degreeDistribution)))
             val revisedSeed: Long = if (seed.isEmpty) System.nanoTime() + numberOfNetworks + agentBiases(0)._2 else seed.get
             val runMetadata = RunMetadata(
                 channelId,
