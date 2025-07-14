@@ -8,21 +8,21 @@ package core.simulation.config
  * be classified as consensus, thus stopping the simulation.
  *
  */
-enum RunMode:
+object RunMode:
     /**
      * Represents a run that has its network generated with the network generating
      * algorithm, the user specifies how many agents of each type and how many
      * connections with their corresponding cognitive bias. Giving a good exploratory
      * option for users.
      */
-    case Generated
+    final val GENERATED: Byte = 0x00  
     
     /**
      * Represents a run where the user manually specifies the network structure,
      * defining each agent's connections, initial beliefs, and cognitive biases 
      * individually for precise control over the simulation setup.
      */
-    case Custom
+    final val CUSTOM: Byte = 0x01
     
     /**
      * Represents a run that reuses an existing simulation configuration while allowing
@@ -30,7 +30,14 @@ enum RunMode:
      * agent types, or cognitive biases. This provides a way to explore variations
      * of previously successful or interesting simulation setups.
      */
-    case Existing
+    final val EXISTING: Byte = 0x02
+    
+    /**
+     * Represents a run that is generated but with a custom network passed as a CSV file
+     * the file must look like:
+     * source, target
+     */
+    final val CSV: Byte = 0x10
     
     
 // --add-modules=jdk.incubator.vector -Xmx32g 

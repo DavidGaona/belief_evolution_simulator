@@ -6,12 +6,11 @@ import core.model.agent.behavior.bias.*
 import core.simulation.config.*
 import io.persistence.RoundRouter
 import io.web.CustomRunInfo
-import utils.rng.distributions.{CustomDistribution, Distribution}
+import utils.rng.distributions.{CustomDistribution, Distribution, Uniform}
 import utils.timers.CustomMultiTimer
 
 import java.util.UUID
 import scala.collection.mutable
-import scala.collection.mutable.ArrayBuffer
 
 // Monitor
 
@@ -19,7 +18,7 @@ import scala.collection.mutable.ArrayBuffer
 
 case class RunMetadata(
     channelId: String,
-    runMode: RunMode,
+    runMode: Byte,
     saveMode: SaveMode,
     distribution: Distribution,
     startTime: Long,
@@ -27,7 +26,7 @@ case class RunMetadata(
     var runId: Option[Int],
     var agentLimit: Int,
     numberOfNetworks: Int,
-    agentsPerNetwork: Int,
+    var agentsPerNetwork: Int,
     iterationLimit: Int,
     seed: Long,
     stopThreshold: Float
@@ -56,15 +55,7 @@ case class AddNetworks(
     stopThreshold: Float
 )
 
-case class AddSpecificNetwork(
-    agents: Array[AgentInitialState],
-    neighbors: Array[Neighbors],
-    distribution: Distribution,
-    saveMode: SaveMode,
-    stopThreshold: Float,
-    iterationLimit: Int,
-    name: String,
-)
+case class AddNetworksFromCSV(path: String, silenceEffect: Byte, silenceStrategy: Byte, bias: Byte)
 
 case class AddNetworksFromExistingRun(
     runId: Int,
@@ -82,15 +73,6 @@ case class AddNetworksFromExistingNetwork(
     saveMode: SaveMode,
     stopThreshold: Float,
     iterationLimit: Int
-)
-
-case class AgentInitialState(
-    name: String,
-    initialBelief: Float,
-    toleranceRadius: Float,
-    toleranceOffset: Float,
-    silenceStrategy: Byte,
-    silenceEffect: Byte
 )
 
 case class Neighbors(
@@ -139,7 +121,7 @@ class Monitor extends Actor {
             
             val runMetadata = RunMetadata(
                 customInfo.channelId,
-                RunMode.Custom,
+                RunMode.CUSTOM,
                 customInfo.saveMode,
                 CustomDistribution,
                 System.currentTimeMillis(),
@@ -163,14 +145,15 @@ class Monitor extends Actor {
             val revisedSeed: Long = if (seed.isEmpty) System.nanoTime() + numberOfNetworks + agentBiases(0)._2 else seed.get
             val runMetadata = RunMetadata(
                 channelId,
-                RunMode.Generated,
+                RunMode.GENERATED,
                 saveMode,
                 distribution,
                 System.currentTimeMillis(),
                 optionalMetadata,
                 None,
                 agentLimit,
-                numberOfNetworks, agentTypeCount.map(_._3).sum, iterationLimit, revisedSeed, stopThreshold)
+                numberOfNetworks, agentTypeCount.map(_._3).sum, iterationLimit, revisedSeed, stopThreshold
+            )
             totalRuns += 1
             val n = runMetadata.agentsPerNetwork
             val m = density
@@ -178,6 +161,32 @@ class Monitor extends Actor {
             val actor = context.actorOf(Props(new Run(runMetadata, agentTypeCount, agentBiases)), s"R$totalRuns")
             val numberOfNeighbors = (m * (m-1)) + (n - m) * (2 * m)
             trackRunMemory(actor, numberOfNetworks, runMetadata.agentsPerNetwork, numberOfNeighbors)
+            
+            simulationTimers.start(s"${actor.path.name}")
+            actor ! StartRun
+        
+        case AddNetworksFromCSV(path, silenceEffect, silenceStrategy, bias) =>
+            totalRuns += 1
+            val optionalMetadata = Some(OptionalMetadata(Some(0), Some(0)))
+            val runMetadata = RunMetadata(
+                "0",
+                RunMode.CSV,
+                Debug,
+                Uniform,
+                System.currentTimeMillis(),
+                optionalMetadata,
+                None,
+                agentLimit,
+                1,
+                1,
+                1_000_000,
+                42L,
+                0.00001f
+            )
+            val agentTypeCount = Array((silenceStrategy, silenceEffect, 18470))
+            val agentBiases = Array((bias, 61157))
+            val actor = context.actorOf(Props(new Run(runMetadata, path, agentTypeCount, agentBiases)), s"R$totalRuns")
+            trackRunMemory(actor, 1, runMetadata.agentsPerNetwork, 61157)
             
             simulationTimers.start(s"${actor.path.name}")
             actor ! StartRun

@@ -104,7 +104,7 @@ class FenwickTree(size: Int, density: Int, setValue: Double, seed: Long, countFr
         while (i < density) {
             scoresArr(arr(i + indexStart) + 1) += 1
             updateTree(arr(i + indexStart), scoresArr(arr(i + indexStart) + 1))
-            if (countFreqs) freqs(arr(i + indexStart) + 1) += 1
+            if (countFreqs) freqs(arr(i + indexStart) + 1) += 8
             i += 1
         }
         

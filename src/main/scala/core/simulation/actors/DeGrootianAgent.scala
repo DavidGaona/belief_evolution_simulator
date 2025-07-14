@@ -349,7 +349,7 @@ class Agent(
         //println(s"${belief.mkString("Array(", ", ", ")")}")
         round += 1
         if (runMetadata.saveMode.includesRounds) snapshotAgentState(false, readBeliefBuffer, writeSpeakingBuffer)
-        sendRoundToWebSocketServer(writeBeliefBuffer, writeSpeakingBuffer)
+        //sendRoundToWebSocketServer(writeBeliefBuffer, writeSpeakingBuffer)
         context.parent ! AgentUpdated(maxBelief, minBelief, existsStableAgent)
     }
     

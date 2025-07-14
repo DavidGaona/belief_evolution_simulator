@@ -10,15 +10,18 @@ import io.web.CustomRunInfo
 import utils.datastructures.{FenwickTree, UUIDS}
 import utils.rng.distributions.BimodalDistribution
 
+import java.io.{File, FileWriter, PrintWriter}
 import java.nio.ByteBuffer
 import java.util.UUID
 import scala.collection.mutable
 import scala.concurrent.duration.*
+import scala.util.Using
 // Network
 
 // Messages
 case class BuildCustomNetwork(customRunInfo: CustomRunInfo) // Monitor -> Network
 case class AgentUpdated(maxBelief: Float, minBelief: Float, isStable: Boolean) // Agent -> network
+case class BuildNetworkFromCSV(neighborsArr: Array[Int], offsetsArr: Array[Int]) // Monitor -> network
 
 case object BuildNetwork // Monitor -> network
 case object RunNetwork // Monitor -> network
@@ -158,7 +161,59 @@ class Network(networkId: UUID,
             
             context.become(running)
             context.parent ! BuildingComplete(networkId)
+        
+        case BuildNetworkFromCSV(neighborsArr, offsetsArr) =>
+            neighborsRefs = neighborsArr
+            Array.copy(offsetsArr, 0, indexOffset, 0, offsetsArr.length)
+            neighborsWeights = new Array[Float](neighborsRefs.length)
+            neighborBiases = new Array[Byte](neighborsRefs.length)
             
+            uuids.v7Bulk(agentsIds)
+            val agentsRemaining: Array[Int] = agentTypeCount.map(_._3)
+            var agentRemainingCount = runMetadata.agentsPerNetwork
+            
+            var i = 0
+            while (i < numberOfAgentActors) {
+                // Get the proportion of agents
+                val agentTypes = getNextBucketDistribution(agentsRemaining, agentsPerActor(i), agentRemainingCount)
+                
+                // Set the agent types
+                var j = 0
+                var total = 0
+                while (j < agentTypes.length) {
+                    var k = 0
+                    while (k < agentTypes(j)) {
+                        silenceStrategy(total + bucketStart(i)) = agentTypeCount(j)._1
+                        val effect = agentTypeCount(j)._2
+                        silenceEffect(total + bucketStart(i)) = effect
+                        hasMemory(total + bucketStart(i)) = if (effect == SilenceEffect.MEMORY) 1 else 0
+                        k += 1
+                        total += 1
+                    }
+                    j += 1
+                }
+                agentRemainingCount -= agentsPerActor(i)
+                val biasCounts = new mutable.HashMap[Byte, Int]()
+                agentBiases.foreach((key, value) => biasCounts.put(key, value))
+                // Create the agent actor
+                val index = i
+                agents(i) = context.actorOf(Props(
+                    new Agent(
+                        agentsIds, silenceStrategy, silenceEffect, threshold,
+                        confidenceState,runMetadata, beliefBuffer1, beliefBuffer2,
+                        speakingBuffer1, speakingBuffer2, privateBeliefs, publicBelief,
+                        tolRadius, tolOffset, indexOffset, timesStable,
+                        neighborsRefs, neighborsWeights, neighborBiases, hasMemory,
+                        Some(biasCounts), networkId, agentsPerActor(index), bucketStart(index), null
+                    )
+                ), s"${self.path.name}_A$i")
+                i += 1
+            }
+            
+            context.become(running)
+            context.parent ! BuildingComplete(networkId)
+            
+        
         case BuildNetwork =>
             val density = runMetadata.optionalMetaData.get.density.get
             // Declare arrays of size -m^2 - m + 2mn <->  m(m-1) + (n - m) * 2m
@@ -310,6 +365,7 @@ class Network(networkId: UUID,
     // Running State
     private def running: Receive = {
         case RunNetwork =>
+            //exportAgentDataToCSV("rt-pol-evo.csv", round, privateBeliefs, speakingBuffer1)
             // agents.foreach { agent => agent ! SaveAgentStaticData }
             pendingResponses = agents.length
             var i = 0
@@ -328,21 +384,21 @@ class Network(networkId: UUID,
 //                println()
                 round += 1
                 //sendNeighbors()
-//                Using(new PrintWriter("agent_influences.csv")) { writer =>
-//                    // Write CSV header
-//                    writer.println("From,To,Influence")
-//
-//                    var i = 0
-//                    var j = 0
-//                    while (i < runMetadata.agentsPerNetwork) {
-//                        while (j < indexOffset(i)) {
-//                            println(s"From Agent${neighborsRefs(j)}, to Agent$i, influence:${neighborsWeights(j)}")
-//                            writer.println(s"Agent${neighborsRefs(j)},Agent$i,${neighborsWeights(j)}")
-//                            j += 1
-//                        }
-//                        i += 1
-//                    }
-//                }
+                Using(new PrintWriter("agent_influences.csv")) { writer =>
+                    // Write CSV header
+                    writer.println("Source,Target,Influence")
+
+                    var i = 0
+                    var j = 0
+                    while (i < runMetadata.agentsPerNetwork) {
+                        while (j < indexOffset(i)) {
+                            //println(s"From Agent${neighborsRefs(j)}, to Agent$i, influence:${neighborsWeights(j)}")
+                            writer.println(s"Agent${neighborsRefs(j)},Agent$i,${neighborsWeights(j)}")
+                            j += 1
+                        }
+                        i += 1
+                    }
+                }
                 runRound()
                 pendingResponses = agents.length
             }
@@ -354,6 +410,12 @@ class Network(networkId: UUID,
             maxBelief = math.max(maxBelief, maxActorBelief)
             minBelief = math.min(minBelief, minActorBelief)
             if (pendingResponses == 0) {
+//                if (bufferSwitch) {
+//                    exportAgentDataToCSV("rt-pol-evo.csv", round, privateBeliefs, speakingBuffer1)
+//                } else {
+//                    exportAgentDataToCSV("rt-pol-evo.csv", round, privateBeliefs, speakingBuffer2)
+//                }
+
 //                println(s"Round: $round")
 //                println(privateBeliefs.mkString("Private(", ", ", ")"))
 //                if (bufferSwitch) println(beliefBuffer2.mkString("Public(", ", ", ")"))
@@ -364,7 +426,7 @@ class Network(networkId: UUID,
                 //                if (bufferSwitch) println(String.format("%32s", (speakingBuffer2.states(0) << 28).toBinaryString).replace(' ', '0').grouped(8).mkString(" "))
                 //                else println(String.format("%32s", (speakingBuffer1.states(0) << 28).toBinaryString).replace(' ', '0').grouped(8).mkString(" "))
                 //                println()
-                //println(s"Round: $round, Max: $maxBelief, Min: $minBelief")
+                println(s"Round: $round, Max: $maxBelief, Min: $minBelief")
                 if ((maxBelief - minBelief) < runMetadata.stopThreshold) {
                     //                    println(s"Consensus! \nFinal round: $round\n" +
                     //                              s"Belief diff: of ${maxBelief - minBelief} ($maxBelief - $minBelief)")
@@ -484,5 +546,44 @@ class Network(networkId: UUID,
         // buffer.put(neighborBiases)
        
         Server.sendNeighborBinaryData(runMetadata.channelId, buffer)
+    }
+    
+    /**
+     * Exports agent data to CSV file, appending if file exists
+     *
+     * @param filePath       Path to the CSV file
+     * @param round          Current round number
+     * @param privateBeliefs Array of agent beliefs
+     * @param speakingBuffer Array of agent speaking status
+     */
+    def exportAgentDataToCSV(
+        filePath: String,
+        round: Int,
+        privateBeliefs: Array[Float],
+        speakingBuffer: Array[Byte]
+    ): Unit = {
+        
+        val file = new File(filePath)
+        val fileExists = file.exists()
+        
+        // Use FileWriter with append=true to add to existing file
+        val writer = new PrintWriter(new FileWriter(file, true))
+        
+        try {
+            // Write header only if file doesn't exist or is empty
+            if (!fileExists || file.length() == 0) {
+                writer.println("id,round,belief,speaking")
+            }
+            
+            // Write data for each agent
+            var agentId = 0
+            while (agentId < privateBeliefs.length) {
+                writer.println(s"$agentId,$round,${privateBeliefs(agentId)},${speakingBuffer(agentId)}")
+                agentId += 1
+            }
+            
+        } finally {
+            writer.close()
+        }
     }
 }

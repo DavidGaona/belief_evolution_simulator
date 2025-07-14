@@ -279,7 +279,7 @@ object DatabaseManager {
     
     // --------------------------------------------------------------
     def createRun(
-                   runMode: RunMode,
+                   runMode: Byte,
                    saveMode: SaveMode,
                    numberOfNetworks: Int,
                    density: Option[Int],

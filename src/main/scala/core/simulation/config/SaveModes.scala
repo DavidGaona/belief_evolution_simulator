@@ -33,7 +33,6 @@ sealed trait BaseMode extends SaveMode {
     def includesNeighbors: Boolean = true
 }
 
-// Save modes implementations
 case object Full extends BaseMode {
     def includesFirstRound: Boolean = true
     def includesRounds: Boolean = true
@@ -55,7 +54,6 @@ case class RoundSampling(sampleInterval: Int) extends BaseMode {
     def savesToDB: Boolean = true
 }
 
-// Re-create and compare final round values
 case object Standard extends BaseMode {
     def includesFirstRound: Boolean = true
     def includesRounds: Boolean = false
@@ -66,7 +64,6 @@ case object Standard extends BaseMode {
     def savesToDB: Boolean = true
 }
 
-// Re-create a network
 case object StandardLight extends BaseMode {
     def includesFirstRound: Boolean = true
     def includesRounds: Boolean = false
@@ -136,7 +133,6 @@ object SaveMode {
         if (mode.allowsNeighborless) NeighborlessMode(mode) else mode
     }
     
-    // Helper method to check if a configuration is valid
     def isValidConfiguration(mode: SaveMode): Boolean = {
         true
     }

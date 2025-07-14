@@ -12,13 +12,8 @@ import utils.rng.distributions.CustomDistribution
 import utils.timers.CustomMultiTimer
 
 import java.util.UUID
-
-enum LoadType:
-    case NoLoad
-    case NetworkLoad
-    case StatelessRunLoad
-    case NeighborlessLoad
-    case FullRunLoad
+import scala.collection.mutable
+import scala.io.Source
 
 // Saving classes
 case class AgentStateLoad(
@@ -96,7 +91,6 @@ class Run extends Actor {
     var agentStates: Option[Array[(UUID, Float, Float, Option[Float], Option[Integer], Float,
       Option[Array[Byte]])]] = None
     var BuildMessage: Any = null
-    var loadType: LoadType = null
     var totalLoaded: Int = 0
     val preFetchThreshold: Float = 0.75
     
@@ -124,7 +118,6 @@ class Run extends Actor {
         }
         networks = Array(network)
         BuildMessage = BuildCustomNetwork(customRunInfo)
-        loadType = LoadType.NoLoad
         networkRunTimes = Array.fill[Long](1)(-1L)
         networkBuildTimes = Array.fill[Long](1)(-1L)
         buildingTimers.start(network.path.name)
@@ -142,7 +135,21 @@ class Run extends Actor {
         this.agentBiases = agentBiases
         initializeGeneratedRun()
         BuildMessage = BuildNetwork
-        loadType = LoadType.NoLoad
+    }
+    
+    // Run generated network from CSV file
+    def this(runMetadata: RunMetadata,
+        path: String,
+        agentTypeCount: Array[(Byte, Byte, Int)],
+        agentBiases: Array[(Byte, Int)]
+    ) = {
+        this()
+        this.runMetadata = runMetadata
+        this.agentTypeCount = agentTypeCount
+        this.agentBiases = agentBiases
+        initializeGeneratedRun()
+        val (neighbors, offsets) = parseNetworkBiCSV(path)
+        BuildMessage = BuildNetworkFromCSV(neighbors, offsets)
     }
     
     private def initializeGeneratedRun(): Unit = {
@@ -239,7 +246,8 @@ class Run extends Actor {
                            |----------------------------
                            |Run ${runMetadata.runId.get} with ${
                             runMetadata.runMode match
-                                case RunMode.Custom => "Custom network"
+                                case RunMode.CUSTOM => "Custom network"
+                                case RunMode.CSV => "CSV network"
                                 case _ => f"density ${runMetadata.optionalMetaData.get.density.get}"
                         } and ${runMetadata.numberOfNetworks} networks of ${runMetadata.agentsPerNetwork} agents
                            |Max rounds: $maxRound
@@ -318,6 +326,166 @@ class Run extends Actor {
         
         buildingTimers.start(networks(index).path.name)
         networks(index) ! BuildMessage
+    }
+    
+    private def parseNetworkCSV(path: String): (Array[Int], Array[Int]) = {
+        val source = Source.fromFile(path)
+        val lines = source.getLines().toArray
+        source.close()
+        
+        val equivalentIndex = mutable.Map[Int, Int]()
+        val outgoingCount = mutable.Map[Int, Int]()
+        var numberOfNeighbors = 0
+        var nextIndex = 0
+
+        var i = 1
+        while (i < lines.length) {
+            val line = lines(i).trim
+            if (line.nonEmpty) {
+                val parts = line.split(",")
+                val sourceId = parts(0).toInt
+                val targetId = parts(1).toInt
+                
+                if (!equivalentIndex.contains(sourceId)) {
+                    equivalentIndex(sourceId) = nextIndex
+                    outgoingCount(nextIndex) = 0
+                    nextIndex += 1
+                }
+                
+                if (!equivalentIndex.contains(targetId)) {
+                    equivalentIndex(targetId) = nextIndex
+                    outgoingCount(nextIndex) = 0
+                    nextIndex += 1
+                }
+                
+                // Count outgoing edge for source
+                val sourceInternalId = equivalentIndex(sourceId)
+                outgoingCount(sourceInternalId) = outgoingCount(sourceInternalId) + 1
+                numberOfNeighbors += 1
+            }
+            i += 1
+        }
+        
+        val numNodes = nextIndex
+        val neighborsArr = new Array[Int](numberOfNeighbors)
+        val offsetsArr = new Array[Int](numNodes)
+        
+        var currentOffset = 0
+        var nodeId = 0
+        while (nodeId < numNodes) {
+            currentOffset += outgoingCount(nodeId)
+            offsetsArr(nodeId) = currentOffset - 1
+            nodeId += 1
+        }
+        
+        val currentPos = new Array[Int](numNodes)
+        nodeId = 0
+        while (nodeId < numNodes) {
+            currentPos(nodeId) = if (nodeId == 0) 0 else offsetsArr(nodeId - 1) + 1
+            nodeId += 1
+        }
+        
+        i = 1
+        while (i < lines.length) {
+            val line = lines(i).trim
+            if (line.nonEmpty) {
+                val parts = line.split(",")
+                val sourceId = parts(0).toInt
+                val targetId = parts(1).toInt
+                
+                val sourceInternalId = equivalentIndex(sourceId)
+                val targetInternalId = equivalentIndex(targetId)
+                
+                neighborsArr(currentPos(sourceInternalId)) = targetInternalId
+                currentPos(sourceInternalId) += 1
+            }
+            i += 1
+        }
+        
+        (neighborsArr, offsetsArr)
+    }
+    
+    private def parseNetworkBiCSV(path: String): (Array[Int], Array[Int]) = {
+        val source = Source.fromFile(path)
+        val lines = source.getLines().toArray
+        source.close()
+        
+        val equivalentIndex = mutable.Map[Int, Int]()
+        val outgoingCount = mutable.Map[Int, Int]()
+        var numberOfNeighbors = 0
+        var nextIndex = 0
+        
+        var i = 1
+        while (i < lines.length) {
+            val line = lines(i).trim
+            if (line.nonEmpty) {
+                val parts = line.split(",")
+                val sourceId = parts(0).toInt
+                val targetId = parts(1).toInt
+                
+                if (!equivalentIndex.contains(sourceId)) {
+                    equivalentIndex(sourceId) = nextIndex
+                    outgoingCount(nextIndex) = 0
+                    nextIndex += 1
+                }
+                
+                if (!equivalentIndex.contains(targetId)) {
+                    equivalentIndex(targetId) = nextIndex
+                    outgoingCount(nextIndex) = 0
+                    nextIndex += 1
+                }
+                
+                val sourceInternalId = equivalentIndex(sourceId)
+                val targetInternalId = equivalentIndex(targetId)
+                
+                outgoingCount(sourceInternalId) = outgoingCount(sourceInternalId) + 1
+                outgoingCount(targetInternalId) = outgoingCount(targetInternalId) + 1
+                
+                numberOfNeighbors += 2
+            }
+            i += 1
+        }
+        
+        val numNodes = nextIndex
+        val neighborsArr = new Array[Int](numberOfNeighbors)
+        val offsetsArr = new Array[Int](numNodes)
+        
+        var currentOffset = 0
+        var nodeId = 0
+        while (nodeId < numNodes) {
+            currentOffset += outgoingCount(nodeId)
+            offsetsArr(nodeId) = currentOffset - 1
+            nodeId += 1
+        }
+        
+        val currentPos = new Array[Int](numNodes)
+        nodeId = 0
+        while (nodeId < numNodes) {
+            currentPos(nodeId) = if (nodeId == 0) 0 else offsetsArr(nodeId - 1) + 1
+            nodeId += 1
+        }
+        
+        i = 1
+        while (i < lines.length) {
+            val line = lines(i).trim
+            if (line.nonEmpty) {
+                val parts = line.split(",")
+                val sourceId = parts(0).toInt
+                val targetId = parts(1).toInt
+                
+                val sourceInternalId = equivalentIndex(sourceId)
+                val targetInternalId = equivalentIndex(targetId)
+                
+                neighborsArr(currentPos(sourceInternalId)) = targetInternalId
+                currentPos(sourceInternalId) += 1
+                
+                neighborsArr(currentPos(targetInternalId)) = sourceInternalId
+                currentPos(targetInternalId) += 1
+            }
+            i += 1
+        }
+        
+        (neighborsArr, offsetsArr)
     }
     
     private def fetchBatch(runId: Int, limit: Int, offset: Int): Unit = {
