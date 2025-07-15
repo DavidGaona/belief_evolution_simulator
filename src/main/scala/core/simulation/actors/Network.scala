@@ -3,11 +3,13 @@ package core.simulation.actors
 import akka.actor.{Actor, ActorRef, Props}
 import akka.util.Timeout
 import core.model.agent.behavior.silence.*
+import core.simulation.config.{AppMode, GlobalState}
 import io.db.DatabaseManager
 import io.web.Server
 import io.persistence.actors.{AgentStaticDataSaver, NeighborSaver}
 import io.web.CustomRunInfo
 import utils.datastructures.{FenwickTree, UUIDS}
+import utils.logging.{log, logError}
 import utils.rng.distributions.BimodalDistribution
 
 import java.io.{File, FileWriter, PrintWriter}
@@ -365,8 +367,8 @@ class Network(networkId: UUID,
     // Running State
     private def running: Receive = {
         case RunNetwork =>
-            //exportAgentDataToCSV("rt-pol-evo.csv", round, privateBeliefs, speakingBuffer1)
-            // agents.foreach { agent => agent ! SaveAgentStaticData }
+            // Remove comment to export round data to csv, in big networks the csv can be VERY big
+            // exportAgentDataToCSV("rt-pol-evo.csv", round, privateBeliefs, speakingBuffer1)
             pendingResponses = agents.length
             var i = 0
             while (i < agents.length) {
@@ -377,28 +379,9 @@ class Network(networkId: UUID,
         case RunFirstRound =>
             pendingResponses -= 1
             if (pendingResponses == 0) {
-//                println(s"Round: $round")
-//                println(privateBeliefs.mkString("Private(", ", ", ")"))
-//                if (bufferSwitch) println(beliefBuffer2.mkString("Public(", ", ", ")"))
-//                else println(beliefBuffer1.mkString("Public(", ", ", ")"))
-//                println()
+                logAgentRoundState()
                 round += 1
                 //sendNeighbors()
-                Using(new PrintWriter("agent_influences.csv")) { writer =>
-                    // Write CSV header
-                    writer.println("Source,Target,Influence")
-
-                    var i = 0
-                    var j = 0
-                    while (i < runMetadata.agentsPerNetwork) {
-                        while (j < indexOffset(i)) {
-                            //println(s"From Agent${neighborsRefs(j)}, to Agent$i, influence:${neighborsWeights(j)}")
-                            writer.println(s"Agent${neighborsRefs(j)},Agent$i,${neighborsWeights(j)}")
-                            j += 1
-                        }
-                        i += 1
-                    }
-                }
                 runRound()
                 pendingResponses = agents.length
             }
@@ -410,26 +393,17 @@ class Network(networkId: UUID,
             maxBelief = math.max(maxBelief, maxActorBelief)
             minBelief = math.min(minBelief, minActorBelief)
             if (pendingResponses == 0) {
-//                if (bufferSwitch) {
-//                    exportAgentDataToCSV("rt-pol-evo.csv", round, privateBeliefs, speakingBuffer1)
-//                } else {
-//                    exportAgentDataToCSV("rt-pol-evo.csv", round, privateBeliefs, speakingBuffer2)
-//                }
-
-//                println(s"Round: $round")
-//                println(privateBeliefs.mkString("Private(", ", ", ")"))
-//                if (bufferSwitch) println(beliefBuffer2.mkString("Public(", ", ", ")"))
-//                else println(beliefBuffer1.mkString("Public(", ", ", ")"))
-//                if (bufferSwitch) println(speakingBuffer2.mkString("Speaking(", ", ", ")"))
-//                else println(speakingBuffer1.mkString("Speaking(", ", ", ")"))
-//                println()
-                //                if (bufferSwitch) println(String.format("%32s", (speakingBuffer2.states(0) << 28).toBinaryString).replace(' ', '0').grouped(8).mkString(" "))
-                //                else println(String.format("%32s", (speakingBuffer1.states(0) << 28).toBinaryString).replace(' ', '0').grouped(8).mkString(" "))
-                //                println()
-                println(s"Round: $round, Max: $maxBelief, Min: $minBelief")
+                // Remove comment to export round data to csv, in big networks the csv can be VERY big
+                // if (bufferSwitch) {
+                //    exportAgentDataToCSV("rt-pol-evo.csv", round, privateBeliefs, speakingBuffer1)
+                // } else {
+                //    exportAgentDataToCSV("rt-pol-evo.csv", round, privateBeliefs, speakingBuffer2)
+                // }
+                logAgentRoundState()
+                log(s"Round: $round, Max: $maxBelief, Min: $minBelief")
                 if ((maxBelief - minBelief) < runMetadata.stopThreshold) {
-                    //                    println(s"Consensus! \nFinal round: $round\n" +
-                    //                              s"Belief diff: of ${maxBelief - minBelief} ($maxBelief - $minBelief)")
+                    log(s"Consensus! \nFinal round: $round\n" +
+                      s"Belief diff: of ${maxBelief - minBelief} ($maxBelief - $minBelief)")
                     context.parent ! RunningComplete(networkId, round, 1)
                     if (runMetadata.saveMode.includesNetworks) DatabaseManager.updateNetworkFinalRound(networkId, round, true)
                     if (runMetadata.saveMode.includesLastRound) agents.foreach { agent => agent ! SnapShotAgent }
@@ -437,8 +411,8 @@ class Network(networkId: UUID,
                     finishedIterating = true
                 }
                 else if (round == runMetadata.iterationLimit || !shouldContinue) {
-                    //                    println(s"Dissensus \nFinal round: $round\n" +
-                    //                              s"Belief diff: of ${maxBelief - minBelief} ($maxBelief - $minBelief)")
+                    log(s"Dissensus \nFinal round: $round\n" +
+                      s"Belief diff: of ${maxBelief - minBelief} ($maxBelief - $minBelief)")
                     context.parent ! RunningComplete(networkId, round, 0)
                     if (runMetadata.saveMode.includesNetworks) DatabaseManager.updateNetworkFinalRound(networkId, round, false)
                     if (runMetadata.saveMode.includesLastRound) agents.foreach { agent => agent ! SnapShotAgent }
@@ -472,8 +446,9 @@ class Network(networkId: UUID,
     }
     
     
-    // Functions:
-    def getNextBucketDistribution(agentsRemaining: Array[Int], bucketSize: Int, totalAgentsRemaining: Int): Array[Int] = {
+    // Helper function Functions:
+    
+    private def getNextBucketDistribution(agentsRemaining: Array[Int], bucketSize: Int, totalAgentsRemaining: Int): Array[Int] = {
         val result = new Array[Int](agentsRemaining.length)
         val floatPart = new Array[Double](agentsRemaining.length)
         var i = 0
@@ -499,7 +474,7 @@ class Network(networkId: UUID,
         result
     }
     
-    @inline def calculateAgentsPerActor(): Unit = {
+    @inline private def calculateAgentsPerActor(): Unit = {
         var i = 0
         var remainingToAssign = runMetadata.agentsPerNetwork
         while (0 < remainingToAssign) {
@@ -509,7 +484,7 @@ class Network(networkId: UUID,
         }
     }
     
-    @inline def calculateCumSum(): Unit = {
+    @inline private def calculateCumSum(): Unit = {
         for (i <- 1 until numberOfAgentActors)
             bucketStart(i) = agentsPerActor(i - 1) + bucketStart(i - 1)
     }
@@ -523,6 +498,28 @@ class Network(networkId: UUID,
         agents(i)
     }
     
+    /**
+     * Logs the state of agent rounds during execution if the application is in DEBUG_VERBOSE mode.
+     * This includes the current round number, private beliefs, public belief buffers, and speaking buffers.
+     * The method outputs detailed logging for debugging purposes to help track agent state transitions per round.
+     *
+     * @return Unit
+     */
+    @inline private def logAgentRoundState(): Unit = {
+        if (GlobalState.APP_MODE == AppMode.DEBUG_VERBOSE) {
+            log(s"Round: $round")
+            log(privateBeliefs.mkString("Private(", ", ", ")"))
+            if (bufferSwitch) log(beliefBuffer2.mkString("Public(", ", ", ")"))
+            else log(beliefBuffer1.mkString("Public(", ", ", ")"))
+            if (bufferSwitch) log(speakingBuffer2.mkString("Speaking(", ", ", ")"))
+            else log(speakingBuffer1.mkString("Speaking(", ", ", ")"))
+            log("")
+        }
+    }
+    
+    /**
+     * Gather neighbor data to then send via web API
+     */
     private def sendNeighbors(): Unit = {
         // NetworkId
         // RunId
@@ -566,24 +563,61 @@ class Network(networkId: UUID,
         val file = new File(filePath)
         val fileExists = file.exists()
         
-        // Use FileWriter with append=true to add to existing file
-        val writer = new PrintWriter(new FileWriter(file, true))
-        
         try {
-            // Write header only if file doesn't exist or is empty
-            if (!fileExists || file.length() == 0) {
-                writer.println("id,round,belief,speaking")
+            log(s"Exporting data for round $round to $filePath (${privateBeliefs.length} agents)")
+            
+            Using(new PrintWriter(new FileWriter(file, true))) { writer =>
+                if (!fileExists || file.length() == 0) {
+                    log(s"Creating new CSV file with headers: $filePath")
+                    writer.println("id,round,belief,speaking")
+                }
+                
+                var agentId = 0
+                while (agentId < privateBeliefs.length) {
+                    writer.println(s"$agentId,$round,${privateBeliefs(agentId)},${speakingBuffer(agentId)}")
+                    agentId += 1
+                }
+                
+                log(s"Successfully exported round $round data to $filePath")
             }
             
-            // Write data for each agent
-            var agentId = 0
-            while (agentId < privateBeliefs.length) {
-                writer.println(s"$agentId,$round,${privateBeliefs(agentId)},${speakingBuffer(agentId)}")
-                agentId += 1
+        } catch {
+            case e: java.io.IOException =>
+                logError(s"Failed to write to CSV file '$filePath': ${e.getMessage}")
+            case e: java.lang.ArrayIndexOutOfBoundsException =>
+                logError(s"Array index error while processing agent data: ${e.getMessage}")
+            case e: Exception =>
+                logError(s"Unexpected error while exporting agent data to '$filePath': ${e.getMessage}")
+        }
+    }
+    
+    /**
+     * Exports neighbor data to CSV file, overwriting if file exists
+     */
+    def exportToNeighborsToCSV(): Unit = {
+        val filePath = "agent_influences.csv"
+        try {
+            Using(new PrintWriter(filePath)) { writer =>
+                log(s"Exporting neighbor data to $filePath (${neighborsRefs.length} neighbors)")
+                writer.println("Source,Target,Influence")
+                
+                var i = 0
+                var j = 0
+                while (i < runMetadata.agentsPerNetwork) {
+                    while (j < indexOffset(i)) {
+                        writer.println(s"Agent${neighborsRefs(j)},Agent$i,${neighborsWeights(j)}")
+                        j += 1
+                    }
+                    i += 1
+                }
             }
-            
-        } finally {
-            writer.close()
+        } catch {
+            case e: java.io.IOException =>
+                logError(s"Failed to write neighbor data to '$filePath': ${e.getMessage}")
+            case e: java.lang.ArrayIndexOutOfBoundsException =>
+                logError(s"Array index error while processing neighbor data - check data integrity: ${e.getMessage}")
+            case e: Exception =>
+                logError(s"Unexpected error while exporting neighbor data to '$filePath': ${e.getMessage}")
         }
     }
 }

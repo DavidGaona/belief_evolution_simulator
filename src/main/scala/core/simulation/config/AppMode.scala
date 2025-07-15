@@ -35,6 +35,13 @@ object AppMode {
      * Slowest of all modes, recommended use on small to medium size simulations.
      */
     final val DEBUG_SERVER: Byte = (0x10 | DEBUG).toByte
+    
+    /**
+     * Debug verbose mode - enables all logging, detailed error messages,
+     * and debugging features. Typically used during debugging sessions.
+     * Slowest performance due to high-impact logging.
+     */
+    final val DEBUG_VERBOSE: Byte = (0x20 | DEBUG).toByte
 }
 
 

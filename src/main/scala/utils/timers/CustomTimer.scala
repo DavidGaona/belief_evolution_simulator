@@ -1,5 +1,7 @@
 package utils.timers
 
+import utils.logging.log
+
 import java.util.concurrent.TimeUnit
 import scala.collection.mutable
 import scala.collection.mutable.Map
@@ -17,7 +19,7 @@ class CustomTimer {
         endTime = Some(System.nanoTime())
         val duration = endTime.get - startTime.getOrElse(throw new IllegalStateException("Timer was not started"))
         val durationInUnit = getTimeElapsed(duration, timeUnit)
-        println(s"$message: $durationInUnit ${timeUnit.toString.toLowerCase}")
+        log(s"$message: $durationInUnit ${timeUnit.toString.toLowerCase}")
     }
     
     def getTimeElapsed(duration: Long, timeUnit: TimeUnit = MILLISECONDS): Long = {
@@ -48,7 +50,7 @@ class CustomMultiTimer {
         
         val duration = endTime - startOpt.getOrElse(throw new IllegalStateException("Timer was not started"))
         val formattedDuration = formatDuration(duration, timeUnit)
-        if (printDuration) println(s"$key$msg: $formattedDuration")
+        if (printDuration) log(s"$key$msg: $formattedDuration")
         duration
     }
     

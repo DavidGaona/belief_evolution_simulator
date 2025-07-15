@@ -6,6 +6,7 @@ import core.model.agent.behavior.bias.*
 import core.simulation.config.*
 import io.persistence.RoundRouter
 import io.web.CustomRunInfo
+import utils.logging.{log, logWarning}
 import utils.rng.distributions.{CustomDistribution, Distribution, Uniform}
 import utils.timers.CustomMultiTimer
 
@@ -192,14 +193,14 @@ class Monitor extends Actor {
             actor ! StartRun
             
         case RunComplete =>
-            println("\nThe run has been complete\n")
+            log("\nThe run has been complete\n")
             val senderActor = sender().path.name
             simulationTimers.stop(senderActor)
             memoryLeft += activeRuns(senderActor)._2
             activeRuns -= senderActor
             
         case GetStatus =>
-            println(f"\nTotal runs: $totalRuns\n" +
+            log(f"\nTotal runs: $totalRuns\n" +
                       f"Active runs: ${activeRuns.size}\n" +
                       f"Total active networks: $totalActiveNetworks\n" +
                       f"Total active agents: $totalActiveAgents\n")
@@ -219,7 +220,7 @@ class Monitor extends Actor {
         if (memoryLeft >= runMemoryUsage) {
         
         } else {
-            println(s"Exceeding memory limits: ${memoryLeft}")
+            logWarning(s"Exceeding memory limits: ${memoryLeft}")
         }
         memoryLeft -= runMemoryUsage
         activeRuns += (runActor.path.name -> (runActor, runMemoryUsage))

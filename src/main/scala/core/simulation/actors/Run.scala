@@ -8,6 +8,7 @@ import io.db.DatabaseManager
 import io.persistence.RoundRouter
 import io.web.CustomRunInfo
 import utils.datastructures.UUIDS
+import utils.logging.log
 import utils.rng.distributions.CustomDistribution
 import utils.timers.CustomMultiTimer
 
@@ -217,7 +218,7 @@ class Run extends Actor {
             val hasReported = currentPercentage != ((numberOfNetworksFinished - 1).toDouble / runMetadata.numberOfNetworks * 100).toInt
             
             if (percentagePoints.contains(currentPercentage) && hasReported) {
-                println(s"Run ${runMetadata.runId.get} $numberOfNetworksFinished($currentPercentage%) Complete")
+                log(s"Run ${runMetadata.runId.get} $numberOfNetworksFinished($currentPercentage%) Complete")
             }
             
             if (runMetadata.saveMode.includesNetworks) {
@@ -236,12 +237,12 @@ class Run extends Actor {
                         "runs", "run_time")
                 }
                 RoundRouter.saveRemainingData()
-                // Show only on debug mode
+                
                 if (!runMetadata.saveMode.savesToDB) {
                     scala.util.Sorting.quickSort(networkBuildTimes)
                     scala.util.Sorting.quickSort(networkRunTimes)
                     val n = networkRunTimes.length
-                    println(
+                    log(
                         f"""
                            |----------------------------
                            |Run ${runMetadata.runId.get} with ${

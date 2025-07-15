@@ -8,8 +8,6 @@ import core.simulation.actors.{AddNetworksFromCSV, Monitor}
 import io.web.Server
 
 import java.lang
-import scala.collection.mutable
-import scala.io.Source
 import scala.reflect
 
 object Main extends App {
@@ -20,7 +18,7 @@ object Main extends App {
     // val cli = new CLI(system, monitor)
     // cli.start()
 
-    monitor ! AddNetworksFromCSV("rt-pol.csv", SilenceEffect.MEMORYLESS, SilenceStrategy.MAJORITY, CognitiveBiases.DEGROOT)
+    // monitor ! AddNetworksFromCSV("rt-pol.csv", SilenceEffect.MEMORYLESS, SilenceStrategy.MAJORITY, CognitiveBiases.DEGROOT)
     
     val runtime = Runtime.getRuntime
     val maxMemory = runtime.maxMemory() / (1024 * 1024)

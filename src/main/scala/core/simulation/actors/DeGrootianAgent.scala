@@ -9,6 +9,7 @@ import io.web.Server
 import io.persistence.RoundRouter
 import io.persistence.actors.{AgentState, AgentStatesSilent, AgentStatesSpeaking, NeighborStructure, SendNeighbors, SendStaticAgentData}
 import io.serialization.binary.Encoder
+import utils.logging.log
 import utils.rng.distributions.*
 
 import java.{lang, util}
@@ -122,11 +123,11 @@ class Agent(
                     )
                 }
                 
-                //println(s"Old radius: ${tolRadius(i)}, old offset(lower): ${tolOffset(i)}")
+                //log(s"Old radius: ${tolRadius(i)}, old offset(lower): ${tolOffset(i)}")
                 val radius = tolRadius(i)
                 tolRadius(i) = radius + tolOffset(i) // Become upper
                 tolOffset(i) = tolOffset(i) - radius // Become lower
-                //println(s"New radius: ${tolRadius(i)}, new offset(lower): ${tolOffset(i)}")
+                //log(s"New radius: ${tolRadius(i)}, new offset(lower): ${tolOffset(i)}")
                 if (runMetadata.saveMode.includesNeighbors) {
                     var j = indexOffset(math.max(0, i - 1))
                     while (j < indexOffset(i)) {
@@ -182,27 +183,23 @@ class Agent(
         val zeroVector = FloatVector.zero(vectorSpecies)
         val oneVector = FloatVector.broadcast(vectorSpecies, 1.0f)
         val negOneVector = FloatVector.broadcast(vectorSpecies, -1.0f)
-        //println("\n")
         
         // Update by groups
         while (i < (startsAt + numberOfAgents)) {
-            // Zero out the sums
             sum0 = 0f;
             sum1 = 0f;
             sum2 = 0f;
-            sum3 = 0f; //sum = FloatVector.zero(species)
+            sum3 = 0f; 
             inFavor = 0
             against = 0
-            // Note that currently tolRadius(i) = originalRadius(i) + originalOffset(i)
-            // and tolOffset(i) = originalOffset(i) - originalRadius(i)
+            // Note that currently tolRadius(i) = original_radius(i) + originalTolOffset(i)
+            //                     tolOffset(i) = originalTolOffset(i) - original_radius(i)
             val upper = tolRadius(i)
             val lower = tolOffset(i)
             val initialBelief = belief(i)
             var j = if (i > 0) indexOffset(i - 1) else 0
             val currentBias = neighborBiases(j)
-            val skipSIMD = marks.contains(i)
-            //val msb = 31 - Integer.numberOfLeadingZeros(indexOffset(i) - j)
-            //val vectorSpecies = floatSpeciesTable(Math.min(4, msb))
+            val skipSIMD = marks.contains(i) // Skips SIMD if agents have neighbors with multiple different biases
             val endLoopSIMD = indexOffset(i) - 15
 
             while (j < endLoopSIMD && !skipSIMD) {
@@ -269,7 +266,7 @@ class Agent(
                 j += vectorSpecies.length()
             }
             
-            //print(s"\nAgent$i")
+            //log(s"\nAgent$i")
             val endUnrolledLoop = indexOffset(i) - 3
             while (j < endUnrolledLoop) {
                 val neighborIndex0 = neighborsRefs(j)
@@ -308,7 +305,6 @@ class Agent(
             
             //print(s"(${round + 1}) = ${belief(i)} ")
             while (j < indexOffset(i)) {
-                //println(s"$j, ${indexOffset(i)}")
                 val neighborIndex = neighborsRefs(j)
                 val speaking: Int = readSpeakingBuffer(neighborIndex) | hasMemory(neighborIndex)
                 val beliefDifference: Float = readBeliefBuffer(neighborIndex) - initialBelief
@@ -332,7 +328,7 @@ class Agent(
             writeBeliefBuffer(i) = SilenceEffect.getPublicValue(
                 silenceEffect(i), i, belief(i), isSpeaking, publicBelief
             )
-            //println(s"For: $inFavor, Against: $against, Speaking: $isSpeaking")
+            //log(s"For: $inFavor, Against: $against, Speaking: $isSpeaking")
             
             // Stability check
             val isStable = math.abs(belief(i) - initialBelief) < stabilityThreshold // 0000001f
@@ -346,7 +342,6 @@ class Agent(
         }
         
         //println("\n---------------------------------------------------\n")
-        //println(s"${belief.mkString("Array(", ", ", ")")}")
         round += 1
         if (runMetadata.saveMode.includesRounds) snapshotAgentState(false, readBeliefBuffer, writeSpeakingBuffer)
         //sendRoundToWebSocketServer(writeBeliefBuffer, writeSpeakingBuffer)
@@ -383,7 +378,7 @@ class Agent(
                 } else {
                     roundDataSilent.addOne(AgentState(ids(i), belief(i), encoder.getBytes))
                 }
-                //println(encoder.getBytes.array().mkString(s"${i + startsAt} Array(", ", ", ")"))
+                //log(encoder.getBytes.array().mkString(s"${i + startsAt} Array(", ", ", ")"))
                 encoder.reset()
             }
             i += 1
@@ -450,11 +445,6 @@ class Agent(
         }
         
         hasUpdatedInfluences = true
-//        println(s"seed: ${runMetadata.seed}")
-//        println(indexOffset.mkString("offset(", ", ", ")"))
-//        println(neighborsRefs.mkString("Neighbors(", ", ", ")"))
-//        println(neighborsWeights.mkString("Influences(", ", ", ")"))
-//        println(neighborBiases.mkString("Biases(", ", ", ")\n"))
     }
     
     override def preStart(): Unit = {
