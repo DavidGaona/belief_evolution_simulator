@@ -2,6 +2,7 @@ package io.persistence.actors
 
 import akka.actor.{Actor, ActorRef}
 import core.model.agent.behavior.bias.*
+import core.model.agent.behavior.bias.CognitiveBiases.Bias
 import io.db.DatabaseManager
 
 import java.util.UUID
@@ -17,7 +18,7 @@ case class NeighborStructure(
     source: UUID,
     target: UUID,
     value: Float,
-    bias: Byte
+    bias: Bias
 )
 
 class NeighborSaver(numberOfAgents: Int) extends Actor {

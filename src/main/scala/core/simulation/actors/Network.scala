@@ -2,14 +2,17 @@ package core.simulation.actors
 
 import akka.actor.{Actor, ActorRef, Props}
 import akka.util.Timeout
+import core.model.agent.behavior.bias.CognitiveBiases.Bias
 import core.model.agent.behavior.silence.*
+import core.model.agent.behavior.silence.SilenceEffects.SilenceEffect
+import core.model.agent.behavior.silence.SilenceStrategies.SilenceStrategy
 import core.simulation.config.{AppMode, GlobalState}
 import io.db.DatabaseManager
 import io.web.Server
 import io.persistence.actors.{AgentStaticDataSaver, NeighborSaver}
 import io.web.CustomRunInfo
 import utils.datastructures.{FenwickTree, UUIDS}
-import utils.logging.{log, logError}
+import utils.logging.Logger
 import utils.rng.distributions.BimodalDistribution
 
 import java.io.{File, FileWriter, PrintWriter}
@@ -34,67 +37,68 @@ case object ActorFinished // Agent -> Network
 // Agent types
 
 // Actor
-class Network(networkId: UUID,
-    runMetadata: RunMetadata,
-    agentTypeCount: Array[(Byte, Byte, Int)],
-    agentBiases: Array[(Byte, Int)]) extends Actor {
-    // Agents
+class Network(networkId: UUID, runMetadata: RunMetadata,
+    agentTypeCount: Array[(SilenceStrategy, SilenceEffect, Int)],
+    agentBiases: Array[(Bias, Int)])
+  extends Actor {
+    // ============================================================================
+    // AGENT DISTRIBUTION AND ACTORS
+    // ============================================================================
     val numberOfAgentActors: Int = math.min(32, (runMetadata.agentsPerNetwork + 31) / 32)
-    val agentsPerActor: Array[Int] = new Array[Int](numberOfAgentActors)
-    calculateAgentsPerActor() // fill agents per actor
-    val bucketStart: Array[Int] = new Array[Int](numberOfAgentActors)
-    calculateCumSum() // Fill buckets
+    val agentsPerActor: Array[Int] = new Array[Int](numberOfAgentActors);calculateAgentsPerActor()
+    val bucketStart: Array[Int] = new Array[Int](numberOfAgentActors);calculateBucketStarts()
     val agents: Array[ActorRef] = Array.ofDim[ActorRef](numberOfAgentActors)
     val agentsIds: Array[UUID] = Array.ofDim[UUID](runMetadata.agentsPerNetwork)
-    val uuids = UUIDS()
-    val bimodal = new BimodalDistribution(0.25, 0.75)
     
-    // Belief buffers
+    // ============================================================================
+    // BELIEF AND COMMUNICATION BUFFERS (Double-buffered)
+    // ============================================================================
     val beliefBuffer1: Array[Float] = Array.fill(runMetadata.agentsPerNetwork)(-1f)
     val beliefBuffer2: Array[Float] = Array.fill(runMetadata.agentsPerNetwork)(-1f)
     val privateBeliefs: Array[Float] = Array.fill(runMetadata.agentsPerNetwork)(-1f)
-    
-    // Speaking buffers
     val speakingBuffer1: Array[Byte] = Array.fill(runMetadata.agentsPerNetwork)(1)
     val speakingBuffer2: Array[Byte] = Array.fill(runMetadata.agentsPerNetwork)(1)
-    //    val speakingBuffer1: AgentStates = AgentStates(runMetadata.agentsPerNetwork)
-    //    val speakingBuffer2: AgentStates = AgentStates(runMetadata.agentsPerNetwork)
+    var bufferSwitch: Boolean = true
     
-    // Agent Statics
+    // ============================================================================
+    // STATIC AGENT PROPERTIES AND BEHAVIORS
+    // ============================================================================
     val tolRadius: Array[Float] = Array.fill(runMetadata.agentsPerNetwork)(0.1f)
     val tolOffset: Array[Float] = Array.fill(runMetadata.agentsPerNetwork)(0.05f)
-    
-    // Behaviors
-    val silenceStrategy: Array[Byte] = new Array[Byte](runMetadata.agentsPerNetwork)
-    val silenceEffect: Array[Byte] = new Array[Byte](runMetadata.agentsPerNetwork)
+    val silenceStrategy: Array[SilenceStrategy] = new Array[SilenceStrategy](runMetadata.agentsPerNetwork)
+    val silenceEffect: Array[SilenceEffect] = new Array[SilenceEffect](runMetadata.agentsPerNetwork)
     val hasMemory: Array[Byte] = new Array[Byte](runMetadata.agentsPerNetwork)
+    val timesStable: Array[Int] = new Array[Int](runMetadata.agentsPerNetwork)
+    
+    // Dynamic properties state maps
     val threshold: mutable.Map[Int, Float] = mutable.Map[Int, Float]()
-    // (Threshold, Unbounded Confidence)
     val confidenceState: mutable.Map[Int, (Float, Float)] = mutable.Map[Int, (Float, Float)]()
     val publicBelief: mutable.Map[Int, Float] = mutable.Map[Int, Float]()
     
-    // Optional
-    var names: Array[String] = null
-    
-    // Neighbors
-    var neighborsRefs: Array[Int] = null // Size = -m^2 - m + 2mn or m(m-1) + (n - m) * 2m
+    // ============================================================================
+    // NETWORK TOPOLOGY (Size = -m^2 - m + 2mn or m(m-1) + (n - m) * 2m)
+    // ============================================================================
+    var neighborsRefs: Array[Int] = null
     var neighborsWeights: Array[Float] = null
-    var neighborBiases: Array[Byte] = null
+    var neighborBiases: Array[Bias] = null
     val indexOffset: Array[Int] = new Array[Int](runMetadata.agentsPerNetwork)
     
-    // Agent varying
-    val timesStable: Array[Int] = new Array[Int](runMetadata.agentsPerNetwork)
-    
-    // Data saving
-    var neighborSaver: ActorRef = null
-    var agentStaticDataSaver: ActorRef = null
-    
-    // Limits
-    implicit val timeout: Timeout = Timeout(600.seconds)
-    
-    // Round state
+    // ============================================================================
+    // SIMULATION STATE AND CONTROL
+    // ============================================================================
     var round: Int = 0
     var pendingResponses: Int = 0
+    var finishedIterating: Boolean = false
+    var minBelief: Float = 2.0f
+    var maxBelief: Float = -1.0f
+    var shouldUpdate: Boolean = false
+    var shouldContinue: Boolean = false
+    
+    // ============================================================================
+    // DATA PERSISTENCE
+    // ============================================================================
+    var neighborSaver: ActorRef = null
+    var agentStaticDataSaver: ActorRef = null
     var finishState: Int = 0
     if (runMetadata.saveMode.includesNeighbors) {
         finishState += 1
@@ -108,12 +112,14 @@ class Network(networkId: UUID,
             new AgentStaticDataSaver(numberOfAgentActors, networkId)
         ), name = s"StaticSaver_${self.path.name}")
     }
-    var finishedIterating: Boolean = false
-    var minBelief: Float = 2.0f
-    var maxBelief: Float = -1.0f
-    var shouldUpdate: Boolean = false
-    var shouldContinue: Boolean = false
-    var bufferSwitch: Boolean = true
+    
+    // ============================================================================
+    // UTILITIES
+    // ============================================================================
+    val uuids = UUIDS()
+    val bimodal = new BimodalDistribution(0.25, 0.75)
+    var names: Array[String] = null
+    implicit val timeout: Timeout = Timeout(600.seconds)
     
     def receive: Receive = building
     
@@ -135,7 +141,7 @@ class Network(networkId: UUID,
             for (i <- 0 until runMetadata.agentsPerNetwork) {
                 silenceStrategy(i) = customRunInfo.agentSilenceStrategy(i)
                 silenceEffect(i) = customRunInfo.agentSilenceEffect(i)
-                hasMemory(i) = if (silenceEffect(i) == SilenceEffect.MEMORY) 1 else 0
+                hasMemory(i) = if (silenceEffect(i) == SilenceEffects.MEMORY) 1 else 0
             }
             
             // Neighbors
@@ -148,7 +154,7 @@ class Network(networkId: UUID,
             for (i <- 0 until numberOfAgentActors) {
                 val index = i
                 agents(i) = context.actorOf(Props(
-                    new Agent(
+                    new AgentProcessor(
                         agentsIds, silenceStrategy, silenceEffect, threshold,
                         confidenceState, runMetadata, beliefBuffer1, beliefBuffer2,
                         speakingBuffer1, speakingBuffer2, privateBeliefs, publicBelief,
@@ -168,7 +174,7 @@ class Network(networkId: UUID,
             neighborsRefs = neighborsArr
             Array.copy(offsetsArr, 0, indexOffset, 0, offsetsArr.length)
             neighborsWeights = new Array[Float](neighborsRefs.length)
-            neighborBiases = new Array[Byte](neighborsRefs.length)
+            neighborBiases = new Array[Bias](neighborsRefs.length)
             
             uuids.v7Bulk(agentsIds)
             val agentsRemaining: Array[Int] = agentTypeCount.map(_._3)
@@ -188,19 +194,19 @@ class Network(networkId: UUID,
                         silenceStrategy(total + bucketStart(i)) = agentTypeCount(j)._1
                         val effect = agentTypeCount(j)._2
                         silenceEffect(total + bucketStart(i)) = effect
-                        hasMemory(total + bucketStart(i)) = if (effect == SilenceEffect.MEMORY) 1 else 0
+                        hasMemory(total + bucketStart(i)) = if (effect == SilenceEffects.MEMORY) 1 else 0
                         k += 1
                         total += 1
                     }
                     j += 1
                 }
                 agentRemainingCount -= agentsPerActor(i)
-                val biasCounts = new mutable.HashMap[Byte, Int]()
+                val biasCounts = new mutable.HashMap[Bias, Int]()
                 agentBiases.foreach((key, value) => biasCounts.put(key, value))
                 // Create the agent actor
                 val index = i
                 agents(i) = context.actorOf(Props(
-                    new Agent(
+                    new AgentProcessor(
                         agentsIds, silenceStrategy, silenceEffect, threshold,
                         confidenceState,runMetadata, beliefBuffer1, beliefBuffer2,
                         speakingBuffer1, speakingBuffer2, privateBeliefs, publicBelief,
@@ -217,32 +223,36 @@ class Network(networkId: UUID,
             
         
         case BuildNetwork =>
+            // ============================================================================
+            // NETWORK TOPOLOGY INITIALIZATION
+            // ============================================================================
             val density = runMetadata.optionalMetaData.get.density.get
-            // Declare arrays of size -m^2 - m + 2mn <->  m(m-1) + (n - m) * 2m
+            // Size of arrays: -m^2 - m + 2mn <-> m(m-1) + (n - m) * 2m
             val size = (density * (density - 1)) + ((runMetadata.agentsPerNetwork - density) * (2 * density))
             neighborsRefs = new Array[Int](size)
             neighborsWeights = new Array[Float](size)
-            neighborBiases = new Array[Byte](size)
-            
+            neighborBiases = new Array[Bias](size)
             
             val fenwickTree = new FenwickTree(
                 runMetadata.agentsPerNetwork,
-                runMetadata.optionalMetaData.get.density.get,
+                density,
                 runMetadata.optionalMetaData.get.degreeDistribution.get - 2,
-                runMetadata.seed
+                runMetadata.seed + runMetadata.runID + self.path.name.substring(1).toLong
             )
             
-            // Create the Actors
+            // ============================================================================
+            // AGENT ACTOR CREATION AND TYPE DISTRIBUTION
+            // ============================================================================
             uuids.v7Bulk(agentsIds)
             val agentsRemaining: Array[Int] = agentTypeCount.map(_._3)
             var agentRemainingCount = runMetadata.agentsPerNetwork
             
             var i = 0
             while (i < numberOfAgentActors) {
-                // Get the proportion of agents
+                // Distribute agent types proportionally across actors
                 val agentTypes = getNextBucketDistribution(agentsRemaining, agentsPerActor(i), agentRemainingCount)
                 
-                // Set the agent types
+                // Assign behavioral strategies to agents in this actor's range
                 var j = 0
                 var total = 0
                 while (j < agentTypes.length) {
@@ -251,19 +261,20 @@ class Network(networkId: UUID,
                         silenceStrategy(total + bucketStart(i)) = agentTypeCount(j)._1
                         val effect = agentTypeCount(j)._2
                         silenceEffect(total + bucketStart(i)) = effect
-                        hasMemory(total + bucketStart(i)) = if (effect == SilenceEffect.MEMORY) 1 else 0
+                        hasMemory(total + bucketStart(i)) = if (effect == SilenceEffects.MEMORY) 1 else 0
                         k += 1
                         total += 1
                     }
                     j += 1
                 }
+                // Create agent actor with bias distribution
                 agentRemainingCount -= agentsPerActor(i)
-                val biasCounts = new mutable.HashMap[Byte, Int]()
+                val biasCounts = new mutable.HashMap[Bias, Int]()
                 agentBiases.foreach((key, value) => biasCounts.put(key, value))
                 // Create the agent actor
                 val index = i
                 agents(i) = context.actorOf(Props(
-                    new Agent(
+                    new AgentProcessor(
                         agentsIds, silenceStrategy, silenceEffect, threshold,
                         confidenceState,runMetadata, beliefBuffer1, beliefBuffer2,
                         speakingBuffer1, speakingBuffer2, privateBeliefs, publicBelief,
@@ -275,8 +286,11 @@ class Network(networkId: UUID,
                 i += 1
             }
             
+            // ============================================================================
+            // NETWORK CONNECTIVITY GENERATION
+            // ============================================================================
             
-            // Link the first n=density agents
+            // Phase 1: Create dense core (first density+1 agents fully connected)
             var count = 0
             i = 0
             while (i < density + 1) { 
@@ -288,26 +302,28 @@ class Network(networkId: UUID,
                     }
                     j += 1
                 }
-                indexOffset(i) += density
+                indexOffset(i) += density // Each core agent has 'density' neighbors
                 i += 1
             }
             
-            // Link the rest of the agents
+            // Phase 2: Connect remaining agents using Fenwick tree sampling
             while (i < runMetadata.agentsPerNetwork) {
-                // val agentsPicked = fenwickTree.pickRandoms()
-                // Array.copy(agentsPicked, 0, neighborsRefs, count, density)
                 fenwickTree.pickRandomsInto(neighborsRefs, count)
                 var j = count
                 while (j < (count + density)) {
-                    indexOffset(neighborsRefs(j)) += 1
+                    indexOffset(neighborsRefs(j)) += 1 // Increment atractiveness score for selected neighbors
                     j += 1
                 }
-                indexOffset(i) = density
+                indexOffset(i) = density // Increment own atractiveness score
                 count += density
                 i += 1
             }
             
-            // Cumulative sum
+            // ============================================================================
+            // ADJACENCY LIST CONSTRUCTION (Convert to Compressed Sparse Row(CSR) format)
+            // ============================================================================
+            
+            // Convert indexOffset to cumulative sum (CSR row pointers)
             var prev = indexOffset(0)
             indexOffset(0) = 0
             
@@ -319,11 +335,11 @@ class Network(networkId: UUID,
                 i += 1
             }
             
-            // Copy of neighbors references
+            // Create bidirectional adjacency using temporary copy
             val temp = new Array[Int](neighborsRefs.length)
             System.arraycopy(neighborsRefs, 0, temp, 0, neighborsRefs.length)
             
-            // First the density ones
+            // Fill adjacency list for dense core agents
             i = 0
             count = 0
             while (i < (density + 1)) {
@@ -337,7 +353,7 @@ class Network(networkId: UUID,
                 i += 1
             }
             
-            // Then the rest
+            // Fill adjacency list for remaining agents (bidirectional edges)
             while (i < runMetadata.agentsPerNetwork) {
                 var j = count
                 while (j < (density + count)) {
@@ -353,11 +369,9 @@ class Network(networkId: UUID,
                 i += 1
             }
             
-            // var neighborsRefs: Array[Int] = null // Size = -m^2 - m + 2mn or m(m-1) + (n - m) * 2m
-            //    var neighborsWeights: Array[Float] = null
-            //    var neighborBiases: Array[Byte] = null
-            //    val indexOffset: Array[Int] = new Array[Int](runMetadata.agentsPerNetwork)
-            
+            // ============================================================================
+            // FINALIZATION
+            // ============================================================================
             context.become(running)
             context.parent ! BuildingComplete(networkId)
             
@@ -400,18 +414,19 @@ class Network(networkId: UUID,
                 //    exportAgentDataToCSV("rt-pol-evo.csv", round, privateBeliefs, speakingBuffer2)
                 // }
                 logAgentRoundState()
-                log(s"Round: $round, Max: $maxBelief, Min: $minBelief")
+                Logger.log(s"Round: $round, Max: $maxBelief, Min: $minBelief")
                 if ((maxBelief - minBelief) < runMetadata.stopThreshold) {
-                    log(s"Consensus! \nFinal round: $round\n" +
+                    Logger.log(s"Consensus! \nFinal round: $round\n" +
                       s"Belief diff: of ${maxBelief - minBelief} ($maxBelief - $minBelief)")
                     context.parent ! RunningComplete(networkId, round, 1)
                     if (runMetadata.saveMode.includesNetworks) DatabaseManager.updateNetworkFinalRound(networkId, round, true)
                     if (runMetadata.saveMode.includesLastRound) agents.foreach { agent => agent ! SnapShotAgent }
+                    
                     if (finishState == 0) context.stop(self)
                     finishedIterating = true
                 }
                 else if (round == runMetadata.iterationLimit || !shouldContinue) {
-                    log(s"Dissensus \nFinal round: $round\n" +
+                    Logger.log(s"Dissensus \nFinal round: $round\n" +
                       s"Belief diff: of ${maxBelief - minBelief} ($maxBelief - $minBelief)")
                     context.parent ! RunningComplete(networkId, round, 0)
                     if (runMetadata.saveMode.includesNetworks) DatabaseManager.updateNetworkFinalRound(networkId, round, false)
@@ -484,7 +499,7 @@ class Network(networkId: UUID,
         }
     }
     
-    @inline private def calculateCumSum(): Unit = {
+    @inline private def calculateBucketStarts(): Unit = {
         for (i <- 1 until numberOfAgentActors)
             bucketStart(i) = agentsPerActor(i - 1) + bucketStart(i - 1)
     }
@@ -505,15 +520,15 @@ class Network(networkId: UUID,
      *
      * @return Unit
      */
-    @inline private def logAgentRoundState(): Unit = {
-        if (GlobalState.APP_MODE == AppMode.DEBUG_VERBOSE) {
-            log(s"Round: $round")
-            log(privateBeliefs.mkString("Private(", ", ", ")"))
-            if (bufferSwitch) log(beliefBuffer2.mkString("Public(", ", ", ")"))
-            else log(beliefBuffer1.mkString("Public(", ", ", ")"))
-            if (bufferSwitch) log(speakingBuffer2.mkString("Speaking(", ", ", ")"))
-            else log(speakingBuffer1.mkString("Speaking(", ", ", ")"))
-            log("")
+    inline private def logAgentRoundState(): Unit = {
+        if (GlobalState.APP_MODE.hasSimulationLogs) {
+            Logger.logSimulation(s"Round: $round")
+            Logger.logSimulation(privateBeliefs.mkString("Private(", ", ", ")"))
+            if (bufferSwitch) Logger.logSimulation(beliefBuffer2.mkString("Public(", ", ", ")"))
+            else Logger.logSimulation(beliefBuffer1.mkString("Public(", ", ", ")"))
+            if (bufferSwitch) Logger.logSimulation(speakingBuffer2.mkString("Speaking(", ", ", ")"))
+            else Logger.logSimulation(speakingBuffer1.mkString("Speaking(", ", ", ")"))
+            Logger.logSimulation("")
         }
     }
     
@@ -529,10 +544,10 @@ class Network(networkId: UUID,
         val numberOfNeighbors = neighborsRefs.length
         val buffer = ByteBuffer.allocate(24 + (numberOfAgents * 4) + (numberOfNeighbors * 8))
         
-        // Header 28 bytes
+        // Header 32 bytes
         buffer.putLong(networkId.getMostSignificantBits)
         buffer.putLong(networkId.getLeastSignificantBits)
-        buffer.putInt(runMetadata.runId.get)
+        buffer.putLong(runMetadata.runID)
         buffer.putInt(indexOffset.length)
         buffer.putInt(neighborsRefs.length)
         
@@ -564,11 +579,11 @@ class Network(networkId: UUID,
         val fileExists = file.exists()
         
         try {
-            log(s"Exporting data for round $round to $filePath (${privateBeliefs.length} agents)")
+            Logger.log(s"Exporting data for round $round to $filePath (${privateBeliefs.length} agents)")
             
             Using(new PrintWriter(new FileWriter(file, true))) { writer =>
                 if (!fileExists || file.length() == 0) {
-                    log(s"Creating new CSV file with headers: $filePath")
+                    Logger.log(s"Creating new CSV file with headers: $filePath")
                     writer.println("id,round,belief,speaking")
                 }
                 
@@ -578,16 +593,16 @@ class Network(networkId: UUID,
                     agentId += 1
                 }
                 
-                log(s"Successfully exported round $round data to $filePath")
+                Logger.log(s"Successfully exported round $round data to $filePath")
             }
             
         } catch {
             case e: java.io.IOException =>
-                logError(s"Failed to write to CSV file '$filePath': ${e.getMessage}")
+                Logger.logError(s"Failed to write to CSV file '$filePath': ${e.getMessage}")
             case e: java.lang.ArrayIndexOutOfBoundsException =>
-                logError(s"Array index error while processing agent data: ${e.getMessage}")
+                Logger.logError(s"Array index error while processing agent data: ${e.getMessage}")
             case e: Exception =>
-                logError(s"Unexpected error while exporting agent data to '$filePath': ${e.getMessage}")
+                Logger.logError(s"Unexpected error while exporting agent data to '$filePath': ${e.getMessage}")
         }
     }
     
@@ -598,7 +613,7 @@ class Network(networkId: UUID,
         val filePath = "agent_influences.csv"
         try {
             Using(new PrintWriter(filePath)) { writer =>
-                log(s"Exporting neighbor data to $filePath (${neighborsRefs.length} neighbors)")
+                Logger.log(s"Exporting neighbor data to $filePath (${neighborsRefs.length} neighbors)")
                 writer.println("Source,Target,Influence")
                 
                 var i = 0
@@ -613,11 +628,11 @@ class Network(networkId: UUID,
             }
         } catch {
             case e: java.io.IOException =>
-                logError(s"Failed to write neighbor data to '$filePath': ${e.getMessage}")
+                Logger.logError(s"Failed to write neighbor data to '$filePath': ${e.getMessage}")
             case e: java.lang.ArrayIndexOutOfBoundsException =>
-                logError(s"Array index error while processing neighbor data - check data integrity: ${e.getMessage}")
+                Logger.logError(s"Array index error while processing neighbor data - check data integrity: ${e.getMessage}")
             case e: Exception =>
-                logError(s"Unexpected error while exporting neighbor data to '$filePath': ${e.getMessage}")
+                Logger.logError(s"Unexpected error while exporting neighbor data to '$filePath': ${e.getMessage}")
         }
     }
 }

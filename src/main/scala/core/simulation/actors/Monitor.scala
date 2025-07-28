@@ -1,12 +1,15 @@
 package core.simulation.actors
 
 import akka.actor.{Actor, ActorRef, Props}
-import core.model.agent.behavior.silence.*
-import core.model.agent.behavior.bias.*
+import core.model.agent.behavior.bias.CognitiveBiases.Bias
+import core.model.agent.behavior.silence.SilenceEffects.SilenceEffect
+import core.model.agent.behavior.silence.SilenceStrategies.SilenceStrategy
 import core.simulation.config.*
+import core.simulation.config.SaveModes.SaveMode
 import io.persistence.RoundRouter
 import io.web.CustomRunInfo
-import utils.logging.{log, logWarning}
+import utils.datastructures.SnowflakeID
+import utils.logging.Logger
 import utils.rng.distributions.{CustomDistribution, Distribution, Uniform}
 import utils.timers.CustomMultiTimer
 
@@ -17,14 +20,33 @@ import scala.collection.mutable
 
 // Containers
 
+/**
+ * Contains immutable configuration and runtime metadata for a simulation run,
+ * providing thread-safe access to core run parameters for all actors
+ * participating in the run.
+ *
+ * @param runID Unique identifier for the simulation run
+ * @param channelId Web socket communication channel identifier assigned to this run
+ * @param runMode Execution mode defining run behavior (Generated, Custom, etc.)
+ * @param saveMode Data persistence strategy for legacy database compatibility
+ * @param distribution Statistical distribution configuration for the simulation
+ * @param startTime Unix timestamp marking the simulation start time
+ * @param optionalMetaData Additional run-specific parameters (e.g., density)
+ * @param agentLimit Maximum number of agents that can execute concurrently
+ * @param numberOfNetworks Total count of networks in the simulation
+ * @param agentsPerNetwork Agent count per network (uniform across all networks)
+ * @param iterationLimit Maximum permitted simulation iterations before termination
+ * @param seed Random number generator seed for reproducible results
+ * @param stopThreshold Consensus threshold below which the simulation terminates
+ */
 case class RunMetadata(
+    runID: Long,
     channelId: String,
     runMode: Byte,
     saveMode: SaveMode,
     distribution: Distribution,
     startTime: Long,
     optionalMetaData: Option[OptionalMetadata],
-    var runId: Option[Int],
     var agentLimit: Int,
     numberOfNetworks: Int,
     var agentsPerNetwork: Int,
@@ -42,27 +64,28 @@ case class OptionalMetadata(
 case object GetStatus
 
 case class AddNetworks(
+    runID: Long,
     channelId: String,
-    agentTypeCount: Array[(Byte, Byte, Int)],
-    agentBiases: Array[(Byte, Int)],
+    agentTypeCount: Array[(SilenceStrategy, SilenceEffect, Int)],
+    agentBiases: Array[(Bias, Int)],
     optionalParams: mutable.Map[Int, (Float, Float)],
     distribution: Distribution,
     saveMode: SaveMode,
     numberOfNetworks: Int,
     density: Int,
     iterationLimit: Int,
-    seed: Option[Long],
+    seed: Long,
     degreeDistribution: Float,
     stopThreshold: Float
 )
 
-case class AddNetworksFromCSV(path: String, silenceEffect: Byte, silenceStrategy: Byte, bias: Byte)
+case class AddNetworksFromCSV(path: String, silenceEffect: SilenceEffect, silenceStrategy: SilenceStrategy, bias: Bias)
 
 case class AddNetworksFromExistingRun(
     runId: Int,
     agentTypeCount: Array[(Byte, Byte, Int)],
     agentBiases: Array[(Byte, Float)],
-    saveMode: SaveMode,
+    saveMode: Int,
     stopThreshold: Float,
     iterationLimit: Int
 )
@@ -121,12 +144,12 @@ class Monitor extends Actor {
             totalRuns += 1
             
             val runMetadata = RunMetadata(
+                customInfo.runID,
                 customInfo.channelId,
                 RunMode.CUSTOM,
                 customInfo.saveMode,
                 CustomDistribution,
                 System.currentTimeMillis(),
-                None,
                 None,
                 agentLimit,
                 1, 
@@ -140,20 +163,23 @@ class Monitor extends Actor {
             simulationTimers.start(s"${runActor.path.name}")
 
         
-        case AddNetworks(channelId, agentTypeCount, agentBiases, optionalParams, distribution, saveMode, 
+        case AddNetworks(runID, channelId, agentTypeCount, agentBiases, optionalParams, distribution, saveMode,
         numberOfNetworks, density, iterationLimit, seed, degreeDistribution, stopThreshold) =>
             val optionalMetadata = Some(OptionalMetadata(Some(density), Some(degreeDistribution)))
-            val revisedSeed: Long = if (seed.isEmpty) System.nanoTime() + numberOfNetworks + agentBiases(0)._2 else seed.get
             val runMetadata = RunMetadata(
+                runID,
                 channelId,
                 RunMode.GENERATED,
                 saveMode,
                 distribution,
                 System.currentTimeMillis(),
                 optionalMetadata,
-                None,
                 agentLimit,
-                numberOfNetworks, agentTypeCount.map(_._3).sum, iterationLimit, revisedSeed, stopThreshold
+                numberOfNetworks,
+                agentTypeCount.map(_._3).sum,
+                iterationLimit,
+                seed,
+                stopThreshold
             )
             totalRuns += 1
             val n = runMetadata.agentsPerNetwork
@@ -170,13 +196,13 @@ class Monitor extends Actor {
             totalRuns += 1
             val optionalMetadata = Some(OptionalMetadata(Some(0), Some(0)))
             val runMetadata = RunMetadata(
+                SnowflakeID.generateId(),
                 "0",
                 RunMode.CSV,
-                Debug,
+                SaveModes.DEBUG,
                 Uniform,
                 System.currentTimeMillis(),
                 optionalMetadata,
-                None,
                 agentLimit,
                 1,
                 1,
@@ -193,14 +219,14 @@ class Monitor extends Actor {
             actor ! StartRun
             
         case RunComplete =>
-            log("\nThe run has been complete\n")
+            Logger.log("\nThe run has been complete\n")
             val senderActor = sender().path.name
             simulationTimers.stop(senderActor)
             memoryLeft += activeRuns(senderActor)._2
             activeRuns -= senderActor
             
         case GetStatus =>
-            log(f"\nTotal runs: $totalRuns\n" +
+            Logger.log(f"\nTotal runs: $totalRuns\n" +
                       f"Active runs: ${activeRuns.size}\n" +
                       f"Total active networks: $totalActiveNetworks\n" +
                       f"Total active agents: $totalActiveAgents\n")
@@ -211,8 +237,8 @@ class Monitor extends Actor {
     
     private def trackRunMemory(runActor: ActorRef, numberOfNetworks: Int, agentsPerNetwork: Int, neighborsPerNetwork: Int):
     Unit = {
-        // 64 bytes per agent
-        // 9 bytes per neighbor
+        // ~64 bytes per agent
+        // ~9 bytes per neighbor
         // 95% memory max
         val runMemoryUsage = (numberOfNetworks * agentsPerNetwork * 64) +
           (numberOfNetworks * neighborsPerNetwork * 9)
@@ -220,7 +246,7 @@ class Monitor extends Actor {
         if (memoryLeft >= runMemoryUsage) {
         
         } else {
-            logWarning(s"Exceeding memory limits: ${memoryLeft}")
+            Logger.logWarning(s"Exceeding memory limits: ${memoryLeft}")
         }
         memoryLeft -= runMemoryUsage
         activeRuns += (runActor.path.name -> (runActor, runMemoryUsage))

@@ -1,6 +1,6 @@
 package utils.timers
 
-import utils.logging.log
+import utils.logging.Logger
 
 import java.util.concurrent.TimeUnit
 import scala.collection.mutable
@@ -19,10 +19,10 @@ class CustomTimer {
         endTime = Some(System.nanoTime())
         val duration = endTime.get - startTime.getOrElse(throw new IllegalStateException("Timer was not started"))
         val durationInUnit = getTimeElapsed(duration, timeUnit)
-        log(s"$message: $durationInUnit ${timeUnit.toString.toLowerCase}")
+        Logger.log(s"$message: $durationInUnit ${timeUnit.toString.toLowerCase}")
     }
     
-    def getTimeElapsed(duration: Long, timeUnit: TimeUnit = MILLISECONDS): Long = {
+    private def getTimeElapsed(duration: Long, timeUnit: TimeUnit = MILLISECONDS): Long = {
         timeUnit match {
             case NANOSECONDS => duration
             case MICROSECONDS => duration / 1000
@@ -50,8 +50,19 @@ class CustomMultiTimer {
         
         val duration = endTime - startOpt.getOrElse(throw new IllegalStateException("Timer was not started"))
         val formattedDuration = formatDuration(duration, timeUnit)
-        if (printDuration) log(s"$key$msg: $formattedDuration")
+        if (printDuration) Logger.log(s"$key$msg: $formattedDuration")
         duration
+    }
+    
+    /**
+     * Gets the duration in nanoseconds for a given key, only works if the timer has finished
+     * @param key Identifier
+     * @return End time - start time
+     */
+    def getDuration(key: String): Long = {
+        val startTime = times(key)._1.getOrElse(throw new IllegalStateException("Timer was not started"))
+        val endTime = times(key)._2.getOrElse(throw new IllegalStateException("Timer was not stopped"))
+        endTime - startTime
     }
     
     def formatDuration(duration: Long, timeUnit: TimeUnit = MILLISECONDS): String = {
@@ -84,12 +95,12 @@ class CustomMultiTimer {
             val totalSeconds = millis / 1000
             val minutes = totalSeconds / 60
             val seconds = totalSeconds % 60
-            f"$minutes%d:${seconds}%02d"
+            f"$minutes%d:$seconds%02d"
         } else {
             val totalMinutes = millis / (1000 * 60)
             val hours = totalMinutes / 60
             val minutes = totalMinutes % 60
-            f"$hours%d:${minutes}%02d"
+            f"$hours%d:$minutes%02d"
         }
     }
     

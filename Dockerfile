@@ -51,7 +51,7 @@ RUN sbt update
 # Copy source code
 COPY --chown=appuser:appuser src/ src/
 
-# Expose the port your Akka HTTP server will use
+# Expose the port the Akka HTTP server will use
 EXPOSE 9000
 
 # Run the application with Vector API enabled

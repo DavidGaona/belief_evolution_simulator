@@ -12,14 +12,24 @@ javaOptions ++= Seq(
     "--add-modules=jdk.incubator.vector"
 )
 
+// Main module
 lazy val root = (project in file("."))
   .settings(
       name := "extended_model",
       scalacOptions ++= Seq(
-          "-Yimports:java.lang,scala,scala.Predef,scala.util.chaining,jdk.incubator.vector"
+          "-Yimports:java.lang,scala,scala.Predef,scala.util.chaining,jdk.incubator.vector",
       ),
+      
+      Compile / mainClass := Some("Main"),
+      run / connectInput := true,
       run / fork := true,
-      compile / javacOptions ++= Seq("--add-modules", "jdk.incubator.vector")
+      compile / javacOptions ++= Seq("--add-modules", "jdk.incubator.vector"),
+      
+      // JVM options
+      javaOptions ++= Seq(
+          //"-Xmx32g",
+          "--add-modules=jdk.incubator.vector"
+      )
   )
 
 resolvers += "Akka library repository".at("https://repo.akka.io/maven")

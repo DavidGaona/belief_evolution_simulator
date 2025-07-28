@@ -8,14 +8,14 @@ package core.simulation.config
  * be classified as consensus, thus stopping the simulation.
  *
  */
-object RunMode:
+object RunMode {
     /**
      * Represents a run that has its network generated with the network generating
      * algorithm, the user specifies how many agents of each type and how many
      * connections with their corresponding cognitive bias. Giving a good exploratory
      * option for users.
      */
-    final val GENERATED: Byte = 0x00  
+    final val GENERATED: Byte = 0x00
     
     /**
      * Represents a run where the user manually specifies the network structure,
@@ -38,6 +38,7 @@ object RunMode:
      * source, target
      */
     final val CSV: Byte = 0x10
+}
     
     
 // --add-modules=jdk.incubator.vector -Xmx32g 

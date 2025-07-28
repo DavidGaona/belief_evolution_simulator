@@ -1,20 +1,30 @@
 package core.simulation.actors
 
 import akka.actor.{Actor, ActorRef, PoisonPill, Props}
-import core.model.agent.behavior.bias.*
-import core.model.agent.behavior.silence.*
+import core.model.agent.behavior.bias.CognitiveBiases.Bias
+import core.model.agent.behavior.silence.SilenceEffects.SilenceEffect
+import core.model.agent.behavior.silence.SilenceStrategies.SilenceStrategy
 import core.simulation.config.RunMode
 import io.db.DatabaseManager
 import io.persistence.RoundRouter
 import io.web.CustomRunInfo
 import utils.datastructures.UUIDS
-import utils.logging.log
-import utils.rng.distributions.CustomDistribution
+import utils.logging.Logger
 import utils.timers.CustomMultiTimer
 
 import java.util.UUID
 import scala.collection.mutable
+import scala.collection.mutable.ArrayBuffer
 import scala.io.Source
+
+// Containers
+case class NetworkResult(
+    buildTime: Long,
+    runTime: Long,
+    networkNumber: Int,
+    finalRound: Int,
+    reachedConsensus: Boolean
+)
 
 // Saving classes
 case class AgentStateLoad(
@@ -33,7 +43,7 @@ case class NeighborsLoad(
     source: UUID,
     target: UUID,
     influence: Float,
-    biasType: Byte
+    biasType: Bias
 )
 
 // Mesagges
@@ -41,7 +51,6 @@ case class NeighborsLoad(
 case object StartRun // Monitor -> Run
 case class BuildingComplete(networkId: UUID) // Network -> Run
 case class RunningComplete(networkId: UUID, round: Int, result: Int) // Network -> Run
-case class ChangeAgentLimit(numberOfAgents: Int) // Monitor -> Run
 
 // Actor
 
@@ -58,8 +67,8 @@ class Run extends Actor {
     // Collections
     var networks: Array[ActorRef] = null
     var times: Array[Long] = null
-    var agentTypeCount: Array[(Byte, Byte, Int)] = null
-    var agentBiases: Array[(Byte, Int)] = null
+    var agentTypeCount: Array[(SilenceStrategy, SilenceEffect, Int)] = null
+    var agentBiases: Array[(Bias, Int)] = null
     
     // Local stats
     val percentagePoints = Seq(10, 25, 50, 75, 90)
@@ -69,6 +78,7 @@ class Run extends Actor {
     var avgRounds: Int = 0
     var networkRunTimes: Array[Long] = null
     var networkBuildTimes: Array[Long] = null
+    var networkResults: mutable.ArrayBuffer[NetworkResult] = new ArrayBuffer[NetworkResult]()
     
     // Timing
     val globalTimers = new CustomMultiTimer
@@ -101,12 +111,6 @@ class Run extends Actor {
         
         globalTimers.start(s"Total_time")
         
-        runMetadata.runId = if (runMetadata.saveMode.savesToDB) DatabaseManager.createRun(
-            runMetadata.runMode, runMetadata.saveMode, 1, None, None, 
-            runMetadata.stopThreshold, runMetadata.iterationLimit,
-            CustomDistribution.toString
-        ) else Option(1)
-        
         this.runMetadata = runMetadata
         globalTimers.start("Building")
         val networkId: UUID = uuids.v7()
@@ -114,7 +118,7 @@ class Run extends Actor {
             Props(new Network(networkId, runMetadata, null, null)) // customRunInfo.networkName
         )
         if (runMetadata.saveMode.includesNetworks) {
-            DatabaseManager.createNetwork(networkId, customRunInfo.networkName, runMetadata.runId.get, 
+            DatabaseManager.createNetwork(networkId, customRunInfo.networkName, runMetadata.runID, 
                 runMetadata.agentsPerNetwork)
         }
         networks = Array(network)
@@ -127,8 +131,8 @@ class Run extends Actor {
     
     // Run generated networks
     def this(runMetadata: RunMetadata,
-        agentTypeCount: Array[(Byte, Byte, Int)],
-        agentBiases: Array[(Byte, Int)]
+        agentTypeCount: Array[(SilenceStrategy, SilenceEffect, Int)],
+        agentBiases: Array[(Bias, Int)]
     ) = {
         this()
         this.runMetadata = runMetadata
@@ -141,8 +145,8 @@ class Run extends Actor {
     // Run generated network from CSV file
     def this(runMetadata: RunMetadata,
         path: String,
-        agentTypeCount: Array[(Byte, Byte, Int)],
-        agentBiases: Array[(Byte, Int)]
+        agentTypeCount: Array[(SilenceStrategy, SilenceEffect, Int)],
+        agentBiases: Array[(Bias, Int)]
     ) = {
         this()
         this.runMetadata = runMetadata
@@ -153,18 +157,8 @@ class Run extends Actor {
         BuildMessage = BuildNetworkFromCSV(neighbors, offsets)
     }
     
-    private def initializeGeneratedRun(): Unit = {
+    inline private def initializeGeneratedRun(): Unit = {
         globalTimers.start(s"Total_time")
-        runMetadata.runId = if (runMetadata.saveMode.savesToDB) DatabaseManager.createRun(
-            runMetadata.runMode,
-            runMetadata.saveMode,
-            runMetadata.numberOfNetworks,
-            runMetadata.optionalMetaData.get.density,
-            runMetadata.optionalMetaData.get.degreeDistribution,
-            runMetadata.stopThreshold,
-            runMetadata.iterationLimit,
-            runMetadata.distribution.toString
-            ) else Option(1)
         networks = Array.fill[ActorRef](runMetadata.numberOfNetworks)(null)
         networkRunTimes = Array.fill[Long](runMetadata.numberOfNetworks)(-1L)
         networkBuildTimes = Array.fill[Long](runMetadata.numberOfNetworks)(-1L)
@@ -195,7 +189,7 @@ class Run extends Actor {
             }
             
             if (runMetadata.saveMode.savesToDB && networksBuilt == runMetadata.numberOfNetworks) {
-                DatabaseManager.updateTimeField(Left(runMetadata.runId.get), globalTimers.stop("Building"), "runs",
+                DatabaseManager.updateTimeField(Left(runMetadata.runID), globalTimers.stop("Building"), "runs",
                     "build_time")
             }
             
@@ -214,11 +208,12 @@ class Run extends Actor {
             val index = numberOfNetworksFinished
             numberOfNetworksFinished += 1
             
+            
             val currentPercentage = (numberOfNetworksFinished.toDouble / runMetadata.numberOfNetworks * 100).toInt
             val hasReported = currentPercentage != ((numberOfNetworksFinished - 1).toDouble / runMetadata.numberOfNetworks * 100).toInt
             
             if (percentagePoints.contains(currentPercentage) && hasReported) {
-                log(s"Run ${runMetadata.runId.get} $numberOfNetworksFinished($currentPercentage%) Complete")
+                Logger.log(s"Run ${runMetadata.runID} $numberOfNetworksFinished($currentPercentage%) Complete")
             }
             
             if (runMetadata.saveMode.includesNetworks) {
@@ -228,24 +223,34 @@ class Run extends Actor {
                 networkRunTimes(index) = runningTimers.stop(networkName, msg = " running")
             }
             
+            networkResults.addOne(NetworkResult(
+                buildingTimers.getDuration(networkName),
+                runningTimers.getDuration(networkName),
+                networkName.substring(1).toInt,
+                round,
+                result == 1
+            ))
+            
             if (numberOfNetworksFinished < runMetadata.numberOfNetworks) {
                 if ((numberOfNetworksFinished + networksPerBatch) <= runMetadata.numberOfNetworks)
                     buildNetwork(numberOfNetworksFinished + networksPerBatch - 1)
             } else {
                 if (runMetadata.saveMode.savesToDB) {
-                    DatabaseManager.updateTimeField(Left(runMetadata.runId.get), globalTimers.stop("Running"),
+                    DatabaseManager.updateTimeField(Left(runMetadata.runID), globalTimers.stop("Running"),
                         "runs", "run_time")
+                    RoundRouter.saveRemainingData()
                 }
-                RoundRouter.saveRemainingData()
+                
+                DatabaseManager.submitNetworkResults(runMetadata.runID, networkResults)
                 
                 if (!runMetadata.saveMode.savesToDB) {
                     scala.util.Sorting.quickSort(networkBuildTimes)
                     scala.util.Sorting.quickSort(networkRunTimes)
                     val n = networkRunTimes.length
-                    log(
+                    Logger.log(
                         f"""
                            |----------------------------
-                           |Run ${runMetadata.runId.get} with ${
+                           |Run ${runMetadata.runID} with ${
                             runMetadata.runMode match
                                 case RunMode.CUSTOM => "Custom network"
                                 case RunMode.CSV => "CSV network"
@@ -281,11 +286,6 @@ class Run extends Actor {
             
             // Clean up network agents
             network ! PoisonPill
-//            if (runMetadata.saveMode.includesNetworks) {
-//
-//            }
-        
-        case ChangeAgentLimit(newAgentLimit: Int) =>
             
     }
     
@@ -321,7 +321,7 @@ class Run extends Actor {
             agentBiases
             )), s"N${index + 1}")
         if (runMetadata.saveMode.includesNetworks) {
-            DatabaseManager.createNetwork(networkId, s"N${index + 1}", runMetadata.runId.get,
+            DatabaseManager.createNetwork(networkId, s"N${index + 1}", runMetadata.runID,
                                           runMetadata.agentsPerNetwork)
         }
         
@@ -487,9 +487,5 @@ class Run extends Actor {
         }
         
         (neighborsArr, offsetsArr)
-    }
-    
-    private def fetchBatch(runId: Int, limit: Int, offset: Int): Unit = {
-        runMetadata.agentsPerNetwork
     }
 }
