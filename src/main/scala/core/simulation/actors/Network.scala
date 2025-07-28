@@ -48,7 +48,15 @@ class Network(networkId: UUID, runMetadata: RunMetadata,
     val agentsPerActor: Array[Int] = new Array[Int](numberOfAgentActors);calculateAgentsPerActor()
     val bucketStart: Array[Int] = new Array[Int](numberOfAgentActors);calculateBucketStarts()
     val agents: Array[ActorRef] = Array.ofDim[ActorRef](numberOfAgentActors)
-    val agentsIds: Array[UUID] = Array.ofDim[UUID](runMetadata.agentsPerNetwork)
+    val agentsIds: Array[UUID] = if (GlobalState.APP_MODE.usesLegacyDB) {
+        val arr = Array.ofDim[UUID](runMetadata.agentsPerNetwork)
+        val uuids = UUIDS()
+        uuids.v7Bulk(arr)
+        arr
+    }
+    else {
+        null
+    }
     
     // ============================================================================
     // BELIEF AND COMMUNICATION BUFFERS (Double-buffered)
@@ -116,7 +124,6 @@ class Network(networkId: UUID, runMetadata: RunMetadata,
     // ============================================================================
     // UTILITIES
     // ============================================================================
-    val uuids = UUIDS()
     val bimodal = new BimodalDistribution(0.25, 0.75)
     var names: Array[String] = null
     implicit val timeout: Timeout = Timeout(600.seconds)
@@ -126,7 +133,6 @@ class Network(networkId: UUID, runMetadata: RunMetadata,
     // Building state
     private def building: Receive = {
         case BuildCustomNetwork(customRunInfo) =>
-            uuids.v7Bulk(agentsIds)
             
             val arrayLength = beliefBuffer1.length
             Array.copy(customRunInfo.agentBeliefs, 0, privateBeliefs, 0, arrayLength)
@@ -176,7 +182,6 @@ class Network(networkId: UUID, runMetadata: RunMetadata,
             neighborsWeights = new Array[Float](neighborsRefs.length)
             neighborBiases = new Array[Bias](neighborsRefs.length)
             
-            uuids.v7Bulk(agentsIds)
             val agentsRemaining: Array[Int] = agentTypeCount.map(_._3)
             var agentRemainingCount = runMetadata.agentsPerNetwork
             
@@ -243,7 +248,6 @@ class Network(networkId: UUID, runMetadata: RunMetadata,
             // ============================================================================
             // AGENT ACTOR CREATION AND TYPE DISTRIBUTION
             // ============================================================================
-            uuids.v7Bulk(agentsIds)
             val agentsRemaining: Array[Int] = agentTypeCount.map(_._3)
             var agentRemainingCount = runMetadata.agentsPerNetwork
             
