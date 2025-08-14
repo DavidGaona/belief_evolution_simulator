@@ -18,8 +18,7 @@ object Logger {
     private val skipDatabase = GlobalState.APP_MODE.skipDatabase
     
     private val useStdout = isLocalMode || skipDatabase  // Local dev or debug modes use stdout
-    private val useStderr = isServerMode || isLocalMode  // Server and local use stderr for warnings/errors
-    private val includeTimestamp = isServerMode || isLocalMode  // Production modes include timestamps
+    private val includeTimestamp = isServerMode // Production modes include timestamps
     private val timestampFormatter = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss")
     
     /**
@@ -28,7 +27,7 @@ object Logger {
      * Behavior:<br>
      * - Only logs if GENERAL_LOGS flag is enabled<br>
      * - Local/Debug: stdout, no timestamp<br>
-     * - Server: stderr, with timestamp
+     * - Server: stdout, with timestamp
      *
      * Use for: Application lifecycle events, configuration info, status updates
      *
@@ -39,11 +38,7 @@ object Logger {
         
         if (includeTimestamp) {
             val timestamp = LocalDateTime.now().format(timestampFormatter)
-            if (useStderr) {
-                Console.err.println(s"[$timestamp] $message")
-            } else {
-                println(s"[$timestamp] $message")
-            }
+            println(s"[$timestamp] $message")
         } else {
             println(message)
         }
@@ -72,7 +67,7 @@ object Logger {
      * Behavior:<br>
      * - Only logs if SERVER_LOGS flag is enabled<br>
      * - Local: stdout, no timestamp<br>
-     * - Server: stderr, with timestamp
+     * - Server: stdout, with timestamp
      *
      * Use for: HTTP requests, message passing, client communication, server debugging
      *
@@ -81,17 +76,11 @@ object Logger {
     def logServer(message: String): Unit = {
         if (!shouldLogServer) return
         
-        val formattedMessage = s"SERVER: $message"
-        
         if (includeTimestamp) {
             val timestamp = LocalDateTime.now().format(timestampFormatter)
-            if (useStderr) {
-                Console.err.println(s"[$timestamp] $formattedMessage")
-            } else {
-                println(s"[$timestamp] $formattedMessage")
-            }
+            println(s"[$timestamp] $message")
         } else {
-            println(formattedMessage)
+            println(message)
         }
     }
     
@@ -100,7 +89,7 @@ object Logger {
      *
      * Behavior:<br>
      * - Always logs (warnings should always be visible)<br>
-     * - Local/Debug: stdout with WARNING prefix<br>
+     * - Local/Debug: stderr with WARNING prefix<br>
      * - Server: stderr with timestamp and WARNING prefix
      *
      * Use for: Deprecated usage, config inconsistencies, recoverable errors
@@ -112,13 +101,9 @@ object Logger {
         
         if (includeTimestamp) {
             val timestamp = LocalDateTime.now().format(timestampFormatter)
-            if (useStderr) {
-                Console.err.println(s"[$timestamp] $formattedMessage")
-            } else {
-                println(s"[$timestamp] $formattedMessage")
-            }
+            Console.err.println(s"[$timestamp] $formattedMessage")
         } else {
-            println(formattedMessage)
+            Console.err.println(formattedMessage)
         }
     }
     
@@ -127,10 +112,10 @@ object Logger {
      *
      * Behavior:<br>
      * - Always logs (errors should always be visible)<br>
-     * - Local/Debug: stdout with ERROR prefix<br>
+     * - Local/Debug: stderr with ERROR prefix<br>
      * - Server: stderr with timestamp and ERROR prefix
      *
-     * Use for: Failed connections, missing files, unhandled exceptions, critical failures
+     * Use for: Failed connections, missing files, unhandled exceptions, critical failures, etc.
      *
      * @param message The error message to log
      */
@@ -139,13 +124,9 @@ object Logger {
         
         if (includeTimestamp) {
             val timestamp = LocalDateTime.now().format(timestampFormatter)
-            if (useStderr) {
-                Console.err.println(s"[$timestamp] $formattedMessage")
-            } else {
-                println(s"[$timestamp] $formattedMessage")
-            }
+            Console.err.println(s"[$timestamp] $formattedMessage")
         } else {
-            println(formattedMessage)
+            Console.err.println(formattedMessage)
         }
     }
     

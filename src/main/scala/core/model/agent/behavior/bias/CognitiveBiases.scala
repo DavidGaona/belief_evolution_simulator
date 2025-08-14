@@ -59,7 +59,6 @@ object CognitiveBiases {
      * x - (x * math.abs(x) * e2)
      */
     
-    
     extension (bias: Bias) {
         /** Get the underlying byte value */
         def toByte: Byte = bias
@@ -81,7 +80,7 @@ object CognitiveBiases {
             }
         }
         
-        /** Converts a bias code to its name as a string representation. */
+        /** Converts a bias to its name as a string representation. */
         def name: String = bias match {
             case DEGROOT => "DeGroot"
             case CONFIRMATION => "Confirmation"

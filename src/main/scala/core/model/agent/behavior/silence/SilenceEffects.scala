@@ -1,7 +1,5 @@
 package core.model.agent.behavior.silence
 
-import scala.collection.mutable
-
 /**
  * Represents different silence effects that determine how an agent's public belief
  * is presented based on whether they are currently speaking or silent.
@@ -35,21 +33,24 @@ object SilenceEffects {
          * @param agentIndex    The index of the agent in the SOA
          * @param privateBelief The agent's current private belief
          * @param isSpeaking    Whether the agent is currently speaking (1) or silent (0)
-         * @param publicBelief  Map containing stored public beliefs for agents using MEMORY effect
+         * @param publicBelief  Array containing stored public beliefs for agents using MEMORY effect
          * @return The public belief value to be displayed/used
          */
         def getPublicValue(
             agentIndex: Int,
             privateBelief: Float,
             isSpeaking: Byte,
-            publicBelief: mutable.Map[Int, Float] = null
+            publicBelief: Array[Float] = null
         ): Float = {
             effect match {
                 case DEGROOT => privateBelief
+                
                 case MEMORY =>
                     if (isSpeaking == 1) publicBelief(agentIndex) = privateBelief
                     publicBelief(agentIndex)
+                    
                 case MEMORYLESS => privateBelief
+                
                 case _ => privateBelief // Default to DeGroot for unknown effects
             }
         }

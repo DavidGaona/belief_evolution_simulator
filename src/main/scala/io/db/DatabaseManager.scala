@@ -22,42 +22,82 @@ import scala.collection.mutable.ArrayBuffer
 import scala.collection.mutable
 
 object DatabaseManager {
-    private val hikariConfig = new HikariConfig()
-    
+    // ============================================================================
+    // DATABASE CONNECTION CONFIGURATION
+    // ============================================================================
     private val dbHost = sys.env.getOrElse("DB_HOST", "localhost")
-    private val dbPort = sys.env.getOrElse("DB_PORT", "5432") // 5433
-    private val dbName = sys.env.getOrElse("DB_NAME", "promueva") // promueva_new
-    private val dbUser = sys.env.getOrElse("DB_USER", "postgres")        
-    private val dbPassword = sys.env.getOrElse("DB_PASSWORD", "postgres") 
+    private val dbHostLegacy = sys.env.getOrElse("DB_HOST_LEGACY", "localhost")
     
-    hikariConfig.setJdbcUrl(s"jdbc:postgresql://$dbHost:$dbPort/$dbName")
-    hikariConfig.setUsername(dbUser)
-    hikariConfig.setPassword(dbPassword)
+    private val dbPort = sys.env.getOrElse("DB_PORT", "5432")
+    private val dbPortLegacy = sys.env.getOrElse("DB_PORT_LEGACY", "5432")
     
-    // Parallel
-    hikariConfig.setMaximumPoolSize(32)
-    hikariConfig.setMinimumIdle(16)
+    private val dbUser = sys.env.getOrElse("DB_USER", "postgres")
+    private val dbUserLegacy = sys.env.getOrElse("DB_USER_LEGACY", "postgres")
     
-    // Set the maximum lifetime of a connection in the pool.
-    hikariConfig.setMaxLifetime(3_600_000) // 1 hour
+    private val dbPassword = sys.env.getOrElse("DB_PASSWORD", "postgres")
+    private val dbPasswordLegacy = sys.env.getOrElse("DB_PASSWORD_LEGACY", "postgres")
     
-    // Set the connection timeout: how long the client will wait for a connection from the pool.
-    hikariConfig.setConnectionTimeout(60_000) // 1 min
+    private val dbNameNew = sys.env.getOrElse("DB_NAME", "promueva")
+    private val dbNameLegacy = sys.env.getOrElse("DB_NAME_LEGACY", "promueva_legacy")
     
-    // Set the idle timeout: how long a connection can remain idle before being closed.
-    hikariConfig.setIdleTimeout(900_000) // 15 minutes
+    // ============================================================================
+    // NEW DATABASE CONFIGURATION - Optimized for lighter workload
+    // ============================================================================
+    private val hikariConfigNew = new HikariConfig()
     
-    // Additional properties for prepared statement caching.
-    hikariConfig.addDataSourceProperty("cachePrepStmts", "true")
-    hikariConfig.addDataSourceProperty("prepStmtCacheSize", "500")
-    hikariConfig.addDataSourceProperty("prepStmtCacheSqlLimit", "4096")
+    hikariConfigNew.setJdbcUrl(s"jdbc:postgresql://$dbHost:$dbPort/$dbNameNew")
+    hikariConfigNew.setUsername(dbUser)
+    hikariConfigNew.setPassword(dbPassword)
     
-    hikariConfig.addDataSourceProperty("useServerPrepStmts", "true")
-    hikariConfig.addDataSourceProperty("rewriteBatchedStatements", "true")
+    // Connection pool sizing
+    hikariConfigNew.setMaximumPoolSize(16)
+    hikariConfigNew.setMinimumIdle(4)
+    hikariConfigNew.setMaxLifetime(3_600_000)
+    hikariConfigNew.setConnectionTimeout(30_000)
+    hikariConfigNew.setIdleTimeout(600_000)
     
-    private val dataSource = new HikariDataSource(hikariConfig)
+    // PostgreSQL optimizations
+    hikariConfigNew.addDataSourceProperty("cachePrepStmts", "true")
+    hikariConfigNew.addDataSourceProperty("prepStmtCacheSize", "250")
+    hikariConfigNew.addDataSourceProperty("prepStmtCacheSqlLimit", "2048")
+    hikariConfigNew.addDataSourceProperty("useServerPrepStmts", "true")
+    hikariConfigNew.addDataSourceProperty("rewriteBatchedStatements", "true")
+    hikariConfigNew.addDataSourceProperty("defaultRowFetchSize", "100")
+    hikariConfigNew.addDataSourceProperty("logUnclosedConnections", "true")
     
-    private def getConnection: Connection = dataSource.getConnection
+    // ============================================================================
+    // LEGACY DATABASE CONFIGURATION - Optimized for heavy workload
+    // ============================================================================
+    private val hikariConfigLegacy = new HikariConfig()
+    
+    hikariConfigLegacy.setJdbcUrl(s"jdbc:postgresql://$dbHostLegacy:$dbPortLegacy/$dbNameLegacy")
+    hikariConfigLegacy.setUsername(dbUserLegacy)
+    hikariConfigLegacy.setPassword(dbPasswordLegacy)
+    
+    // Connection pool sizing
+    hikariConfigLegacy.setMaximumPoolSize(32)
+    hikariConfigLegacy.setMinimumIdle(16)
+    hikariConfigLegacy.setMaxLifetime(3_600_000)
+    hikariConfigLegacy.setConnectionTimeout(60_000)
+    hikariConfigLegacy.setIdleTimeout(900_000)
+    
+    // PostgreSQL optimizations
+    hikariConfigLegacy.addDataSourceProperty("cachePrepStmts", "true")
+    hikariConfigLegacy.addDataSourceProperty("prepStmtCacheSize", "500")
+    hikariConfigLegacy.addDataSourceProperty("prepStmtCacheSqlLimit", "4096")
+    hikariConfigLegacy.addDataSourceProperty("useServerPrepStmts", "true")
+    hikariConfigLegacy.addDataSourceProperty("rewriteBatchedStatements", "true")
+    hikariConfigLegacy.addDataSourceProperty("defaultRowFetchSize", "1000")
+    hikariConfigLegacy.addDataSourceProperty("tcpKeepAlive", "true")
+    
+    // ============================================================================
+    // DATA SOURCE INSTANCES
+    // ============================================================================
+    private val dataSource = new HikariDataSource(hikariConfigNew)
+    private val dataSourceLegacy = new HikariDataSource(hikariConfigLegacy)
+    
+    private inline def getConnection: Connection = dataSource.getConnection
+    private inline def getConnectionLegacy: Connection = dataSourceLegacy.getConnection
     
     // Inserts
     private def setPreparedStatementInt(stmt: PreparedStatement, parameterIndex: Int, value: Option[Int]): Unit = {
@@ -85,126 +125,6 @@ object DatabaseManager {
         value match {
             case Some(str) => stmt.setString(parameterIndex, str)
             case None => stmt.setNull(parameterIndex, java.sql.Types.VARCHAR)
-        }
-    }
-    
-    case class UserData(
-        id: Long,
-        firebaseUid: String,
-        email: String,
-        name: String,
-        role: String,
-        isActive: Boolean,
-        createdAt: String,
-        updatedAt: String
-    )
-    
-    def createOrUpdateUser(firebaseUid: String, email: String, name: String, role: String = "Guest"): Option[UserData] = {
-        val connection = getConnection
-        try {
-            val sql =
-                """
-                   INSERT INTO users (firebase_uid, email, name, role, created_at, updated_at, is_active) 
-                   VALUES (?::uuid, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, true)
-                   ON CONFLICT (firebase_uid) 
-                   DO UPDATE SET 
-                       email = EXCLUDED.email,
-                       name = EXCLUDED.name,
-                       updated_at = CURRENT_TIMESTAMP
-                   RETURNING id, firebase_uid, created_at, updated_at, role, email, name, is_active
-               """
-            
-            val stmt = connection.prepareStatement(sql)
-            stmt.setString(1, firebaseUid)
-            stmt.setString(2, email)
-            stmt.setString(3, name)
-            stmt.setString(4, role)
-            
-            val resultSet = stmt.executeQuery()
-            
-            if (resultSet.next()) {
-                Some(UserData(
-                    id = resultSet.getLong("id"),
-                    firebaseUid = resultSet.getString("firebase_uid"),
-                    email = resultSet.getString("email"),
-                    name = resultSet.getString("name"),
-                    role = resultSet.getString("role"),
-                    isActive = resultSet.getBoolean("is_active"),
-                    createdAt = resultSet.getTimestamp("created_at").toString,
-                    updatedAt = resultSet.getTimestamp("updated_at").toString
-                ))
-            } else {
-                None
-            }
-        } catch {
-            case ex: Exception =>
-                println(s"Error creating/updating user: ${ex.getMessage}")
-                None
-        } finally {
-            connection.close()
-        }
-    }
-    
-    def getUserByFirebaseUid(firebaseUid: String): Option[UserData] = {
-        val connection = getConnection
-        try {
-            val sql =
-                """
-                   SELECT id, firebase_uid, created_at, updated_at, role, email, name, is_active 
-                   FROM users 
-                   WHERE firebase_uid = ?::uuid
-               """
-            
-            val stmt = connection.prepareStatement(sql)
-            stmt.setString(1, firebaseUid)
-            
-            val resultSet = stmt.executeQuery()
-            
-            if (resultSet.next()) {
-                Some(UserData(
-                    id = resultSet.getLong("id"),
-                    firebaseUid = resultSet.getString("firebase_uid"),
-                    email = resultSet.getString("email"),
-                    name = resultSet.getString("name"),
-                    role = resultSet.getString("role"),
-                    isActive = resultSet.getBoolean("is_active"),
-                    createdAt = resultSet.getTimestamp("created_at").toString,
-                    updatedAt = resultSet.getTimestamp("updated_at").toString
-                ))
-            } else {
-                None
-            }
-        } catch {
-            case ex: Exception =>
-                println(s"Error getting user: ${ex.getMessage}")
-                None
-        } finally {
-            connection.close()
-        }
-    }
-    
-    def updateUserRole(firebaseUid: String, newRole: String): Boolean = {
-        val connection = getConnection
-        try {
-            val sql =
-                """
-                   UPDATE users 
-                   SET role = ?, updated_at = CURRENT_TIMESTAMP 
-                   WHERE firebase_uid = ?::uuid
-               """
-            
-            val stmt = connection.prepareStatement(sql)
-            stmt.setString(1, newRole)
-            stmt.setString(2, firebaseUid)
-            
-            val rowsAffected = stmt.executeUpdate()
-            rowsAffected > 0
-        } catch {
-            case ex: Exception =>
-                println(s"Error updating user role: ${ex.getMessage}")
-                false
-        } finally {
-            connection.close()
         }
     }
     
@@ -399,33 +319,12 @@ object DatabaseManager {
         }
     }
     
-    def submitNetworkResult(runID: Long, totalTime: Long, networkNumber: Int, totalRounds: Int,
-        reachedConsensus: Boolean): Unit = {
-        if (GlobalState.APP_MODE.skipDatabase) return
-        val connection = getConnection
-        try {
-            val query =
-                """
-                  |INSERT INTO network_results (run_id, total_time, network_number, total_rounds, reached_consensus)
-                  |VALUES (?, ?, ?, ?, ?)
-                  |""".stripMargin
-                  
-            val stmt = connection.prepareStatement(query)
-            stmt.setLong(1, runID)
-            stmt.setLong(2, totalTime)
-            stmt.setInt(3, networkNumber)
-            stmt.setInt(4, totalRounds)
-            stmt.setBoolean(5, reachedConsensus)
-            stmt.executeUpdate()
-            
-        } catch {
-            case ex: Exception =>
-                Logger.logError(s"Error saving the run: ${ex.getMessage}")
-        } finally {
-            connection.close()
-        }
-    }
-    
+    /**
+     * Saves the results of the different networks from a particular run to the database
+     *
+     * @param runID             Id of the run
+     * @param networkResults    The Array with the individual results of each network
+     */
     def submitNetworkResults(runID: Long, networkResults: mutable.ArrayBuffer[NetworkResult]): Unit = {
         if (GlobalState.APP_MODE.skipDatabase) return
         val connection = getConnection
@@ -456,6 +355,126 @@ object DatabaseManager {
         }
     }
     
+    case class UserData(
+        id: Long,
+        firebaseUid: String,
+        email: String,
+        name: String,
+        role: String,
+        isActive: Boolean,
+        createdAt: String,
+        updatedAt: String
+    )
+    
+    def createOrUpdateUser(firebaseUid: String, email: String, name: String, role: String = "Guest"): Option[UserData] = {
+        val connection = getConnection
+        try {
+            val sql =
+                """
+                       INSERT INTO users (firebase_uid, email, name, role, created_at, updated_at, is_active)
+                       VALUES (?::uuid, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, true)
+                       ON CONFLICT (firebase_uid)
+                       DO UPDATE SET
+                           email = EXCLUDED.email,
+                           name = EXCLUDED.name,
+                           updated_at = CURRENT_TIMESTAMP
+                       RETURNING id, firebase_uid, created_at, updated_at, role, email, name, is_active
+                   """
+            
+            val stmt = connection.prepareStatement(sql)
+            stmt.setString(1, firebaseUid)
+            stmt.setString(2, email)
+            stmt.setString(3, name)
+            stmt.setString(4, role)
+            
+            val resultSet = stmt.executeQuery()
+            
+            if (resultSet.next()) {
+                Some(UserData(
+                    id = resultSet.getLong("id"),
+                    firebaseUid = resultSet.getString("firebase_uid"),
+                    email = resultSet.getString("email"),
+                    name = resultSet.getString("name"),
+                    role = resultSet.getString("role"),
+                    isActive = resultSet.getBoolean("is_active"),
+                    createdAt = resultSet.getTimestamp("created_at").toString,
+                    updatedAt = resultSet.getTimestamp("updated_at").toString
+                ))
+            } else {
+                None
+            }
+        } catch {
+            case ex: Exception =>
+                println(s"Error creating/updating user: ${ex.getMessage}")
+                None
+        } finally {
+            connection.close()
+        }
+    }
+    
+    def getUserByFirebaseUid(firebaseUid: String): Option[UserData] = {
+        val connection = getConnection
+        try {
+            val sql =
+                """
+                       SELECT id, firebase_uid, created_at, updated_at, role, email, name, is_active
+                       FROM users
+                       WHERE firebase_uid = ?::uuid
+                   """
+            
+            val stmt = connection.prepareStatement(sql)
+            stmt.setString(1, firebaseUid)
+            
+            val resultSet = stmt.executeQuery()
+            
+            if (resultSet.next()) {
+                Some(UserData(
+                    id = resultSet.getLong("id"),
+                    firebaseUid = resultSet.getString("firebase_uid"),
+                    email = resultSet.getString("email"),
+                    name = resultSet.getString("name"),
+                    role = resultSet.getString("role"),
+                    isActive = resultSet.getBoolean("is_active"),
+                    createdAt = resultSet.getTimestamp("created_at").toString,
+                    updatedAt = resultSet.getTimestamp("updated_at").toString
+                ))
+            } else {
+                None
+            }
+        } catch {
+            case ex: Exception =>
+                println(s"Error getting user: ${ex.getMessage}")
+                None
+        } finally {
+            connection.close()
+        }
+    }
+    
+    def updateUserRole(firebaseUid: String, newRole: String): Boolean = {
+        val connection = getConnection
+        try {
+            val sql =
+                """
+                       UPDATE users
+                       SET role = ?, updated_at = CURRENT_TIMESTAMP
+                       WHERE firebase_uid = ?::uuid
+                   """
+            
+            val stmt = connection.prepareStatement(sql)
+            stmt.setString(1, newRole)
+            stmt.setString(2, firebaseUid)
+            
+            val rowsAffected = stmt.executeUpdate()
+            rowsAffected > 0
+        } catch {
+            case ex: Exception =>
+                println(s"Error updating user role: ${ex.getMessage}")
+                false
+        } finally {
+            connection.close()
+        }
+    }
+    
     /**
      * Legacy code to save the entire state to database use can be used when
      */
@@ -471,7 +490,7 @@ object DatabaseManager {
                    iterationLimit: Int,
                    initialDistribution: String
                  ): Option[Long] = {
-        val conn = getConnection
+        val conn = getConnectionLegacy
         var stmt: PreparedStatement = null
         
         try {
@@ -547,7 +566,7 @@ object DatabaseManager {
       runId: Long,
       numberOfAgents: Int
     ): Unit = {
-        val conn = getConnection
+        val conn = getConnectionLegacy
         try {
             conn.setAutoCommit(true)
             val sql =
@@ -613,7 +632,7 @@ object DatabaseManager {
     
     // ToDo optimize insert to maybe use copy or batched concurrency
     def insertNeighborsBatch(networkStructures: ArrayBuffer[NeighborStructure]): Unit = {
-        val conn = dataSource.getConnection
+        val conn = getConnectionLegacy
         try {
             val sql =
                 """
@@ -645,7 +664,7 @@ object DatabaseManager {
     }
     
     private def createUnloggedTable(tableName: String): Unit = {
-        val conn = getConnection
+        val conn = getConnectionLegacy
         var stmt: Statement = null
         try {
             stmt = conn.createStatement()
@@ -666,7 +685,7 @@ object DatabaseManager {
     }
     
     def insertRounds(dataOut: Array[Byte], tableName: String): Unit = {
-        val conn = getConnection
+        val conn = getConnectionLegacy
         var copyManager: CopyManager = null
         try {
             conn.setAutoCommit(false)
@@ -697,21 +716,15 @@ object DatabaseManager {
                     """;
             
         val dropSql = s"DROP TABLE IF EXISTS public.$tempTableName"
-        val conn = getConnection
+        val conn = getConnectionLegacy
         var stmt: Statement = null
         try {
             conn.setAutoCommit(false)
             stmt = conn.createStatement()
-        
-            // Disable triggers
+            
             stmt.execute(disableTriggersSql)
-            
             stmt.execute(insertSql)
-            
-            // Enable triggers
             stmt.execute(enableTriggersSql)
-            
-            // Execute DROP TABLE
             stmt.execute(dropSql)
             
             conn.commit()
@@ -731,7 +744,7 @@ object DatabaseManager {
     
     //Updates
     def updateTimeField(id: Either[Long, UUID], timeValue: Long, table: String, field: String): Unit = {
-        val conn = getConnection
+        val conn = getConnectionLegacy
         var stmt: PreparedStatement = null
         try {
             val sql = id match {
@@ -758,7 +771,7 @@ object DatabaseManager {
     
     
     def updateNetworkFinalRound(id: UUID, finalRound: Int, simulationOutcome: Boolean): Unit = {
-        val conn = getConnection
+        val conn = getConnectionLegacy
         var stmt: PreparedStatement = null
         try {
             val sql = s"UPDATE networks SET final_round = ?, simulation_outcome = ? WHERE id = CAST(? AS uuid)"
@@ -780,7 +793,7 @@ object DatabaseManager {
         distribution: String, density: Option[Int], degreeDistribution: Option[Float])
     
     def getRun(runId: Int): Option[RunQueryResult] = {
-        val conn = getConnection
+        val conn = getConnectionLegacy
         var stmt: PreparedStatement = null
         try {
             val sql = """
@@ -812,7 +825,7 @@ object DatabaseManager {
     }
     
     def getRunInfo(networkId: UUID): Option[(String, Option[Int], Option[Float])] = {
-        val conn = getConnection
+        val conn = getConnectionLegacy
         var stmt: PreparedStatement = null
         try {
             val sql =
@@ -844,7 +857,7 @@ object DatabaseManager {
     }
     
     def getNetworks(runId: Int, numberOfNetworks: Int): Option[Array[UUID]] = {
-        val conn = getConnection
+        val conn = getConnectionLegacy
         var stmt: PreparedStatement = null
         try {
             val sql = s"SELECT id FROM networks WHERE run_id = ?"
@@ -868,7 +881,7 @@ object DatabaseManager {
     
     def getAgents(networkId: UUID, numberOfAgents: Int): Option[
       Array[(UUID, Float, Float, Option[Float], Option[Integer])]] = {
-        val conn = getConnection
+        val conn = getConnectionLegacy
         var stmt: PreparedStatement = null
         try {
             val sql =
@@ -906,7 +919,7 @@ object DatabaseManager {
     def getAgentsWithState(networkId: UUID, numberOfAgents: Int): Option[
       Array[(UUID, Float, Float, Option[Float], Option[Integer],
         Float, Option[Array[Byte]])]] = {
-        val conn = getConnection
+        val conn = getConnectionLegacy
         var stmt: PreparedStatement = null
         try {
             val sql =
@@ -954,7 +967,7 @@ object DatabaseManager {
     
     def getNeighbors(networkId: UUID, numberOfAgents: Int): Option[Array[(UUID, UUID, Float, 
       Option[Bias])]] = {
-        val conn = getConnection
+        val conn = getConnectionLegacy
         var stmt: PreparedStatement = null
         try {
             val sql =
@@ -993,7 +1006,7 @@ object DatabaseManager {
     
     def getAgentsWithState(runId: Int, numberOfAgents: Int, limit: Int, offset: Int): Option[
       Array[AgentStateLoad]] = {
-        val conn = getConnection
+        val conn = getConnectionLegacy
         var stmt: PreparedStatement = null
         try {
             val sql =
@@ -1050,7 +1063,7 @@ object DatabaseManager {
     }
     
     def getNeighbors(runId: Int, numberOfAgents: Int, limit: Int, offset: Int): Option[Array[NeighborsLoad]] = {
-        val conn = getConnection
+        val conn = getConnectionLegacy
         var stmt: PreparedStatement = null
         try {
             val sql =
@@ -1115,7 +1128,7 @@ object DatabaseManager {
             stateData: Array[Byte],
             isSpeaking: Boolean
         )
-        val conn = getConnection
+        val conn = getConnectionLegacy
         var stmt: PreparedStatement = null
 
         val ids = mutable.HashMap[String, Int]()

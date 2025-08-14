@@ -56,7 +56,7 @@ object AppMode {
      */
     private final val LEGACY_DB_FLAG: Int = 0x08
     
-    // Logging and debugging flags (bits 4-6)
+    // Logging flags (bits 4-6 reserved 4-15)
     /**
      * Server logging flag - logs server-specific operations and messages.
      * Useful when making changes to server message structure or debugging
@@ -81,6 +81,15 @@ object AppMode {
      * Impacts: Significant performance overhead due to high-frequency logging.
      */
     private final val SIMULATION_LOGS: Int = 0x40
+    
+    /**
+     * Skip Web Socket flag - disables the sending of simulation data to the web socket server.
+     * Can be useful when measuring raw performance without the overhead of sending via web or
+     * when there is no front end service to receive the msgs.
+     * 
+     * Impacts: Notable on huge simulation (4m+ agents), less significant in medium/small sizes. 
+     */
+    private final val SKIP_WS_FLAG: Int = 0x10000
     
     extension (mode: Mode) {
         /** Get the underlying int value */
@@ -110,6 +119,9 @@ object AppMode {
         /** Check if any form of logging is enabled */
         def hasAnyLogging: Boolean = hasGeneralLogs || hasSimulationLogs || hasServerLogs
         
+        /** Check if web socket data should be skipped */
+        def skipWS: Boolean = (mode & SKIP_WS_FLAG) != 0
+        
         /** Get a human-readable description of the mode */
         def description: String = {
             val flags = List(
@@ -119,7 +131,8 @@ object AppMode {
                 if (usesLegacyDB) Some("Legacy-DB") else None,
                 if (hasServerLogs) Some("Server-Logs") else None,
                 if (hasGeneralLogs) Some("General-Logs") else None,
-                if (hasSimulationLogs) Some("Simulation-Logs") else None
+                if (hasSimulationLogs) Some("Simulation-Logs") else None,
+                if (skipWS) Some("No-WS") else None
             ).flatten
             
             if (flags.nonEmpty) flags.mkString(" + ") else "Unknown"
@@ -137,7 +150,8 @@ object AppMode {
         legacyDB: Boolean = false,
         serverLogs: Boolean = false,
         generalLogs: Boolean = false,
-        simulationLogs: Boolean = false): Mode = {
+        simulationLogs: Boolean = false,
+        skipWS: Boolean = false): Mode = {
         require(!(server && local), "SERVER and LOCAL modes are mutually exclusive")
         require(!skipDatabase || !legacyDB, "Cannot use legacy database when skipping database entirely")
         
@@ -149,6 +163,7 @@ object AppMode {
         if (serverLogs) mode = (mode | SERVER_LOGS)
         if (generalLogs) mode = (mode | GENERAL_LOGS)
         if (simulationLogs) mode = (mode | SIMULATION_LOGS)
+        if (skipWS) mode = (mode | SKIP_WS_FLAG)
         
         mode
     }
@@ -164,7 +179,8 @@ object AppMode {
             legacyDB = sys.env.get("APP_LEGACY_DB").exists(_.toLowerCase == "true"),
             serverLogs = sys.env.get("APP_SERVER_LOGS").exists(_.toLowerCase == "true"),
             generalLogs = sys.env.get("APP_GENERAL_LOGS").exists(_.toLowerCase == "true"),
-            simulationLogs = sys.env.get("APP_SIMULATION_LOGS").exists(_.toLowerCase == "true")
+            simulationLogs = sys.env.get("APP_SIMULATION_LOGS").exists(_.toLowerCase == "true"),
+            skipWS = sys.env.get("APP_SKIP_WS").exists(_.toLowerCase == "true")
         )
     }
     

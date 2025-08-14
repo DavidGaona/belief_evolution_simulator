@@ -259,12 +259,12 @@ object Server {
         bindingFuture.onComplete {
             case scala.util.Success(binding) =>
                 val address = binding.localAddress
-                println(s"Server online at http://${address.getHostString}:${address.getPort}/")
-                println(s"API endpoint: http://${address.getHostString}:${address.getPort}/run")
-                println(s"Custom API endpoint: http://${address.getHostString}:${address.getPort}/custom")
-                println(s"WebSocket endpoint: ws://${address.getHostString}:${address.getPort}/ws")
+                Logger.log(s"Server online at http://${address.getHostString}:${address.getPort}/")
+                Logger.log(s"API endpoint: http://${address.getHostString}:${address.getPort}/run")
+                Logger.log(s"Custom API endpoint: http://${address.getHostString}:${address.getPort}/custom")
+                Logger.log(s"WebSocket endpoint: ws://${address.getHostString}:${address.getPort}/ws")
             case scala.util.Failure(ex) =>
-                println(s"Failed to bind server: ${ex.getMessage}")
+                Logger.log(s"Failed to bind server: ${ex.getMessage}")
                 system.get.terminate()
         }
         
@@ -314,37 +314,43 @@ object Server {
         )(Keep.right)
     }
     
+    
     /**
      * Broadcasts binary simulation data to all WebSocket clients connected to a specific channel.
      *
      * Receives the binary packet created by AgentProcessor.sendRoundToWebSocketServer() and distributes
-     * it to all connected WebSocket clients for that simulation run. Uses Akka Streams for efficient
+     * it to all connected WebSocket clients for that simulation run. This enables real-time visualization
+     * of agent states and beliefs during simulation execution. Uses Akka Streams for efficient
      * message delivery to multiple concurrent clients.
      *
-     * Message Flow:<br>
+     * '''Message Flow:'''
+     * {{{
      * AgentProcessor ──▶ Server (this) ──▶ WebSocket Clients (Browser/Frontend)
+     * }}}
      *
-     * Binary Data Handling:<br>
-     * ┌─────────────────────────────────────────────────────────────────────────────┐ <br>
-     * │ INPUT: ByteBuffer from AgentProcessor                                       │ <br>
-     * ├─────────────────────────────────────────────────────────────────────────────┤ <br>
-     * │ HEADER (36 bytes)    │ networkId + runID + numberOfAgents + round + range   │ <br>
-     * │ BELIEF DATA (n*8)    │ Public + Private beliefs for n agents                │ <br>
-     * │ SPEAKING DATA (n*1)  │ Speaking state (0/1) for n agents                    │ <br>
-     * ├─────────────────────────────────────────────────────────────────────────────┤ <br>
-     * │ OUTPUT: BinaryMessage via WebSocket                                         │ <br>
-     * └─────────────────────────────────────────────────────────────────────────────┘
+     * '''Binary Data Layout:'''
+     * {{{
+     * ┌──────────────────────────────────────────────────────────────────────┐
+     * │ INPUT: ByteBuffer from AgentProcessor                                │
+     * ├──────────────────────────────────────────────────────────────────────┤
+     * │ HEADER (36 bytes)   │ networkId + runID + numOfAgents + round + range│
+     * │ BELIEF DATA (n*8)   │ Public + Private beliefs for n agents          │
+     * │ SPEAKING DATA (n*1) │ Speaking state (0/1) for n agents              │
+     * ├──────────────────────────────────────────────────────────────────────┤
+     * │ OUTPUT: BinaryMessage via WebSocket                                  │
+     * └──────────────────────────────────────────────────────────────────────┘
+     * }}}
      *
-     * Error Handling:
-     * - Server not initialized: Logs error and returns early <br>
-     * - Channel not found: No active WebSocket connections for this simulation <br>
-     * - Network failures: Handled by Akka Streams internally <br>
+     * '''Error Handling:'''
+     *  - Server not initialized: Logs error and returns early
+     *  - Channel not found: Logs error when no active WebSocket connections exist
+     *  - Network failures: Handled by Akka Streams internally
      *
-     * Performance Notes:
-     * - Uses Akka Streams for backpressure handling <br>
-     * - ByteString wraps buffer for zero-copy transmission <br>
-     * - Single Source broadcasts to multiple clients efficiently <br>
-     * - Debug logging only enabled when APP_MODE.hasServerLogs is true
+     * '''Performance Notes:'''
+     *  - Uses Akka Streams for backpressure handling
+     *  - ByteString wraps buffer for zero-copy transmission
+     *  - Single Source broadcasts to multiple clients efficiently
+     *  - Debug logging only enabled when APP_MODE.hasServerLogs is true
      *
      * @param channelId Unique identifier for the simulation run (maps to WebSocket connections)
      * @param buffer Binary packet containing agent states (created by AgentProcessor.sendRoundToWebSocketServer)
@@ -368,6 +374,48 @@ object Server {
         }
     }
     
+    /**
+     * Broadcasts neighbor topology data to all WebSocket clients connected to a specific channel.
+     *
+     * Receives the binary packet created by Network.sendNeighbors() and distributes it to all
+     * connected WebSocket clients for that simulation run. This enables real-time visualization
+     * of the agent network topology and relationships. Uses Akka Streams for efficient message
+     * delivery to multiple concurrent clients.
+     *
+     * '''Message Flow:'''
+     * {{{
+     * Network.sendNeighbors() ──▶ Server (this) ──▶ WebSocket Clients (Browser/Frontend)
+     * }}}
+     *
+     * '''Binary Data Layout:'''
+     * {{{
+     * ┌─────────────────────────────────────────────────────────────────────────────┐
+     * │ INPUT: ByteBuffer from Network.sendNeighbors()                              │
+     * ├──────────────────────────────────────────────────────────────────────────┤
+     * │ HEADER (24 bytes)      │ networkId + runID + numberOfAgents + neighbors  │
+     * │ INDEX OFFSETS (n*4)    │ Agent index mapping for n agents (CSR format)   │
+     * │ NEIGHBOR REFS (m*4)    │ Neighbor reference indices for m connections    │
+     * │ NEIGHBOR WEIGHTS (m*4) │ Connection weights for m neighbor pairs         │
+     * │ NEIGHBOR BIASES (m*1)  │ Cognitive bias types for m connections          │
+     * ├─────────────────────────────────────────────────────────────────────────────┤
+     * │ OUTPUT: BinaryMessage via WebSocket                                         │
+     * └─────────────────────────────────────────────────────────────────────────────┘
+     * }}}
+     *
+     * '''Error Handling:'''
+     *  - Server not initialized: Logs error and returns early
+     *  - Channel not found: Silent failure (no active WebSocket connections)
+     *  - Network failures: Handled by Akka Streams internally
+     *
+     * '''Performance Notes:'''
+     *  - Uses Akka Streams for backpressure handling
+     *  - ByteString wraps buffer for zero-copy transmission
+     *  - Single Source broadcasts to multiple clients efficiently
+     *  - Debug logging only enabled when APP_MODE.hasServerLogs is true
+     *
+     * @param channelId Unique identifier for the simulation run (maps to WebSocket connections)
+     * @param buffer Binary packet containing network topology data (created by Network.sendNeighbors)
+     */
     def sendNeighborBinaryData(channelId: String, buffer: ByteBuffer): Unit = {
         if (!initialized || system.isEmpty) {
             Logger.logError("Error: WebSocket server not initialized properly")
@@ -380,6 +428,8 @@ object Server {
                 implicit val materializer: Materializer = Materializer(system.get)
                 val message = BinaryMessage(ByteString(buffer))
                 Source.single(message).runWith(publisher)
+            case None =>
+                Logger.logError(s"Error: No WebSocket clients connected to channel $channelId")
         }
     }
     

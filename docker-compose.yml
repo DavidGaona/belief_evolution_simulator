@@ -1,15 +1,19 @@
 services:
   postgres:
-    image: postgres:17.5
+    build:
+      context: .
+      dockerfile: Dockerfile_db
     environment:
       POSTGRES_DB: ${POSTGRES_DB}
       POSTGRES_USER: ${POSTGRES_USER}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB_LEGACY: ${POSTGRES_DB_LEGACY}
+      POSTGRES_USER_LEGACY: ${POSTGRES_USER_LEGACY}
+      POSTGRES_PASSWORD_LEGACY: ${POSTGRES_PASSWORD_LEGACY}
     ports:
       - "5434:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
-      - ./db/init:/docker-entrypoint-initdb.d
     networks:
       - app-network
 
@@ -23,6 +27,11 @@ services:
       DB_NAME: ${POSTGRES_DB}
       DB_USER: ${POSTGRES_USER}
       DB_PASSWORD: ${POSTGRES_PASSWORD}
+      DB_HOST_LEGACY: ${DB_HOST_LEGACY}
+      DB_PORT_LEGACY: ${DB_PORT_LEGACY}
+      DB_NAME_LEGACY: ${POSTGRES_DB_LEGACY}
+      DB_USER_LEGACY: ${POSTGRES_USER_LEGACY}
+      DB_PASSWORD_LEGACY: ${POSTGRES_PASSWORD_LEGACY}
       SERVER_HOST: ${SERVER_HOST}
       SERVER_PORT: ${SERVER_PORT}
     ports:

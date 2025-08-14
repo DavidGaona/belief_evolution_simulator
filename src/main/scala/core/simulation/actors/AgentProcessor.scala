@@ -8,6 +8,7 @@ import core.model.agent.behavior.silence.*
 import core.model.agent.behavior.silence.SilenceEffects.SilenceEffect
 import core.model.agent.behavior.silence.SilenceStrategies.SilenceStrategy
 import core.simulation.*
+import core.simulation.config.GlobalState
 import io.web.Server
 import io.persistence.RoundRouter
 import io.persistence.actors.{AgentState, AgentStatesSilent, AgentStatesSpeaking, NeighborStructure, SendNeighbors, SendStaticAgentData}
@@ -62,10 +63,10 @@ case class StaticAgentData(
  */
 class AgentProcessor(
     ids: Array[UUID], silenceStrategy: Array[SilenceStrategy], silenceEffect: Array[SilenceEffect],
-    thresholdMap: mutable.Map[Int, Float], confidenceMap: mutable.Map[Int, (Float, Float)],
+    threshold: Array[Float], confidence: Array[Float], confidenceThreshold: Array[Float],
     runMetadata: RunMetadata, beliefBuffer1: Array[Float], beliefBuffer2: Array[Float],
     speakingBuffer1: Array[Byte], speakingBuffer2: Array[Byte], belief: Array[Float],
-    publicBelief: mutable.Map[Int, Float], tolRadius: Array[Float], tolOffset: Array[Float],
+    publicBelief: Array[Float], tolRadius: Array[Float], tolOffset: Array[Float],
     indexOffset: Array[Int], timesStable: Array[Int], neighborsRefs: Array[Int],
     neighborsWeights: Array[Float], neighborBiases: Array[Bias],
     hasMemory: Array[Byte], neighborsBiasesToAssign: Option[mutable.HashMap[Bias, Int]],
@@ -106,10 +107,11 @@ class AgentProcessor(
                 beliefBuffer1(i) = belief(i)
                 if (silenceEffect(i) == SilenceEffects.MEMORY) publicBelief(i) = belief(i)
                 
-                if (silenceStrategy(i) == SilenceStrategies.THRESHOLD) thresholdMap(i) = 0.1f
+                if (silenceStrategy(i) == SilenceStrategies.THRESHOLD) threshold(i) = 0.1f
                 
                 if (silenceStrategy(i) == SilenceStrategies.CONFIDENCE) {
-                    confidenceMap(i) = (0.1f, random.nextFloat())
+                    confidence(i) = random.nextFloat()
+                    confidenceThreshold(i) = 0.1f
                 }
                 
                 if (!hasUpdatedInfluences) generateInfluencesAndBiases()
@@ -339,7 +341,7 @@ class AgentProcessor(
             //print(s"= ${belief(i)}\n")
             
             // Determine speaking behavior and public belief expression
-            val isSpeaking = silenceStrategy(i).shouldSpeak(i, inFavor, against, thresholdMap, confidenceMap)
+            val isSpeaking = silenceStrategy(i).shouldSpeak(i, inFavor, against, threshold, confidence, confidenceThreshold)
             writeSpeakingBuffer(i) = isSpeaking
             writeBeliefBuffer(i) = silenceEffect(i).getPublicValue(i, belief(i), isSpeaking, publicBelief)
             
@@ -359,7 +361,7 @@ class AgentProcessor(
         // ========================================================================
         round += 1
         if (runMetadata.saveMode.includesRounds) snapshotAgentState(false, readBeliefBuffer, writeSpeakingBuffer)
-        sendRoundToWebSocketServer(writeBeliefBuffer, writeSpeakingBuffer)
+        if (!GlobalState.APP_MODE.skipWS) sendRoundToWebSocketServer(writeBeliefBuffer, writeSpeakingBuffer)
         context.parent ! AgentUpdated(maxBelief, minBelief, existsStableAgent)
     }
     
@@ -400,11 +402,12 @@ class AgentProcessor(
         while (i < (startsAt + numberOfAgents)) {
             if (forceSnapshot || math.abs(belief(i) - pastBeliefs(i)) != 0) {
                 if (silenceEffect(i) == SilenceEffects.MEMORY) encoder.encodeFloat("publicBelief", publicBelief(i))
-                if (thresholdMap.contains(i)) encoder.encodeFloat("threshold", thresholdMap(i))
+                if (threshold.contains(i)) encoder.encodeFloat("threshold", threshold(i))
                 
-                if (confidenceMap.contains(i)) {
-                    val (threshold, unboundedConfidence) = confidenceMap(i)
-                    encoder.encodeFloat("threshold", threshold)
+                if (confidence.contains(i)) {
+                    val unboundedConfidence = confidence(i)
+                    val threshold = confidenceThreshold(i)
+                    encoder.encodeFloat("confidenceThreshold", threshold)
                     encoder.encodeFloat("confidence", (2f / (1f + Math.exp(-unboundedConfidence).toFloat)) - 1)
                 }
                 

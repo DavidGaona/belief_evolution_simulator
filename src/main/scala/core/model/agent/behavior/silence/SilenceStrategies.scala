@@ -28,7 +28,9 @@ object SilenceStrategies {
     
     /**
      * Confidence silence - agent's willingness to speak depends on accumulated confidence.
-     * Builds confidence over time based on opinion climate and has a configurable threshold.
+     * Builds confidence over time based on opinion climate and has a configurable threshold. <br>
+     * 
+     * @see [[https://doi.org/10.1080/0960085X.2018.1560920]] Original paper
      */
     final val CONFIDENCE: SilenceStrategy = 0x03
     
@@ -39,34 +41,46 @@ object SilenceStrategies {
          * @param agentIndex    The index of the agent in the SOA arrays
          * @param inFavor       Number of agents speaking in favor
          * @param against       Number of agents speaking against
-         * @param thresholdMap  Map containing threshold values for agents that need them
-         * @param confidenceMap Map containing (threshold, unbounded) tuples for confidence agents
+         * @param threshold  Array containing threshold values for agents that need them
+         * @param unboundedConfidence Array containing confidence values for confidence agents
+         * @param confidenceThreshold  Array containing confidence threshold values for agents that need them
          * @return 1 if agent should speak, 0 if silent
          */
         def shouldSpeak(
             agentIndex: Int,
             inFavor: Int,
             against: Int,
-            thresholdMap: mutable.Map[Int, Float],
-            confidenceMap: mutable.Map[Int, (Float, Float)]
+            threshold: Array[Float],
+            unboundedConfidence: Array[Float],
+            confidenceThreshold: Array[Float]
         ): Byte = {
             strategy match {
                 case DEGROOT => 1
+                
                 case MAJORITY => (1 - ((inFavor - against) >>> 31)).toByte
+                
                 case THRESHOLD =>
-                    val threshold = thresholdMap(agentIndex)
-                    val total = inFavor + against
-                    (1 - (java.lang.Float.floatToRawIntBits(threshold * total - inFavor.toFloat) >>> 31)).toByte
+                    val agentThreshold = threshold(agentIndex)
+                    val totalSpeaking = inFavor + against
+                    val thresholdMet = agentThreshold * totalSpeaking <= inFavor.toFloat
+                    if (thresholdMet) 1 else 0
+                    
                 case CONFIDENCE =>
-                    val (threshold, oldUnbounded) = confidenceMap(agentIndex)
-                    val opinionClimate = (inFavor + against) match {
-                        case 0 => 0.0f
-                        case totalSpeaking => (inFavor - against).toFloat / totalSpeaking
-                    }
-                    val newUnbounded = math.max(oldUnbounded + opinionClimate, 0)
-                    confidenceMap(agentIndex) = (threshold, newUnbounded)
+                    val totalSpeaking = inFavor + against
+                    val opinionClimate = if (totalSpeaking == 0) 0.0f
+                    else (inFavor - against).toFloat / totalSpeaking
+                    
+                    val oldUnbounded = unboundedConfidence(agentIndex)
+                    val newUnbounded = math.max(oldUnbounded + opinionClimate, 0.0f)
+                    unboundedConfidence(agentIndex) = newUnbounded
+                    
+                    // Transform to confidence using sigmoid: f(x) = 2/(1+e^(-x)) - 1
                     val confidence = (2f / (1f + Math.exp(-newUnbounded).toFloat)) - 1f
-                    (1 - (java.lang.Float.floatToRawIntBits(threshold - confidence) >>> 31)).toByte
+                    
+                    // Speaking decision: confident enough to express opinion?
+                    val personalThreshold = confidenceThreshold(agentIndex)
+                    if (confidence > personalThreshold) 1 else 0
+                    
                 case _ => 1 // Default to DeGroot for unknown strategies
             }
         }

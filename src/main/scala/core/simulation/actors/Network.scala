@@ -23,7 +23,9 @@ import scala.concurrent.duration.*
 import scala.util.Using
 // Network
 
-// Messages
+// ============================================================================
+// MESSAGES
+// ============================================================================
 case class BuildCustomNetwork(customRunInfo: CustomRunInfo) // Monitor -> Network
 case class AgentUpdated(maxBelief: Float, minBelief: Float, isStable: Boolean) // Agent -> network
 case class BuildNetworkFromCSV(neighborsArr: Array[Int], offsetsArr: Array[Int]) // Monitor -> network
@@ -34,9 +36,9 @@ case object RunFirstRound // Agent -> Network
 case object SaveRemainingData // Network -> AgentRoundDataSaver
 case object ActorFinished // Agent -> Network
 
-// Agent types
-
-// Actor
+// ============================================================================
+// ACTOR
+// ============================================================================
 class Network(networkId: UUID, runMetadata: RunMetadata,
     agentTypeCount: Array[(SilenceStrategy, SilenceEffect, Int)],
     agentBiases: Array[(Bias, Int)])
@@ -54,9 +56,7 @@ class Network(networkId: UUID, runMetadata: RunMetadata,
         uuids.v7Bulk(arr)
         arr
     }
-    else {
-        null
-    }
+    else null
     
     // ============================================================================
     // BELIEF AND COMMUNICATION BUFFERS (Double-buffered)
@@ -78,10 +78,16 @@ class Network(networkId: UUID, runMetadata: RunMetadata,
     val hasMemory: Array[Byte] = new Array[Byte](runMetadata.agentsPerNetwork)
     val timesStable: Array[Int] = new Array[Int](runMetadata.agentsPerNetwork)
     
-    // Dynamic properties state maps
-    val threshold: mutable.Map[Int, Float] = mutable.Map[Int, Float]()
-    val confidenceState: mutable.Map[Int, (Float, Float)] = mutable.Map[Int, (Float, Float)]()
-    val publicBelief: mutable.Map[Int, Float] = mutable.Map[Int, Float]()
+    // ============================================================================
+    // CONDITIONAL AGENT PROPERTIES - Only allocated if agent types require them
+    // ============================================================================
+    private val hasThreshold: Boolean = agentTypeCount.exists(_._1 == SilenceStrategies.THRESHOLD)
+    private val hasConfidence: Boolean = agentTypeCount.exists(_._1 == SilenceStrategies.CONFIDENCE)
+    private val hasPublicBelief: Boolean = agentTypeCount.exists(_._2 == SilenceEffects.MEMORY)
+    var threshold: Array[Float] = if (hasThreshold) new Array[Float](runMetadata.agentsPerNetwork) else null
+    var confidence: Array[Float] = if (hasConfidence) new Array[Float](runMetadata.agentsPerNetwork) else null
+    var confidenceThreshold: Array[Float] = if (hasConfidence) new Array[Float](runMetadata.agentsPerNetwork) else null
+    var publicBelief: Array[Float] = if (hasPublicBelief) new Array[Float](runMetadata.agentsPerNetwork) else null
     
     // ============================================================================
     // NETWORK TOPOLOGY (Size = -m^2 - m + 2mn or m(m-1) + (n - m) * 2m)
@@ -161,8 +167,8 @@ class Network(networkId: UUID, runMetadata: RunMetadata,
                 val index = i
                 agents(i) = context.actorOf(Props(
                     new AgentProcessor(
-                        agentsIds, silenceStrategy, silenceEffect, threshold,
-                        confidenceState, runMetadata, beliefBuffer1, beliefBuffer2,
+                        agentsIds, silenceStrategy, silenceEffect, threshold, confidence,
+                        confidenceThreshold, runMetadata, beliefBuffer1, beliefBuffer2,
                         speakingBuffer1, speakingBuffer2, privateBeliefs, publicBelief,
                         tolRadius, tolOffset, indexOffset, timesStable,
                         neighborsRefs, neighborsWeights, neighborBiases, hasMemory, None,
@@ -212,8 +218,8 @@ class Network(networkId: UUID, runMetadata: RunMetadata,
                 val index = i
                 agents(i) = context.actorOf(Props(
                     new AgentProcessor(
-                        agentsIds, silenceStrategy, silenceEffect, threshold,
-                        confidenceState,runMetadata, beliefBuffer1, beliefBuffer2,
+                        agentsIds, silenceStrategy, silenceEffect, threshold, confidence,
+                        confidenceThreshold, runMetadata, beliefBuffer1, beliefBuffer2,
                         speakingBuffer1, speakingBuffer2, privateBeliefs, publicBelief,
                         tolRadius, tolOffset, indexOffset, timesStable,
                         neighborsRefs, neighborsWeights, neighborBiases, hasMemory,
@@ -279,8 +285,8 @@ class Network(networkId: UUID, runMetadata: RunMetadata,
                 val index = i
                 agents(i) = context.actorOf(Props(
                     new AgentProcessor(
-                        agentsIds, silenceStrategy, silenceEffect, threshold,
-                        confidenceState,runMetadata, beliefBuffer1, beliefBuffer2,
+                        agentsIds, silenceStrategy, silenceEffect, threshold, confidence,
+                        confidenceThreshold, runMetadata, beliefBuffer1, beliefBuffer2,
                         speakingBuffer1, speakingBuffer2, privateBeliefs, publicBelief,
                         tolRadius, tolOffset, indexOffset, timesStable,
                         neighborsRefs, neighborsWeights, neighborBiases, hasMemory,
@@ -399,14 +405,14 @@ class Network(networkId: UUID, runMetadata: RunMetadata,
             if (pendingResponses == 0) {
                 logAgentRoundState()
                 round += 1
-                //sendNeighbors()
+                sendNeighbors()
                 runRound()
                 pendingResponses = agents.length
             }
         
         case AgentUpdated(maxActorBelief, minActorBelief, isStable) =>
             pendingResponses -= 1
-            // If isStable true then we don't continue as we are stable
+            // If isStable true then we don't continue as we are stable meaning no agent belief changes
             if (!isStable) shouldContinue = true
             maxBelief = math.max(maxBelief, maxActorBelief)
             minBelief = math.min(minBelief, minActorBelief)
@@ -537,30 +543,43 @@ class Network(networkId: UUID, runMetadata: RunMetadata,
     }
     
     /**
-     * Gather neighbor data to then send via web API
+     * Gather neighbor data to then send via web API.
+     *
+     * '''Buffer Layout:'''
+     *
+     * '''HEADER (24 bytes total):'''
+     *  - networkId_msb: 8 bytes (Long) - Most significant bits of network UUID
+     *  - networkId_lsb: 8 bytes (Long) - Least significant bits of network UUID
+     *  - runId: 8 bytes (Long) - Unique identifier for this simulation run
+     *  - numberOfAgents: 4 bytes (Int) - Count of agents in the simulation
+     *  - numberOfNeighbors: 4 bytes (Int) - Count of neighbor relationships
+     *
+     * '''BODY (variable bytes):'''
+     *  - indexOffset: (numberOfAgents * 4) bytes (Int[]) - Agent index offsets
+     *  - neighborsRefs: (numberOfNeighbors * 4) bytes (Int[]) - Neighbor reference indices
+     *  - neighborsWeights: (numberOfNeighbors * 4) bytes (Float[]) - Connection weights
+     *  - neighborBiases: (numberOfNeighbors * 1) bytes (Bias[]/Byte[]) - Cognitive bias types
+     *
+     * @note Total buffer size: 24 + (numberOfAgents * 4) + (numberOfNeighbors * 9) bytes
      */
     private def sendNeighbors(): Unit = {
-        // NetworkId
-        // RunId
-        // Number of agents
-        // Number of neighbors
         val numberOfAgents = indexOffset.length
         val numberOfNeighbors = neighborsRefs.length
         val buffer = ByteBuffer.allocate(24 + (numberOfAgents * 4) + (numberOfNeighbors * 8))
         
-        // Header 32 bytes
+        // HEADER (24 bytes total)
         buffer.putLong(networkId.getMostSignificantBits)
         buffer.putLong(networkId.getLeastSignificantBits)
         buffer.putLong(runMetadata.runID)
         buffer.putInt(indexOffset.length)
         buffer.putInt(neighborsRefs.length)
         
-        // Body variable bytes
+        // BODY (variable bytes)
         buffer.asIntBuffer().put(indexOffset)
         buffer.asIntBuffer().put(neighborsRefs)
         buffer.asFloatBuffer().put(neighborsWeights)
-        // buffer.put(neighborBiases)
-       
+        buffer.put(neighborBiases.asInstanceOf[Array[Byte]])
+        
         Server.sendNeighborBinaryData(runMetadata.channelId, buffer)
     }
     

@@ -1,0 +1,14 @@
+FROM postgres:17.5
+
+RUN apt-get update && apt-get install -y postgresql-client && rm -rf /var/lib/apt/lists/*
+
+COPY db/init/ /app/db/init/
+COPY db/init_db.sh /app/init_db.sh
+
+RUN chmod +x /app/init_db.sh
+
+COPY db/postgres-entrypoint.sh /usr/local/bin/postgres-entrypoint.sh
+RUN chmod +x /usr/local/bin/postgres-entrypoint.sh
+
+ENTRYPOINT ["/usr/local/bin/postgres-entrypoint.sh"]
+CMD ["postgres"]
