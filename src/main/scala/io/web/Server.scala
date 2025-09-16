@@ -7,22 +7,33 @@ import akka.http.scaladsl.model.headers.*
 import akka.http.scaladsl.model.ws.{BinaryMessage, Message}
 import akka.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCodes}
 import akka.http.scaladsl.server.Directives.*
-import akka.http.scaladsl.server.Route
+import akka.http.scaladsl.server.{Directive0, Route}
 import akka.http.scaladsl.unmarshalling.{FromEntityUnmarshaller, Unmarshaller}
 import akka.stream.Materializer
 import akka.stream.scaladsl.{BroadcastHub, Flow, Keep, MergeHub, Sink, Source}
 import akka.util.ByteString
-import core.model.agent.behavior.silence.{SilenceEffectType, SilenceStrategyType}
+import akka.http.scaladsl.marshallers.sprayjson.SprayJsonSupport.*
+import core.model.agent.behavior.bias.CognitiveBiases
+import core.model.agent.behavior.bias.CognitiveBiases.Bias
+import core.model.agent.behavior.silence.SilenceEffects.SilenceEffect
+import core.model.agent.behavior.silence.{SilenceEffects, SilenceStrategies}
+import core.model.agent.behavior.silence.SilenceStrategies.SilenceStrategy
 import core.simulation.actors.{AddNetworks, RunCustomNetwork}
 import core.simulation.config.*
+import core.simulation.config.SaveModes.SaveMode
+import utils.logging.Logger
+import io.db.DatabaseManager
+import utils.datastructures.SnowflakeID
 import utils.rng.distributions.Uniform
 
 import java.nio.{ByteBuffer, ByteOrder}
 import scala.collection.mutable
-import scala.concurrent.ExecutionContextExecutor
+import scala.concurrent.{ExecutionContext, ExecutionContextExecutor}
 
 // Data containers:
 case class CustomRunInfo(
+    runID: Long,
+    channelId: String,
     stopThreshold: Float,
     iterationLimit: Int,
     saveMode: SaveMode,
@@ -30,13 +41,49 @@ case class CustomRunInfo(
     agentBeliefs: Array[Float],
     agentToleranceRadii: Array[Float],
     agentToleranceOffsets: Array[Float],
-    agentSilenceStrategy: Array[Byte],
-    agentSilenceEffect: Array[Byte],
+    agentSilenceStrategy: Array[SilenceStrategy],
+    agentSilenceEffect: Array[SilenceEffect],
     agentNames: Array[String],
     indexOffset: Array[Int],
     target: Array[Int],
     influences: Array[Float],
-    bias: Array[Byte]
+    bias: Array[Bias]
+)
+
+/**
+ * Contains the data to save to the database for custom agents table
+ * @param belief Initial beliefs of the agents
+ * @param radius Tolerance radius of the agents
+ * @param offset Tolerance offset of the agents
+ * @param majorityThreshold Majority thresholds of the agents
+ * @param confidence Initial confidences of the agents
+ * @param silenceStrategy Silence strategies of the agents
+ * @param silenceEffect Silence effects of the agents 
+ * @param name Names of the agents
+ */
+case class CustomAgentsData(
+    belief: Array[Float],
+    radius: Array[Float],
+    offset: Array[Float],
+    silenceStrategy: Array[SilenceStrategy],
+    silenceEffect: Array[SilenceEffect],
+    name: Array[String],
+    majorityThreshold: Option[mutable.Map[Int, Float]],
+    confidence: Option[mutable.Map[Int, Float]],
+)
+
+/**
+ * Contains the data to save to the database for the custom neighbors table
+ * @param source The agents that influence
+ * @param target The agents that are influenced
+ * @param influence The influences
+ * @param bias The cognitive biases the agents react with
+ */
+case class CustomNeighborsData(
+    source: Array[Int],
+    target: Array[Int],
+    influence: Array[Float],
+    bias: Array[Bias],
 )
 
 final case class Payload(data: Array[Byte])
@@ -50,12 +97,18 @@ object BinaryProtocol {
 }
 
 object Server {
+    
     import BinaryProtocol.*
     
     private var initialized = false
     private var system: Option[ActorSystem] = None
     private var monitor: Option[ActorRef] = None
-    private var messagePublisher: Option[Sink[Message, Any]] = None
+    
+    private val channelPublishers = mutable.Map[String, Sink[Message, Any]]()
+    private val channelSources = mutable.Map[String, Source[Message, Any]]()
+    private var channels: Long = 0L
+    
+    case class UserSyncRequest(firebaseUid: String, email: String, name: String)
     
     def initialize(actorSystem: ActorSystem, monitor: ActorRef): Unit = {
         if (initialized) return
@@ -63,122 +116,586 @@ object Server {
         system = Some(actorSystem)
         this.monitor = Some(monitor)
         
-        implicit val sys: ActorSystem = actorSystem
+        implicit val systenImplicit: ActorSystem = actorSystem
         implicit val executionContext: ExecutionContextExecutor = actorSystem.dispatcher
         implicit val materializer: Materializer = Materializer(actorSystem)
         
-        // Create a hub for broadcasting messages to all connected clients
+        val serverHost = sys.env.getOrElse("SERVER_HOST", "0.0.0.0")
+        val serverPort = sys.env.getOrElse("SERVER_PORT", "8080").toInt
+        
         val (sink, source) = MergeHub.source[Message]
           .toMat(BroadcastHub.sink[Message])(Keep.both)
           .run()
         
-        // Store the sink for later use
-        messagePublisher = Some(sink)
-        
-        // Create a WebSocket flow that will handle our WebSocket connections
         val websocketFlow = Flow.fromSinkAndSourceMat(
-            Sink.ignore, // Ignore incoming messages from clients
-            source       // Broadcast our messages to all clients
+            Sink.ignore, 
+            source
         )(Keep.right)
         
-        // CORS headers
         val corsResponseHeaders = List(
             `Access-Control-Allow-Origin`.*,
             `Access-Control-Allow-Methods`(POST, GET, OPTIONS),
-            `Access-Control-Allow-Headers`("Content-Type", "Authorization", "X-Requested-With")
+            `Access-Control-Allow-Headers`("Content-Type", "Authorization", "X-Requested-With", "Accept", "Origin"),
+            `Access-Control-Max-Age`(86400),
+            `Access-Control-Allow-Credentials`(false)
         )
         
-        // CORS handler
-        val corsHandler: Route = options {
-            complete(HttpResponse(StatusCodes.OK).withHeaders(corsResponseHeaders))
+        def addCorsHeaders: Directive0 = {
+            respondWithHeaders(corsResponseHeaders)
         }
         
-        // WebSocket route
-        val webSocketRoute: Route =
-            path("ws") {
+        val corsHandler: Route = addCorsHeaders {
+            options {
+                complete(HttpResponse(StatusCodes.OK))
+            }
+        }
+        
+        val webSocketRoute: Route = addCorsHeaders {
+            path("ws" / Segment) { channelId =>
                 get {
-                    handleWebSocketMessages(websocketFlow)
-                }
-            }
-        
-        // API route
-        val apiRoute: Route = respondWithHeaders(corsResponseHeaders) {
-            post {
-                pathPrefix("run") {
-                    entity(as[Payload]) { payload =>
-                        runGeneratedRun(payload.data)
-                        complete(s"Received payload successfully")
-                    }
-                }
-                
-                pathPrefix("custom") {
-                    entity(as[Payload]) { payload =>
-                        runCustomRun(payload.data)
-                        complete(s"Received payload successfully")
+                    optionalHeaderValueByName("Origin") { origin =>
+                        // ToDo add origin validation here
+                        val channelFlow = createChannelFlow(channelId)
+                        handleWebSocketMessages(channelFlow)
                     }
                 }
             }
         }
         
-        // Home page route
-        val homeRoute: Route =
+        val apiRoute: Route = addCorsHeaders {
+            pathPrefix("run") {
+                post {
+                    entity(as[Payload]) { payload =>
+                        val channelId = parseGeneratedRun(payload.data)
+                        complete(channelId) 
+                    }
+                }
+            } ~ pathPrefix("custom") {
+                post {
+                    entity(as[Payload]) { payload =>
+                        val channelId = parseCustomRun(payload.data)
+                        complete(channelId)
+                    }
+                }
+            } ~ pathPrefix("neighbors") {
+                get {
+                    entity(as[Payload]) { payload =>
+                        val channelId = parseCustomRun(payload.data)
+                        complete(channelId)
+                    }
+                }
+            }
+        }
+        
+        val userRoutes: Route = addCorsHeaders {
+            pathPrefix("api" / "users") {
+                path("sync") {
+                    post {
+                        entity(as[String]) { jsonString =>
+                            parseUserSyncRequest(jsonString) match {
+                                case Some(userRequest) =>
+                                    DatabaseManager.createOrUpdateUser(
+                                        userRequest.firebaseUid,
+                                        userRequest.email,
+                                        userRequest.name
+                                    ) match {
+                                        case Some(user) =>
+                                            complete(StatusCodes.OK -> s"User synced: ${user.email}")
+                                        case None =>
+                                            complete(StatusCodes.InternalServerError -> "Failed to sync user")
+                                    }
+                                case None =>
+                                    complete(StatusCodes.BadRequest -> "Invalid user data")
+                            }
+                        }
+                    }
+                } ~
+                  path("info" / Segment) { firebaseUid =>
+                      get {
+                          DatabaseManager.getUserByFirebaseUid(firebaseUid) match {
+                              case Some(user) =>
+                                  complete(StatusCodes.OK -> s"User: ${user.email}, Role: ${user.role}")
+                              case None =>
+                                  complete(StatusCodes.NotFound -> "User not found")
+                          }
+                      }
+                  } ~
+                  path("role" / Segment / Segment) { (firebaseUid, newRole) =>
+                      put {
+                          if (DatabaseManager.updateUserRole(firebaseUid, newRole)) {
+                              complete(StatusCodes.OK -> s"Role updated to: $newRole")
+                          } else {
+                              complete(StatusCodes.InternalServerError -> "Failed to update role")
+                          }
+                      }
+                  }
+            }
+        }
+        
+        val homeRoute: Route = addCorsHeaders {
             pathEndOrSingleSlash {
                 get {
                     complete(HttpEntity(ContentTypes.`text/html(UTF-8)`,
                         """
                           |<html>
+                          |  <head>
+                          |    <title>Simulation Server</title>
+                          |  </head>
                           |  <body>
                           |    <h1>Simulation Server</h1>
                           |    <p>API endpoint: POST /run</p>
+                          |    <p>Custom API endpoint: POST /custom</p>
                           |    <p>WebSocket endpoint: ws://localhost:8080/ws</p>
                           |  </body>
                           |</html>
-                        """.stripMargin))
+                            """.stripMargin))
                 }
             }
+        }
         
-        // Combine all routes with CORS
-        val routes: Route = corsHandler ~ webSocketRoute ~ apiRoute ~ homeRoute
-        
-        // Bind to port - using one port for both services
-        val bindingFuture = Http().newServerAt("0.0.0.0", 8080).bind(routes)
+        val routes: Route = corsHandler ~ webSocketRoute ~ apiRoute ~ userRoutes ~ homeRoute
+        val bindingFuture = Http().newServerAt(serverHost, serverPort).bind(routes)
         
         bindingFuture.onComplete {
             case scala.util.Success(binding) =>
                 val address = binding.localAddress
-                println(s"Server online at http://${address.getHostString}:${address.getPort}/")
-                println(s"API endpoint: http://${address.getHostString}:${address.getPort}/run")
-                println(s"WebSocket endpoint: ws://${address.getHostString}:${address.getPort}/ws")
+                Logger.log(s"Server online at http://${address.getHostString}:${address.getPort}/")
+                Logger.log(s"API endpoint: http://${address.getHostString}:${address.getPort}/run")
+                Logger.log(s"Custom API endpoint: http://${address.getHostString}:${address.getPort}/custom")
+                Logger.log(s"WebSocket endpoint: ws://${address.getHostString}:${address.getPort}/ws")
             case scala.util.Failure(ex) =>
-                println(s"Failed to bind server: ${ex.getMessage}")
+                Logger.log(s"Failed to bind server: ${ex.getMessage}")
                 system.get.terminate()
         }
         
         initialized = true
     }
     
-    // Method to send data to all WebSocket clients
-    def sendSimulationBinaryData(buffer: ByteBuffer): Unit = {
-        if (!initialized || messagePublisher.isEmpty || system.isEmpty) {
-            println("Error: WebSocket server not initialized properly")
+    private def parseUserSyncRequest(jsonString: String): Option[UserSyncRequest] = {
+        try {
+            val firebaseUidPattern = """"firebaseUid"\s*:\s*"([^"]+)"""".r
+            val emailPattern = """"email"\s*:\s*"([^"]+)"""".r
+            val namePattern = """"name"\s*:\s*"([^"]+)"""".r
+            
+            val firebaseUid = firebaseUidPattern.findFirstMatchIn(jsonString).map(_.group(1)).getOrElse("")
+            val email = emailPattern.findFirstMatchIn(jsonString).map(_.group(1)).getOrElse("")
+            val name = namePattern.findFirstMatchIn(jsonString).map(_.group(1)).getOrElse("")
+            
+            if (firebaseUid.nonEmpty) {
+                Some(UserSyncRequest(firebaseUid, email, name))
+            } else {
+                None
+            }
+        } catch {
+            case _: Exception => None
+        }
+    }
+    
+    private def createChannelFlow(channelId: String): Flow[Message, Message, Any] = {
+        implicit val systenImplicit: ActorSystem = system.get
+        implicit val materializer: Materializer = Materializer(system.get)
+        
+        val (sink, source) = channelPublishers.get(channelId) match {
+            case Some(existingSink) =>
+                (existingSink, channelSources(channelId))
+            case None =>
+                val (newSink, newSource) = MergeHub.source[Message]
+                  .toMat(BroadcastHub.sink[Message])(Keep.both)
+                  .run()
+                
+                channelPublishers(channelId) = newSink
+                channelSources(channelId) = newSource
+                (newSink, newSource)
+         }
+        
+        Flow.fromSinkAndSourceMat(
+            Sink.ignore,
+            source
+        )(Keep.right)
+    }
+    
+    
+    /**
+     * Broadcasts binary simulation data to all WebSocket clients connected to a specific channel.
+     *
+     * Receives the binary packet created by AgentProcessor.sendRoundToWebSocketServer() and distributes
+     * it to all connected WebSocket clients for that simulation run. This enables real-time visualization
+     * of agent states and beliefs during simulation execution. Uses Akka Streams for efficient
+     * message delivery to multiple concurrent clients.
+     *
+     * '''Message Flow:'''
+     * {{{
+     * AgentProcessor ──▶ Server (this) ──▶ WebSocket Clients (Browser/Frontend)
+     * }}}
+     *
+     * '''Binary Data Layout:'''
+     * {{{
+     * ┌──────────────────────────────────────────────────────────────────────┐
+     * │ INPUT: ByteBuffer from AgentProcessor                                │
+     * ├──────────────────────────────────────────────────────────────────────┤
+     * │ HEADER (36 bytes)   │ networkId + runID + numOfAgents + round + range│
+     * │ BELIEF DATA (n*8)   │ Public + Private beliefs for n agents          │
+     * │ SPEAKING DATA (n*1) │ Speaking state (0/1) for n agents              │
+     * ├──────────────────────────────────────────────────────────────────────┤
+     * │ OUTPUT: BinaryMessage via WebSocket                                  │
+     * └──────────────────────────────────────────────────────────────────────┘
+     * }}}
+     *
+     * '''Error Handling:'''
+     *  - Server not initialized: Logs error and returns early
+     *  - Channel not found: Logs error when no active WebSocket connections exist
+     *  - Network failures: Handled by Akka Streams internally
+     *
+     * '''Performance Notes:'''
+     *  - Uses Akka Streams for backpressure handling
+     *  - ByteString wraps buffer for zero-copy transmission
+     *  - Single Source broadcasts to multiple clients efficiently
+     *  - Debug logging only enabled when APP_MODE.hasServerLogs is true
+     *
+     * @param channelId Unique identifier for the simulation run (maps to WebSocket connections)
+     * @param buffer Binary packet containing agent states (created by AgentProcessor.sendRoundToWebSocketServer)
+     */
+    def sendSimulationBinaryData(channelId: String, buffer: ByteBuffer): Unit = {
+        if (!initialized || system.isEmpty) {
+            Logger.logError("Error: WebSocket server not initialized properly")
             return
         }
         
-        implicit val materializer: Materializer = Materializer(system.get)
-        
-        // Create a copy of the buffer to ensure thread safety
-        val bytes = new Array[Byte](buffer.remaining())
-        buffer.get(bytes)
-        buffer.position(buffer.position() - bytes.length) // Reset position
-        
-        // Create a binary message from the buffer
-        val message = BinaryMessage(ByteString(bytes))
-        
-        // Send the message to all clients
-        Source.single(message).runWith(messagePublisher.get)
+        channelPublishers.get(channelId) match {
+            case Some(publisher) =>
+                if (GlobalState.APP_MODE.hasServerLogs) logBufferDebugInfo(buffer)
+                
+                implicit val materializer: Materializer = Materializer(system.get)
+                implicit val ec: ExecutionContext = system.get.dispatcher
+                val message = BinaryMessage(ByteString(buffer))
+                Source.single(message).runWith(publisher)
+            case None =>
+                Logger.logError(s"Error: No WebSocket clients connected to channel $channelId")
+        }
     }
     
-    // Remaining methods from Api class
+    /**
+     * Broadcasts neighbor topology data to all WebSocket clients connected to a specific channel.
+     *
+     * Receives the binary packet created by Network.sendNeighbors() and distributes it to all
+     * connected WebSocket clients for that simulation run. This enables real-time visualization
+     * of the agent network topology and relationships. Uses Akka Streams for efficient message
+     * delivery to multiple concurrent clients.
+     *
+     * '''Message Flow:'''
+     * {{{
+     * Network.sendNeighbors() ──▶ Server (this) ──▶ WebSocket Clients (Browser/Frontend)
+     * }}}
+     *
+     * '''Binary Data Layout:'''
+     * {{{
+     * ┌─────────────────────────────────────────────────────────────────────────────┐
+     * │ INPUT: ByteBuffer from Network.sendNeighbors()                              │
+     * ├──────────────────────────────────────────────────────────────────────────┤
+     * │ HEADER (24 bytes)      │ networkId + runID + numberOfAgents + neighbors  │
+     * │ INDEX OFFSETS (n*4)    │ Agent index mapping for n agents (CSR format)   │
+     * │ NEIGHBOR REFS (m*4)    │ Neighbor reference indices for m connections    │
+     * │ NEIGHBOR WEIGHTS (m*4) │ Connection weights for m neighbor pairs         │
+     * │ NEIGHBOR BIASES (m*1)  │ Cognitive bias types for m connections          │
+     * ├─────────────────────────────────────────────────────────────────────────────┤
+     * │ OUTPUT: BinaryMessage via WebSocket                                         │
+     * └─────────────────────────────────────────────────────────────────────────────┘
+     * }}}
+     *
+     * '''Error Handling:'''
+     *  - Server not initialized: Logs error and returns early
+     *  - Channel not found: Silent failure (no active WebSocket connections)
+     *  - Network failures: Handled by Akka Streams internally
+     *
+     * '''Performance Notes:'''
+     *  - Uses Akka Streams for backpressure handling
+     *  - ByteString wraps buffer for zero-copy transmission
+     *  - Single Source broadcasts to multiple clients efficiently
+     *  - Debug logging only enabled when APP_MODE.hasServerLogs is true
+     *
+     * @param channelId Unique identifier for the simulation run (maps to WebSocket connections)
+     * @param buffer Binary packet containing network topology data (created by Network.sendNeighbors)
+     */
+    def sendNeighborBinaryData(channelId: String, buffer: ByteBuffer): Unit = {
+        if (!initialized || system.isEmpty) {
+            Logger.logError("Error: WebSocket server not initialized properly")
+            return
+        }
+        channelPublishers.get(channelId) match {
+            case Some(publisher) =>
+                if (GlobalState.APP_MODE.hasServerLogs) logBufferDebugInfo(buffer)
+                
+                implicit val materializer: Materializer = Materializer(system.get)
+                val message = BinaryMessage(ByteString(buffer))
+                Source.single(message).runWith(publisher)
+            case None =>
+                Logger.logError(s"Error: No WebSocket clients connected to channel $channelId")
+        }
+    }
+    
+    private def parseGeneratedRun(data: Array[Byte]): String = {
+        val saveMode = data(1)
+        val agentTypeCount = data(2)
+        val biasTypeCount = data(3)
+        val numberOfNetworks = bytesToInt(data, 4)
+        val density = bytesToInt(data, 8)
+        val iterationLimit = bytesToInt(data, 12)
+        val stopThreshold = bytesToFloat(data, 16)
+        val seed: Long = if (bytesToLong(data, 20) == -1) {
+            System.currentTimeMillis() ^ System.nanoTime()
+        } else {
+            bytesToLong(data, 20)
+        }
+        
+        val agentTypes = new Array[(SilenceStrategy, SilenceEffect, Int)](agentTypeCount)
+        val confidenceParams: mutable.Map[Int, (Float, Float)] = mutable.Map()
+        var curOffset = 28
+        var agentsPerNetwork = 0
+        for (i <- 0 until agentTypeCount) {
+            val count = bytesToInt(data, curOffset)
+            val silenceStrategyType = SilenceStrategies.fromByte(data(curOffset + 4))
+            val silenceEffectType = SilenceEffects.fromByte(data(curOffset + 5))
+            agentTypes(i) = (silenceStrategyType, silenceEffectType, count)
+            curOffset += 6
+            agentsPerNetwork += count
+        }
+        
+        val biases = new Array[(Bias, Int)](biasTypeCount)
+        
+        for (i <- 0 until biasTypeCount) {
+            val count = bytesToInt(data, curOffset)
+            val biasType: Bias = CognitiveBiases.fromByte(data(curOffset + 4))
+            biases(i) = (biasType, count)
+            curOffset += 5
+        }
+        
+        var runID = SnowflakeID.generateId()
+        val convertedSaveMode = if (GlobalState.APP_MODE.skipDatabase || !GlobalState.APP_MODE.usesLegacyDB)
+            SaveModes.DEBUG
+        else
+            SaveModes.codeToSaveMode(saveMode)
+            
+        if (GlobalState.APP_MODE.usesLegacyDB && convertedSaveMode.savesToDB) {
+            runID = DatabaseManager.createRun(
+                RunMode.GENERATED, saveMode, numberOfNetworks, Some(density), Some(2.5f),
+                stopThreshold, iterationLimit,
+                "uniform"
+            ).get
+        } else {
+            DatabaseManager.saveGeneratedRun(
+                id = runID,
+                seed = seed,
+                density = density,
+                iterationLimit = iterationLimit,
+                totalNetworks = numberOfNetworks,
+                agentsPerNetwork = agentsPerNetwork,
+                stopThreshold = stopThreshold,
+                agentTypeDistributions = agentTypes,
+                cognitiveBiasDistributions = biases
+            )
+        }
+        
+        val channelId = takeChannel()
+        
+        monitor.get ! AddNetworks(
+            runID,
+            channelId,
+            agentTypes,
+            biases,
+            confidenceParams,
+            Uniform,
+            convertedSaveMode,
+            numberOfNetworks,
+            density,
+            iterationLimit,
+            seed,
+            2.5f,
+            stopThreshold
+        )
+        
+        channelId
+    }
+    
+    private def parseCustomRun(data: Array[Byte]): String = {
+        // Header
+        val stopThreshold = bytesToFloat(data, 0)
+        val iterationLimit = bytesToInt(data, 4)
+        val saveMode = data(8)
+        var offset = 9
+        val networkNameLength = data(9)
+        val networkName = byteArrToString(data, 10, networkNameLength)
+        offset = 10 + networkNameLength
+        
+        while (offset % 4 != 0) offset += 1
+        
+        // Agent section
+        val numberOfAgents = bytesToInt(data, offset)
+        offset += 4
+        
+        val initialBeliefs = byteArrayToFloatArray(data, offset, numberOfAgents)
+        offset += 4 * numberOfAgents
+        
+        val toleranceRadius = byteArrayToFloatArray(data, offset, numberOfAgents)
+        offset += 4 * numberOfAgents
+        
+        val toleranceOffset = byteArrayToFloatArray(data, offset, numberOfAgents)
+        offset += 4 * numberOfAgents
+        
+        val silenceStrategies = data.slice(offset, offset + numberOfAgents).asInstanceOf[Array[SilenceStrategy]]
+        offset += numberOfAgents
+        
+        val silenceEffects = data.slice(offset, offset + numberOfAgents).asInstanceOf[Array[SilenceEffect]]
+        offset += numberOfAgents
+        
+        // Read the agent names
+        val agentNames = new Array[String](numberOfAgents)
+        val agentIndexes = new mutable.HashMap[String, Int]()
+        for (i <- 0 until numberOfAgents) {
+            val strByteLength = data(offset)
+            offset += 1
+            agentNames(i) = byteArrToString(data, offset, strByteLength)
+            agentIndexes.put(agentNames(i), i)
+            offset += strByteLength
+        }
+        
+        // Align to 4 bytes
+        while (offset % 4 != 0) offset += 1
+        
+        // Neighbor section
+        val numberOfNeighbors = bytesToInt(data, offset)
+        
+        offset += 4
+        
+        val influences = byteArrayToFloatArray(data, offset, numberOfNeighbors)
+        offset += 4 * numberOfNeighbors
+        
+        val biases = data.slice(offset, offset + numberOfNeighbors).asInstanceOf[Array[Bias]]
+        offset += numberOfNeighbors
+        
+        val source = new Array[Int](numberOfNeighbors)
+        for (i <- 0 until numberOfNeighbors) {
+            val strByteLength = data(offset)
+            offset += 1
+            source(i) = agentIndexes(byteArrToString(data, offset, strByteLength))
+            offset += strByteLength
+        }
+        
+        val target = new Array[Int](numberOfNeighbors)
+        for (i <- 0 until numberOfNeighbors) {
+            val strByteLength = data(offset)
+            offset += 1
+            target(i) = agentIndexes(byteArrToString(data, offset, strByteLength))
+            offset += strByteLength
+        }
+        
+        // Optional data
+        val majorityThreshold: mutable.Map[Int, Float] = mutable.Map()
+        val confidences: mutable.Map[Int, Float] = mutable.Map()
+        while (offset < data.length) {
+            val possibleConfidence = bytesToFloat(data, offset + 8)
+            possibleConfidence match {
+                case 2.0 =>
+                    majorityThreshold(bytesToInt(data, offset)) = bytesToFloat(data, offset + 4)
+                case _ =>
+                    majorityThreshold(bytesToInt(data, offset)) = bytesToFloat(data, offset + 4)
+                    confidences(bytesToInt(data, offset)) = possibleConfidence
+            }
+            offset += 12
+        }
+        
+        // Preparing data
+        val sortedIndices = source.indices.sortBy(source(_))
+        
+        val sortedInfluences = sortedIndices.map(influences(_)).toArray
+        val sortedBiases = sortedIndices.map(biases(_)).toArray
+        val sortedSource = sortedIndices.map(source(_)).toArray
+        val sortedTarget = sortedIndices.map(target(_)).toArray
+        
+        val indexOffset = new Array[Int](numberOfAgents)
+        var count = 0
+        for (i <- 1 until numberOfNeighbors) {
+            if (sortedSource(i - 1) != sortedSource(i)) {
+                indexOffset(count) = i - 1
+                count += 1
+            }
+        }
+        indexOffset(indexOffset.length - 1) = numberOfNeighbors - 1
+        
+        var runID = SnowflakeID.generateId()
+        val convertedSaveMode = if (GlobalState.APP_MODE.skipDatabase) SaveModes.DEBUG
+        else SaveModes.codeToSaveMode(saveMode)
+        
+        if (SaveModes.savesToDB(convertedSaveMode)) {
+            runID = DatabaseManager.createRun(
+                RunMode.GENERATED, saveMode, 1, None, None,
+                stopThreshold, iterationLimit,
+                "uniform"
+            ).get
+        } else {
+            DatabaseManager.saveCustomRun(
+                id = runID,
+                iterationLimit = iterationLimit,
+                stopThreshold = stopThreshold,
+                runName = networkName,
+                customAgentsData = CustomAgentsData(
+                    initialBeliefs,
+                    toleranceRadius,
+                    toleranceOffset,
+                    silenceStrategies,
+                    silenceEffects,
+                    agentNames,
+                    if (majorityThreshold.isEmpty) None else Some(majorityThreshold),
+                    if (confidences.isEmpty) None else Some(confidences),
+                ),
+                customNeighborsData = CustomNeighborsData(
+                    sortedSource,
+                    sortedTarget,
+                    sortedInfluences,
+                    sortedBiases
+                )
+            )
+        }
+        
+        
+        val channelId = takeChannel()
+        
+        val customRunInfo = CustomRunInfo(
+            runID = runID,
+            channelId = channelId,
+            stopThreshold = stopThreshold,
+            iterationLimit = iterationLimit,
+            saveMode = convertedSaveMode,
+            networkName = networkName,
+            agentBeliefs = initialBeliefs,
+            agentToleranceRadii = toleranceRadius,
+            agentToleranceOffsets = toleranceOffset,
+            agentSilenceStrategy = silenceStrategies,
+            agentSilenceEffect = silenceEffects,
+            agentNames = agentNames,
+            indexOffset = indexOffset,
+            target = sortedTarget,
+            influences = sortedInfluences,
+            bias = sortedBiases
+        )
+        
+        monitor.get ! RunCustomNetwork(customRunInfo)
+        
+        channelId
+    }
+    
+    // Bit operation methods for channels
+    private def takeChannel(): String = {
+        val index = java.lang.Long.numberOfTrailingZeros(~channels).toString
+        channels = channels | (channels + 1)
+        createChannelFlow(index)
+        index
+    }
+    
+    def freeChannel(index: Int): Unit = {
+        channels = channels & ~(1L << index)
+    }
+    
+    // Utility methods for data transformation
     private def bytesToInt(bytes: Array[Byte], offset: Int): Int = {
         ByteBuffer.wrap(bytes, offset, 4).order(ByteOrder.LITTLE_ENDIAN).getInt()
     }
@@ -203,205 +720,34 @@ object Server {
         dest
     }
     
+    /*
+     * Converts a byte string representation in UTF-8 encoding to String
+     */
     private def byteArrToString(bytes: Array[Byte], start: Int, length: Int): String = {
         new String(bytes, start, length, "UTF-8")
     }
     
-    private def runGeneratedRun(data: Array[Byte]): Unit = {
-        val saveMode = data(1)
-        val agentTypeCount = data(2)
-        val biasTypeCount = data(3)
-        val numberOfNetworks = bytesToInt(data, 4)
-        val density = bytesToInt(data, 8)
-        val iterationLimit = bytesToInt(data, 12)
-        val stopThreshold = bytesToFloat(data, 16)
-        val seed: Option[Long] = if (bytesToLong(data, 20) == -1) None else Some(bytesToLong(data, 20))
+    // Logging section methods only for server debug purposes
+    private def logBufferDebugInfo(buffer: ByteBuffer): Unit = {
+        val originalPosition = buffer.position()
+        val originalLimit = buffer.limit()
         
-        val agentTypes = new Array[(SilenceStrategyType, SilenceEffectType, Int)](agentTypeCount)
-        var curOffset = 28
-        for (i <- 0 until agentTypeCount) {
-            val count = bytesToInt(data, curOffset)
-            val strategyByte = data(curOffset + 4)
-            val silenceEffectType = SilenceEffectType.fromByte(data(curOffset + 5))
-            val (silenceStrategyType, additionalOffset) = strategyByte match {
-                case 2 =>
-                    val threshold = bytesToFloat(data, curOffset + 6)
-                    (SilenceStrategyType.fromByte(strategyByte, thresholdValue = threshold), 4)
-                    
-                case 3 =>
-                    val confidence = bytesToFloat(data, curOffset + 6)
-                    val update = bytesToInt(data, curOffset + 10)
-                    (SilenceStrategyType.fromByte(strategyByte, confidenceValue = confidence, updateValue = update), 8)
-                    
-                case _ =>
-                    (SilenceStrategyType.fromByte(strategyByte), 0)
-            }
-            agentTypes(i) = (silenceStrategyType, silenceEffectType, count)
-            curOffset += 6 + additionalOffset
-        }
+        Logger.logServer("--- SERVER SEND DEBUG ---")
+        Logger.logServer(s"Buffer state: position=$originalPosition, limit=$originalLimit, remaining=${buffer.remaining()}")
         
-        val biases = new Array[(Byte, Int)](biasTypeCount)
+        // Read header for validation
+        buffer.rewind()
+        val networkIdMSB = buffer.getLong()
+        val networkIdLSB = buffer.getLong()
+        val runId = buffer.getInt()
+        val numberOfAgents = buffer.getInt()
+        val round = buffer.getInt()
+        val indexReference = buffer.getInt()
         
-        for (i <- 0 until biasTypeCount) {
-            val count = bytesToInt(data, curOffset)
-            val biasType = data(curOffset + 4)
-            biases(i) = (biasType, count)
-            curOffset += 5
-        }
+        Logger.logServer(s"Header: runId=$runId, agents=$numberOfAgents, round=$round, indexRef=$indexReference")
         
-        monitor.get ! AddNetworks(
-        agentTypes,
-        biases,
-        Uniform,
-        codeToSaveMode(saveMode).get,
-        None,
-        numberOfNetworks,
-        density,
-        iterationLimit,
-        seed,
-        2.5f,
-        stopThreshold
-        )
-    }
-    
-    private def runCustomRun(data: Array[Byte]): Unit = {
-        // Header
-        val stopThreshold = bytesToFloat(data, 0)
-        val iterationLimit = bytesToInt(data, 4)
-        val saveMode = data(8)
-        var offset = 9
-        val networkNameLength = data(9)
-        val networkName = byteArrToString(data, 10, networkNameLength)
-        offset = 10 + networkNameLength
-        
-        while (offset % 4 != 0) offset += 1
-        
-        // Agent section
-        val numberOfAgents = bytesToInt(data, offset)
-        offset += 4
-        
-        val initialBeliefs = byteArrayToFloatArray(data, offset, numberOfAgents)
-        println(s"initialBeliefs: ${(0 until numberOfAgents).map(initialBeliefs).mkString("[", ", ", "]")}")
-        offset += 4 * numberOfAgents
-        
-        val toleranceRadii = byteArrayToFloatArray(data, offset, numberOfAgents)
-        println(s"toleranceRadii: ${(0 until numberOfAgents).map(toleranceRadii).mkString("[", ", ", "]")}")
-        offset += 4 * numberOfAgents
-        
-        val toleranceOffset = byteArrayToFloatArray(data, offset, numberOfAgents)
-        println(s"toleranceOffset: ${(0 until numberOfAgents).map(toleranceOffset).mkString("[", ", ", "]")}")
-        offset += 4 * numberOfAgents
-        
-        val silenceStrategies = data.slice(offset, offset + numberOfAgents)
-        println(s"silenceStrategies: ${silenceStrategies.mkString("[", ", ", "]")}")
-        offset += numberOfAgents
-        
-        val silenceEffects = data.slice(offset, offset + numberOfAgents)
-        println(s"silenceEffects: ${silenceEffects.mkString("[", ", ", "]")}")
-        offset += numberOfAgents
-        
-        // Read the agent names
-        val agentNames = new Array[String](numberOfAgents)
-        val agentIndexes = new mutable.HashMap[String, Int]()
-        for (i <- 0 until numberOfAgents) {
-            val strByteLength = data(offset)
-            offset += 1
-            agentNames(i) = byteArrToString(data, offset, strByteLength)
-            agentIndexes.put(agentNames(i), i)
-            offset += strByteLength
-        }
-        println(s"All agentNames: ${agentNames.mkString("[", ", ", "]")}")
-        
-        // Align to 4 bytes
-        while (offset % 4 != 0) offset += 1
-        
-        // Neighbor section
-        val numberOfNeighbors = bytesToInt(data, offset)
-        
-        println(s"numberOfNeighbors: $numberOfNeighbors")
-        offset += 4
-        
-        val influences = byteArrayToFloatArray(data, offset, numberOfNeighbors)
-        offset += 4 * numberOfNeighbors
-        
-        val biases = data.slice(offset, offset + numberOfNeighbors)
-        offset += numberOfNeighbors
-        
-        val source = new Array[Int](numberOfNeighbors)
-        for (i <- 0 until numberOfNeighbors) {
-            val strByteLength = data(offset)
-            offset += 1
-            source(i) = agentIndexes(byteArrToString(data, offset, strByteLength))
-            offset += strByteLength
-        }
-        println(s"All source: ${source.mkString("[", ", ", "]")}")
-        println(s"Indexes:")
-        
-        val target = new Array[Int](numberOfNeighbors)
-        for (i <- 0 until numberOfNeighbors) {
-            val strByteLength = data(offset)
-            offset += 1
-            target(i) = agentIndexes(byteArrToString(data, offset, strByteLength))
-            offset += strByteLength
-        }
-        
-        // tuple (name, index)
-        val sortedIndices = source.indices.sortBy(source(_))
-        
-        val sortedInfluences = sortedIndices.map(influences(_)).toArray
-        val sortedBiases = sortedIndices.map(biases(_)).toArray
-        val sortedSource = sortedIndices.map(source(_)).toArray
-        val sortedTarget = sortedIndices.map(target(_)).toArray
-        
-        val indexOffset = new Array[Int](numberOfAgents)
-        var count = 0
-        for (i <- 1 until numberOfNeighbors) {
-            if (sortedSource(i - 1) != sortedSource(i)) {
-                indexOffset(count) = i - 1
-                count += 1
-            }
-        }
-        indexOffset(indexOffset.length - 1) = numberOfNeighbors - 1
-        
-        println(indexOffset.mkString("Index offset: (", ", ", ")"))
-        println(sortedTarget.mkString("Targets: (", ", ", ")"))
-        println(sortedInfluences.mkString("Influences: (", ", ", ")"))
-        println(sortedBiases.mkString("Biases: (", ", ", ")"))
-        
-        val customRunInfo = CustomRunInfo(
-        stopThreshold = stopThreshold,
-        iterationLimit = iterationLimit,
-        saveMode = codeToSaveMode(saveMode).get,
-        networkName = networkName,
-        agentBeliefs = initialBeliefs,
-        agentToleranceRadii = toleranceRadii,
-        agentToleranceOffsets = toleranceOffset,
-        agentSilenceStrategy = silenceStrategies,
-        agentSilenceEffect = silenceEffects,
-        agentNames = agentNames,
-        indexOffset = indexOffset,
-        target = sortedTarget,
-        influences = sortedInfluences,
-        bias = sortedBiases
-        )
-        
-        monitor.get ! RunCustomNetwork(customRunInfo)
-        
-        println(s"Final offset: $offset, Total data length: ${data.length}")
-    }
-    
-    
-    private def codeToSaveMode(code: Byte): Option[SaveMode] = {
-        code match {
-            case 0 => Some(Full)
-            case 1 => Some(Standard)
-            case 2 | 3 => Some(StandardLight)
-            case 4 => Some(Roundless)
-            case 5 | 6 => Some(AgentlessTyped)
-            case 7 => Some(Agentless)
-            case 8 => Some(Performance)
-            case 9 => Some(Debug)
-            case _ => None
-        }
+        // Restore original buffer state
+        buffer.position(originalPosition)
+        buffer.limit(originalLimit)
     }
 }

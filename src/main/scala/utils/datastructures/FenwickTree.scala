@@ -45,7 +45,7 @@ class FenwickTree(size: Int, density: Int, setValue: Double, seed: Long, countFr
         var low = 0
         var high = curLength - 1
         while (low < high) {
-            val mid = (low + high) / 2
+            val mid = (low + high) >>> 1
             val queryVal = query(mid)
             if (queryVal < value) low = mid + 1
             else high = mid
@@ -104,7 +104,7 @@ class FenwickTree(size: Int, density: Int, setValue: Double, seed: Long, countFr
         while (i < density) {
             scoresArr(arr(i + indexStart) + 1) += 1
             updateTree(arr(i + indexStart), scoresArr(arr(i + indexStart) + 1))
-            if (countFreqs) freqs(arr(i + indexStart) + 1) += 1
+            if (countFreqs) freqs(arr(i + indexStart) + 1) += 8
             i += 1
         }
         

@@ -1,51 +1,103 @@
 package io.db
 
 import com.zaxxer.hikari.{HikariConfig, HikariDataSource}
-import core.model.agent.behavior.bias.{CognitiveBiasType, CognitiveBiases}
-import core.simulation.actors.{AgentStateLoad, NeighborsLoad}
+import core.model.agent.behavior.bias.CognitiveBiases
+import core.model.agent.behavior.bias.CognitiveBiases.Bias
+import core.model.agent.behavior.silence.SilenceEffects.SilenceEffect
+import core.model.agent.behavior.silence.SilenceStrategies.SilenceStrategy
+import core.model.agent.behavior.silence.{SilenceEffects, SilenceStrategies}
+import core.simulation.actors.{AgentStateLoad, NeighborsLoad, NetworkResult}
 import core.simulation.config.*
 import io.persistence.actors.{NeighborStructure, StaticData}
 import io.serialization.binary.Decoder
+import io.web.{CustomAgentsData, CustomNeighborsData}
 import org.postgresql.copy.CopyManager
 import org.postgresql.core.BaseConnection
+import utils.logging.Logger
 
 import java.io.{ByteArrayInputStream, PrintWriter}
 import java.sql.{Connection, PreparedStatement, Statement}
 import java.util.UUID
 import scala.collection.mutable.ArrayBuffer
-import scala.collection.{IndexedSeqView, mutable}
-
+import scala.collection.mutable
 
 object DatabaseManager {
-    private val hikariConfig = new HikariConfig()
-    hikariConfig.setJdbcUrl("jdbc:postgresql://localhost:5433/promueva_new")
-    hikariConfig.setUsername("postgres")
-    hikariConfig.setPassword("postgres")
+    // ============================================================================
+    // DATABASE CONNECTION CONFIGURATION
+    // ============================================================================
+    private val dbHost = sys.env.getOrElse("DB_HOST", "localhost")
+    private val dbHostLegacy = sys.env.getOrElse("DB_HOST_LEGACY", "localhost")
     
-    // Parallel
-    hikariConfig.setMaximumPoolSize(32)
-    hikariConfig.setMinimumIdle(16)
+    private val dbPort = sys.env.getOrElse("DB_PORT", "5432")
+    private val dbPortLegacy = sys.env.getOrElse("DB_PORT_LEGACY", "5432")
     
-    // Set the maximum lifetime of a connection in the pool.
-    hikariConfig.setMaxLifetime(3_600_000) // 1 hour
+    private val dbUser = sys.env.getOrElse("DB_USER", "postgres")
+    private val dbUserLegacy = sys.env.getOrElse("DB_USER_LEGACY", "postgres")
     
-    // Set the connection timeout: how long the client will wait for a connection from the pool.
-    hikariConfig.setConnectionTimeout(60_000) // 1 min
+    private val dbPassword = sys.env.getOrElse("DB_PASSWORD", "postgres")
+    private val dbPasswordLegacy = sys.env.getOrElse("DB_PASSWORD_LEGACY", "postgres")
     
-    // Set the idle timeout: how long a connection can remain idle before being closed.
-    hikariConfig.setIdleTimeout(900_000) // 15 minutes
+    private val dbNameNew = sys.env.getOrElse("DB_NAME", "promueva")
+    private val dbNameLegacy = sys.env.getOrElse("DB_NAME_LEGACY", "promueva_legacy")
     
-    // Additional properties for prepared statement caching.
-    hikariConfig.addDataSourceProperty("cachePrepStmts", "true")
-    hikariConfig.addDataSourceProperty("prepStmtCacheSize", "500")
-    hikariConfig.addDataSourceProperty("prepStmtCacheSqlLimit", "4096")
+    // ============================================================================
+    // NEW DATABASE CONFIGURATION - Optimized for lighter workload
+    // ============================================================================
+    private val hikariConfigNew = new HikariConfig()
     
-    hikariConfig.addDataSourceProperty("useServerPrepStmts", "true")
-    hikariConfig.addDataSourceProperty("rewriteBatchedStatements", "true")
+    hikariConfigNew.setJdbcUrl(s"jdbc:postgresql://$dbHost:$dbPort/$dbNameNew")
+    hikariConfigNew.setUsername(dbUser)
+    hikariConfigNew.setPassword(dbPassword)
     
-    private val dataSource = new HikariDataSource(hikariConfig)
+    // Connection pool sizing
+    hikariConfigNew.setMaximumPoolSize(16)
+    hikariConfigNew.setMinimumIdle(4)
+    hikariConfigNew.setMaxLifetime(3_600_000)
+    hikariConfigNew.setConnectionTimeout(30_000)
+    hikariConfigNew.setIdleTimeout(600_000)
     
-    private def getConnection: Connection = dataSource.getConnection
+    // PostgreSQL optimizations
+    hikariConfigNew.addDataSourceProperty("cachePrepStmts", "true")
+    hikariConfigNew.addDataSourceProperty("prepStmtCacheSize", "250")
+    hikariConfigNew.addDataSourceProperty("prepStmtCacheSqlLimit", "2048")
+    hikariConfigNew.addDataSourceProperty("useServerPrepStmts", "true")
+    hikariConfigNew.addDataSourceProperty("rewriteBatchedStatements", "true")
+    hikariConfigNew.addDataSourceProperty("defaultRowFetchSize", "100")
+    hikariConfigNew.addDataSourceProperty("logUnclosedConnections", "true")
+    
+    // ============================================================================
+    // LEGACY DATABASE CONFIGURATION - Optimized for heavy workload
+    // ============================================================================
+    private val hikariConfigLegacy = new HikariConfig()
+    
+    hikariConfigLegacy.setJdbcUrl(s"jdbc:postgresql://$dbHostLegacy:$dbPortLegacy/$dbNameLegacy")
+    hikariConfigLegacy.setUsername(dbUserLegacy)
+    hikariConfigLegacy.setPassword(dbPasswordLegacy)
+    
+    // Connection pool sizing
+    hikariConfigLegacy.setMaximumPoolSize(32)
+    hikariConfigLegacy.setMinimumIdle(16)
+    hikariConfigLegacy.setMaxLifetime(3_600_000)
+    hikariConfigLegacy.setConnectionTimeout(60_000)
+    hikariConfigLegacy.setIdleTimeout(900_000)
+    
+    // PostgreSQL optimizations
+    hikariConfigLegacy.addDataSourceProperty("cachePrepStmts", "true")
+    hikariConfigLegacy.addDataSourceProperty("prepStmtCacheSize", "500")
+    hikariConfigLegacy.addDataSourceProperty("prepStmtCacheSqlLimit", "4096")
+    hikariConfigLegacy.addDataSourceProperty("useServerPrepStmts", "true")
+    hikariConfigLegacy.addDataSourceProperty("rewriteBatchedStatements", "true")
+    hikariConfigLegacy.addDataSourceProperty("defaultRowFetchSize", "1000")
+    hikariConfigLegacy.addDataSourceProperty("tcpKeepAlive", "true")
+    
+    // ============================================================================
+    // DATA SOURCE INSTANCES
+    // ============================================================================
+    private val dataSource = new HikariDataSource(hikariConfigNew)
+    private val dataSourceLegacy = new HikariDataSource(hikariConfigLegacy)
+    
+    private inline def getConnection: Connection = dataSource.getConnection
+    private inline def getConnectionLegacy: Connection = dataSourceLegacy.getConnection
     
     // Inserts
     private def setPreparedStatementInt(stmt: PreparedStatement, parameterIndex: Int, value: Option[Int]): Unit = {
@@ -64,7 +116,7 @@ object DatabaseManager {
     
     private def setPreparedStatementLong(stmt: PreparedStatement, parameterIndex: Int, value: Option[Long]): Unit = {
         value match {
-            case Some(f) => stmt.setFloat(parameterIndex, f)
+            case Some(f) => stmt.setLong(parameterIndex, f)
             case None => stmt.setNull(parameterIndex, java.sql.Types.BIGINT)
         }
     }
@@ -76,17 +128,369 @@ object DatabaseManager {
         }
     }
     
+    /**
+     * Saves a generated (procedurally created) simulation run to the database with its configuration and distributions.
+     *
+     * This method stores runs that are created through procedural generation rather than custom agent-by-agent
+     * specification. It performs a transactional insert across three tables: <br>
+     * 1. <code>generated_runs</code> - core simulation parameters (seed, density, limits, etc.) <br>
+     * 2. <code>agent_type_distributions</code> - how many agents of each silence strategy/effect combination <br>
+     * 3. <code>cognitive_bias_distributions</code> - how many agents exhibit each type of cognitive bias
+     *
+     * @param id                         Unique identifier for this simulation run (typically a Snowflake ID)
+     * @param seed                       Random seed used for procedural generation (for reproducibility)
+     * @param density                    Network density parameter controlling connection probability between agents
+     * @param iterationLimit             Maximum number of simulation iterations before forced termination
+     * @param totalNetworks              Number of separate networks to generate in this run
+     * @param agentsPerNetwork           Number of agents in each network (calculated from agent type counts)
+     * @param stopThreshold              Convergence threshold - simulation stops early if change falls below this
+     * @param agentTypeDistributions     Array of (silenceStrategy, silenceEffect, count) tuples defining
+     *                                   how many agents should have each combination of silence behaviors
+     * @param cognitiveBiasDistributions Array of (biasType, count) tuples defining how many agents
+     *                                   should exhibit each type of cognitive bias
+     */
+    def saveGeneratedRun(id: Long, seed: Long, density: Int, iterationLimit: Int,
+        totalNetworks: Int, agentsPerNetwork: Int, stopThreshold: Float,
+        agentTypeDistributions: Array[(SilenceStrategy, SilenceEffect, Int)],
+        cognitiveBiasDistributions: Array[(Bias, Int)]): Unit = {
+        if (GlobalState.APP_MODE.skipDatabase) return
+        val connection = getConnection
+        try {
+            connection.setAutoCommit(false)
+            val generatedRunsQuery =
+                """
+                INSERT INTO generated_runs (id, seed, density, iteration_limit, total_networks,
+                                           agents_per_network, stop_threshold)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """
+            
+            val generatedRunsStmt = connection.prepareStatement(generatedRunsQuery)
+            generatedRunsStmt.setLong(1, id)
+            generatedRunsStmt.setLong(2, seed)
+            generatedRunsStmt.setInt(3, density)
+            generatedRunsStmt.setInt(4, iterationLimit)
+            generatedRunsStmt.setInt(5, totalNetworks)
+            generatedRunsStmt.setInt(6, agentsPerNetwork)
+            generatedRunsStmt.setFloat(7, stopThreshold)
+            generatedRunsStmt.executeUpdate()
+            
+            val agentTypeQuery =
+                """
+                INSERT INTO agent_type_distributions (run_id, silence_strategy, silence_effect, count)
+                VALUES (?, CAST(? AS silence_strategy), CAST(? AS silence_effect), ?)
+                """
+            
+            val agentTypeStmt = connection.prepareStatement(agentTypeQuery)
+            agentTypeDistributions.foreach { case (silenceStrategy, silenceEffect, count) =>
+                agentTypeStmt.setLong(1, id)
+                agentTypeStmt.setString(2, silenceStrategy.name)
+                agentTypeStmt.setString(3, silenceEffect.name)
+                agentTypeStmt.setInt(4, count)
+                agentTypeStmt.addBatch()
+            }
+            agentTypeStmt.executeBatch()
+            
+            val cognitiveBiasQuery =
+                """
+                INSERT INTO cognitive_bias_distributions (run_id, cognitive_bias, count)
+                VALUES (?, CAST(? AS cognitive_bias), ?)
+                """
+            
+            val cognitiveBiasStmt = connection.prepareStatement(cognitiveBiasQuery)
+            cognitiveBiasDistributions.foreach { case (cognitiveBias, count) =>
+                cognitiveBiasStmt.setLong(1, id)
+                cognitiveBiasStmt.setString(2, cognitiveBias.name)
+                cognitiveBiasStmt.setInt(3, count)
+                cognitiveBiasStmt.addBatch()
+            }
+            cognitiveBiasStmt.executeBatch()
+            
+            connection.commit()
+        } catch {
+            case ex: Exception =>
+                connection.rollback()
+                Logger.logError(s"Error saving the run: ${ex.getMessage}")
+        } finally {
+            connection.setAutoCommit(true)
+            connection.close()
+        }
+    }
+    
+    /**
+     * Saves a custom simulation run to the database with all associated agent and neighbor data.
+     *
+     * This method performs a transactional insert across three tables: <br>
+     * 1. <code>custom_runs</code> - basic run metadata <br>
+     * 2. <code>custom_agents</code> - individual agent properties and behaviors <br>
+     * 3. <code>custom_neighbors</code> - network connections and influences between agents
+     *
+     * @param id                  Unique identifier for this simulation run
+     * @param iterationLimit      Maximum number of simulation iterations to run
+     * @param stopThreshold       Convergence threshold to stop simulation early
+     * @param runName             Human-readable name for this simulation run
+     * @param customAgentsData    Container with all agent properties (beliefs, strategies, etc.)
+     * @param customNeighborsData Container with network topology and influence data
+     */
+    def saveCustomRun(id: Long, iterationLimit: Int, stopThreshold: Float, runName: String,
+        customAgentsData: CustomAgentsData, customNeighborsData: CustomNeighborsData): Unit = {
+        if (GlobalState.APP_MODE.skipDatabase) return
+        val connection = getConnection
+        try {
+            connection.setAutoCommit(false)
+            
+            val customRunsQuery =
+                """
+                  |INSERT INTO custom_runs (id, iteration_limit, stop_threshold, run_name)
+                  |values (?, ?, ?, ?)
+                  |""".stripMargin
+            
+            val customRunsStmt: PreparedStatement = connection.prepareStatement(customRunsQuery)
+            customRunsStmt.setLong(1, id)
+            customRunsStmt.setInt(2, iterationLimit)
+            customRunsStmt.setFloat(3, stopThreshold)
+            customRunsStmt.setString(4, runName)
+            customRunsStmt.executeUpdate()
+            
+            val customAgentsQuery =
+                """
+                  |INSERT INTO custom_agents (run_id, silence_strategy, silence_effect, belief, tolerance_radius,
+                  |                           tolerance_offset, name, majority_threshold, confidence)
+                  |values (?, CAST(? AS silence_strategy), CAST(? AS silence_effect), ?, ?, ?, ?, ?, ?)
+                  |""".stripMargin
+            
+            val customAgentsStmt: PreparedStatement = connection.prepareStatement(customAgentsQuery)
+            for (i <- customAgentsData.belief.indices) {
+                customAgentsStmt.setLong(1, id)
+                customAgentsStmt.setString(2, customAgentsData.silenceStrategy(i).name)
+                customAgentsStmt.setString(3, customAgentsData.silenceEffect(i).name)
+                customAgentsStmt.setFloat(4, customAgentsData.belief(i))
+                customAgentsStmt.setFloat(5, customAgentsData.radius(i))
+                customAgentsStmt.setFloat(6, customAgentsData.offset(i))
+                customAgentsStmt.setString(7, customAgentsData.name(i))
+                
+                customAgentsData.majorityThreshold match {
+                    case Some(thresholdMap) =>
+                        thresholdMap.get(i) match {
+                            case Some(threshold) => customAgentsStmt.setFloat(8, threshold)
+                            case None => customAgentsStmt.setNull(8, java.sql.Types.FLOAT)
+                        }
+                    case None => customAgentsStmt.setNull(8, java.sql.Types.FLOAT)
+                }
+                
+                customAgentsData.confidence match {
+                    case Some(confidenceMap) =>
+                        confidenceMap.get(i) match {
+                            case Some(conf) => customAgentsStmt.setFloat(9, conf)
+                            case None => customAgentsStmt.setNull(9, java.sql.Types.FLOAT)
+                        }
+                    case None => customAgentsStmt.setNull(9, java.sql.Types.FLOAT)
+                }
+                
+                customAgentsStmt.addBatch()
+            }
+            customAgentsStmt.executeBatch()
+            
+            val customNeighborsQuery =
+                """
+                  |INSERT INTO custom_neighbors (run_id, influence, cognitive_bias, source, target)
+                  |values (?, ?, CAST(? AS cognitive_bias), ?, ?)
+                  |""".stripMargin
+            
+            val customNeighborsStmt: PreparedStatement = connection.prepareStatement(customNeighborsQuery)
+            
+            for (i <- customNeighborsData.source.indices) {
+                customNeighborsStmt.setLong(1, id)
+                customNeighborsStmt.setFloat(2, customNeighborsData.influence(i))
+                customNeighborsStmt.setString(3, customNeighborsData.bias(i).name)
+                customNeighborsStmt.setInt(4, customNeighborsData.source(i))
+                customNeighborsStmt.setInt(5, customNeighborsData.target(i))
+                customNeighborsStmt.addBatch()
+            }
+            customNeighborsStmt.executeBatch()
+            
+            connection.commit()
+        } catch {
+            case ex: Exception =>
+                connection.rollback()
+                Logger.logError(s"Error saving the run: ${ex.getMessage}")
+        } finally {
+            connection.setAutoCommit(true)
+            connection.close()
+        }
+    }
+    
+    /**
+     * Saves the results of the different networks from a particular run to the database
+     *
+     * @param runID             Id of the run
+     * @param networkResults    The Array with the individual results of each network
+     */
+    def submitNetworkResults(runID: Long, networkResults: mutable.ArrayBuffer[NetworkResult]): Unit = {
+        if (GlobalState.APP_MODE.skipDatabase) return
+        val connection = getConnection
+        try {
+            val query =
+                """
+                  |INSERT INTO network_results (run_id, build_time, run_time, network_number, final_round, reached_consensus)
+                  |VALUES (?, ?, ?, ?, ?, ?)
+                  |""".stripMargin
+                
+            val stmt = connection.prepareStatement(query)
+            for (result <- networkResults) {
+                stmt.setLong(1, runID)
+                stmt.setLong(2, result.buildTime)
+                stmt.setLong(3, result.runTime)
+                stmt.setInt(4, result.networkNumber)
+                stmt.setInt(5, result.finalRound)
+                stmt.setBoolean(6, result.reachedConsensus)
+                stmt.addBatch()
+            }
+            stmt.executeBatch()
+            
+        } catch {
+            case ex: Exception =>
+                Logger.logError(s"Error saving the runs: ${ex.getMessage}")
+        } finally {
+            connection.close()
+        }
+    }
+    
+    case class UserData(
+        id: Long,
+        firebaseUid: String,
+        email: String,
+        name: String,
+        role: String,
+        isActive: Boolean,
+        createdAt: String,
+        updatedAt: String
+    )
+    
+    def createOrUpdateUser(firebaseUid: String, email: String, name: String, role: String = "Guest"): Option[UserData] = {
+        val connection = getConnection
+        try {
+            val sql =
+                """
+                       INSERT INTO users (firebase_uid, email, name, role, created_at, updated_at, is_active)
+                       VALUES (?::uuid, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, true)
+                       ON CONFLICT (firebase_uid)
+                       DO UPDATE SET
+                           email = EXCLUDED.email,
+                           name = EXCLUDED.name,
+                           updated_at = CURRENT_TIMESTAMP
+                       RETURNING id, firebase_uid, created_at, updated_at, role, email, name, is_active
+                   """
+            
+            val stmt = connection.prepareStatement(sql)
+            stmt.setString(1, firebaseUid)
+            stmt.setString(2, email)
+            stmt.setString(3, name)
+            stmt.setString(4, role)
+            
+            val resultSet = stmt.executeQuery()
+            
+            if (resultSet.next()) {
+                Some(UserData(
+                    id = resultSet.getLong("id"),
+                    firebaseUid = resultSet.getString("firebase_uid"),
+                    email = resultSet.getString("email"),
+                    name = resultSet.getString("name"),
+                    role = resultSet.getString("role"),
+                    isActive = resultSet.getBoolean("is_active"),
+                    createdAt = resultSet.getTimestamp("created_at").toString,
+                    updatedAt = resultSet.getTimestamp("updated_at").toString
+                ))
+            } else {
+                None
+            }
+        } catch {
+            case ex: Exception =>
+                println(s"Error creating/updating user: ${ex.getMessage}")
+                None
+        } finally {
+            connection.close()
+        }
+    }
+    
+    def getUserByFirebaseUid(firebaseUid: String): Option[UserData] = {
+        val connection = getConnection
+        try {
+            val sql =
+                """
+                       SELECT id, firebase_uid, created_at, updated_at, role, email, name, is_active
+                       FROM users
+                       WHERE firebase_uid = ?::uuid
+                   """
+            
+            val stmt = connection.prepareStatement(sql)
+            stmt.setString(1, firebaseUid)
+            
+            val resultSet = stmt.executeQuery()
+            
+            if (resultSet.next()) {
+                Some(UserData(
+                    id = resultSet.getLong("id"),
+                    firebaseUid = resultSet.getString("firebase_uid"),
+                    email = resultSet.getString("email"),
+                    name = resultSet.getString("name"),
+                    role = resultSet.getString("role"),
+                    isActive = resultSet.getBoolean("is_active"),
+                    createdAt = resultSet.getTimestamp("created_at").toString,
+                    updatedAt = resultSet.getTimestamp("updated_at").toString
+                ))
+            } else {
+                None
+            }
+        } catch {
+            case ex: Exception =>
+                println(s"Error getting user: ${ex.getMessage}")
+                None
+        } finally {
+            connection.close()
+        }
+    }
+    
+    def updateUserRole(firebaseUid: String, newRole: String): Boolean = {
+        val connection = getConnection
+        try {
+            val sql =
+                """
+                       UPDATE users
+                       SET role = ?, updated_at = CURRENT_TIMESTAMP
+                       WHERE firebase_uid = ?::uuid
+                   """
+            
+            val stmt = connection.prepareStatement(sql)
+            stmt.setString(1, newRole)
+            stmt.setString(2, firebaseUid)
+            
+            val rowsAffected = stmt.executeUpdate()
+            rowsAffected > 0
+        } catch {
+            case ex: Exception =>
+                println(s"Error updating user role: ${ex.getMessage}")
+                false
+        } finally {
+            connection.close()
+        }
+    }
+    
+    /**
+     * Legacy code to save the entire state to database use can be used when
+     */
+    
+    // --------------------------------------------------------------
     def createRun(
-                   runMode: RunMode,
-                   saveMode: SaveMode,
+                   runMode: Byte,
+                   saveMode: Byte,
                    numberOfNetworks: Int,
                    density: Option[Int],
                    degreeDistribution: Option[Float],
                    stopThreshold: Float,
                    iterationLimit: Int,
                    initialDistribution: String
-                 ): Option[Int] = {
-        val conn = getConnection
+                 ): Option[Long] = {
+        val conn = getConnectionLegacy
         var stmt: PreparedStatement = null
         
         try {
@@ -135,7 +539,7 @@ object DatabaseManager {
             }
             
             val rs = stmt.executeQuery()
-            val result = if (rs.next()) Some(rs.getInt(1)) else None
+            val result = if (rs.next()) Some(rs.getLong(1)) else None
             
             conn.commit()
             result
@@ -159,10 +563,10 @@ object DatabaseManager {
     (
       id: UUID,
       name: String,
-      runId: Int,
+      runId: Long,
       numberOfAgents: Int
     ): Unit = {
-        val conn = getConnection
+        val conn = getConnectionLegacy
         try {
             conn.setAutoCommit(true)
             val sql =
@@ -173,7 +577,7 @@ object DatabaseManager {
                 """
             val stmt = conn.prepareStatement(sql, Statement.RETURN_GENERATED_KEYS)
             stmt.setObject(1, id)
-            stmt.setInt(2, runId)
+            stmt.setLong(2, runId)
             stmt.setInt(3, numberOfAgents)
             stmt.setString(4, name)
             
@@ -228,7 +632,7 @@ object DatabaseManager {
     
     // ToDo optimize insert to maybe use copy or batched concurrency
     def insertNeighborsBatch(networkStructures: ArrayBuffer[NeighborStructure]): Unit = {
-        val conn = dataSource.getConnection
+        val conn = getConnectionLegacy
         try {
             val sql =
                 """
@@ -244,7 +648,7 @@ object DatabaseManager {
                 stmt.setObject(1, networkStructure.source)
                 stmt.setObject(2, networkStructure.target)
                 stmt.setFloat(3, networkStructure.value)
-                stmt.setString(4, networkStructure.bias.toString)
+                stmt.setString(4, networkStructure.bias.name)
                 stmt.addBatch()
                 i += 1
             }
@@ -260,7 +664,7 @@ object DatabaseManager {
     }
     
     private def createUnloggedTable(tableName: String): Unit = {
-        val conn = getConnection
+        val conn = getConnectionLegacy
         var stmt: Statement = null
         try {
             stmt = conn.createStatement()
@@ -281,7 +685,7 @@ object DatabaseManager {
     }
     
     def insertRounds(dataOut: Array[Byte], tableName: String): Unit = {
-        val conn = getConnection
+        val conn = getConnectionLegacy
         var copyManager: CopyManager = null
         try {
             conn.setAutoCommit(false)
@@ -312,21 +716,15 @@ object DatabaseManager {
                     """;
             
         val dropSql = s"DROP TABLE IF EXISTS public.$tempTableName"
-        val conn = getConnection
+        val conn = getConnectionLegacy
         var stmt: Statement = null
         try {
             conn.setAutoCommit(false)
             stmt = conn.createStatement()
-        
-            // Disable triggers
+            
             stmt.execute(disableTriggersSql)
-            
             stmt.execute(insertSql)
-            
-            // Enable triggers
             stmt.execute(enableTriggersSql)
-            
-            // Execute DROP TABLE
             stmt.execute(dropSql)
             
             conn.commit()
@@ -345,12 +743,12 @@ object DatabaseManager {
     }
     
     //Updates
-    def updateTimeField(id: Either[Int, UUID], timeValue: Long, table: String, field: String): Unit = {
-        val conn = getConnection
+    def updateTimeField(id: Either[Long, UUID], timeValue: Long, table: String, field: String): Unit = {
+        val conn = getConnectionLegacy
         var stmt: PreparedStatement = null
         try {
             val sql = id match {
-                case Left(intId) => s"UPDATE $table SET $field = ? WHERE id = ?"
+                case Left(longID) => s"UPDATE $table SET $field = ? WHERE id = ?"
                 case Right(uuid) => s"UPDATE $table SET $field = ? WHERE id = CAST(? AS uuid)"
             }
             
@@ -358,7 +756,7 @@ object DatabaseManager {
             stmt.setLong(1, timeValue)
             
             id match {
-                case Left(intId) => stmt.setInt(2, intId)
+                case Left(longID) => stmt.setLong(2, longID)
                 case Right(uuid) => stmt.setString(2, uuid.toString)
             }
             
@@ -373,7 +771,7 @@ object DatabaseManager {
     
     
     def updateNetworkFinalRound(id: UUID, finalRound: Int, simulationOutcome: Boolean): Unit = {
-        val conn = getConnection
+        val conn = getConnectionLegacy
         var stmt: PreparedStatement = null
         try {
             val sql = s"UPDATE networks SET final_round = ?, simulation_outcome = ? WHERE id = CAST(? AS uuid)"
@@ -395,7 +793,7 @@ object DatabaseManager {
         distribution: String, density: Option[Int], degreeDistribution: Option[Float])
     
     def getRun(runId: Int): Option[RunQueryResult] = {
-        val conn = getConnection
+        val conn = getConnectionLegacy
         var stmt: PreparedStatement = null
         try {
             val sql = """
@@ -427,7 +825,7 @@ object DatabaseManager {
     }
     
     def getRunInfo(networkId: UUID): Option[(String, Option[Int], Option[Float])] = {
-        val conn = getConnection
+        val conn = getConnectionLegacy
         var stmt: PreparedStatement = null
         try {
             val sql =
@@ -459,7 +857,7 @@ object DatabaseManager {
     }
     
     def getNetworks(runId: Int, numberOfNetworks: Int): Option[Array[UUID]] = {
-        val conn = getConnection
+        val conn = getConnectionLegacy
         var stmt: PreparedStatement = null
         try {
             val sql = s"SELECT id FROM networks WHERE run_id = ?"
@@ -483,7 +881,7 @@ object DatabaseManager {
     
     def getAgents(networkId: UUID, numberOfAgents: Int): Option[
       Array[(UUID, Float, Float, Option[Float], Option[Integer])]] = {
-        val conn = getConnection
+        val conn = getConnectionLegacy
         var stmt: PreparedStatement = null
         try {
             val sql =
@@ -521,7 +919,7 @@ object DatabaseManager {
     def getAgentsWithState(networkId: UUID, numberOfAgents: Int): Option[
       Array[(UUID, Float, Float, Option[Float], Option[Integer],
         Float, Option[Array[Byte]])]] = {
-        val conn = getConnection
+        val conn = getConnectionLegacy
         var stmt: PreparedStatement = null
         try {
             val sql =
@@ -568,8 +966,8 @@ object DatabaseManager {
     }
     
     def getNeighbors(networkId: UUID, numberOfAgents: Int): Option[Array[(UUID, UUID, Float, 
-      Option[CognitiveBiasType])]] = {
-        val conn = getConnection
+      Option[Bias])]] = {
+        val conn = getConnectionLegacy
         var stmt: PreparedStatement = null
         try {
             val sql =
@@ -584,7 +982,7 @@ object DatabaseManager {
             stmt = conn.prepareStatement(sql)
             stmt.setObject(1, networkId)
             val queryResult = stmt.executeQuery()
-            val resultArray = new ArrayBuffer[(UUID, UUID, Float, Option[CognitiveBiasType])](numberOfAgents)
+            val resultArray = new ArrayBuffer[(UUID, UUID, Float, Option[Bias])](numberOfAgents)
             var i = 0
             while (queryResult.next()) {
                 val bytes = queryResult.getBytes(7)
@@ -608,7 +1006,7 @@ object DatabaseManager {
     
     def getAgentsWithState(runId: Int, numberOfAgents: Int, limit: Int, offset: Int): Option[
       Array[AgentStateLoad]] = {
-        val conn = getConnection
+        val conn = getConnectionLegacy
         var stmt: PreparedStatement = null
         try {
             val sql =
@@ -665,7 +1063,7 @@ object DatabaseManager {
     }
     
     def getNeighbors(runId: Int, numberOfAgents: Int, limit: Int, offset: Int): Option[Array[NeighborsLoad]] = {
-        val conn = getConnection
+        val conn = getConnectionLegacy
         var stmt: PreparedStatement = null
         try {
             val sql =
@@ -730,7 +1128,7 @@ object DatabaseManager {
             stateData: Array[Byte],
             isSpeaking: Boolean
         )
-        val conn = getConnection
+        val conn = getConnectionLegacy
         var stmt: PreparedStatement = null
 
         val ids = mutable.HashMap[String, Int]()

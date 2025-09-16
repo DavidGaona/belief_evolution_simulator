@@ -1,118 +1,110 @@
 package core.model.agent.behavior.bias
 
-import core.model.agent.behavior.bias.CognitiveBiasType.Authority
+import scala.reflect.ClassTag
 
-enum CognitiveBiasType:
-    case DeGroot
-    case Confirmation
-    case Backfire
-    case Authority
-    case Insular
-    
-    def toFunction: BiasFunction = this match {
-        case CognitiveBiasType.DeGroot => CognitiveBiases.DeGroot
-        case CognitiveBiasType.Confirmation => CognitiveBiases.confirmation
-        case CognitiveBiasType.Backfire => CognitiveBiases.backfire
-        case CognitiveBiasType.Authority => CognitiveBiases.authority
-        case CognitiveBiasType.Insular => CognitiveBiases.insular
-    }
-    
-    def toBiasCode: Byte = this match {
-        case CognitiveBiasType.DeGroot => 0
-        case CognitiveBiasType.Confirmation => 1
-        case CognitiveBiasType.Backfire => 2
-        case CognitiveBiasType.Authority => 3
-        case CognitiveBiasType.Insular => 4
-    }
-
-type BiasFunction = Float => Float
-
+/**
+ * Represents different cognitive biases that can be applied to belief differences.
+ * Each bias modifies how agents process and update their beliefs when exposed
+ * to conflicting information.
+ */
 object CognitiveBiases {
-    // Where x is the belief difference
-    val DeGroot: BiasFunction = x => x
+    opaque type Bias = Byte
     
-    // Confirmation constants
-    // Original (x * (1f + 0.0001f - math.abs(x))) / (1f + 0.0001f)
-    private val EPSILON_PLUS_ONE: Float = 1f + 0.001f // call this e1
-    private val INV_EPSILON_PLUS_ONE: Float = 1 / EPSILON_PLUS_ONE // call this e2
-    // (x * (e1 - math.abs(x))) / (e1)
-    // x * (e1 - math.abs(x)) * e2
-    // x * (e1 * e2 - math.abs(x) * e2)
-    // x * (1 - math.abs(x) * e2)
-    // x - (x * math.abs(x) * e2)
-    val confirmation: BiasFunction = x => x - (x * math.abs(x) * INV_EPSILON_PLUS_ONE)
+    given ClassTag[Bias] = ClassTag.Byte.asInstanceOf[ClassTag[Bias]]
     
-    // -x^3
-    val backfire: BiasFunction = x => -x * (x * x)
+    /**
+     * DeGroot bias - no modification to belief difference.
+     * Represents rational, unbiased belief updating.
+     * Formula: f(x) = x
+     */
+    final val DEGROOT: Bias = 0x00
     
-    // Authority
-    // {
-    //    case 0f => 0.0f
-    //    case x => x / math.abs(x)
-    // }
-    val authority: BiasFunction = x => math.signum(x)
+    /**
+     * Confirmation bias - reduces belief change when it conflicts with existing beliefs.
+     * Agents tend to accept information that confirms their existing beliefs more readily.
+     * Formula: f(x) = x - (x * |x| * ε)
+     */
+    final val CONFIRMATION: Bias = 0x01
     
-    val insular: BiasFunction = _ => 0f
+    /**
+     * Backfire bias - reverses belief change when strongly contradicted.
+     * Agents become more entrenched in their beliefs when presented with strong opposing evidence.
+     * Formula: f(x) = -x³
+     */
+    final val BACKFIRE: Bias = 0x02
     
-    // bd = beliefDifference
-    // 0 DeGroot
-    // 1 Confirmation
-    // 2 Backfire
-    // 3 Authority
-    // 4 Insular
-    @inline def applyBias(code: Byte, bd: Float): Float = {
-        code match {
-            case 0 => bd
-            case 1 => bd - (bd * math.abs(bd) * INV_EPSILON_PLUS_ONE)
-            case 2 => -bd * (bd * bd)
-            case 3 => math.signum(bd)
-            case 4 => 0
+    /**
+     * Authority bias - belief change depends only on direction, not magnitude.
+     * Agents accept or reject information based on source authority rather than evidence strength.
+     * Formula: f(x) = sign(x)
+     */
+    final val AUTHORITY: Bias = 0x03
+    
+    /**
+     * Insular bias - complete rejection of external information.
+     * Agents ignore all conflicting information and maintain their existing beliefs.
+     * Formula: f(x) = 0
+     */
+    final val INSULAR: Bias = 0x04
+    
+    // Optimization constants for confirmation bias
+    final private val EPSILON_PLUS_ONE: Float = 1f + 0.001f // call this e1
+    final val INV_EPSILON_PLUS_ONE: Float = 1 / EPSILON_PLUS_ONE // call this e2
+    /**
+     * Original (x * (1f + 0.0001f - math.abs(x))) / (1f + 0.0001f)
+     * (x * (e1 - math.abs(x))) / (e1)
+     * x * (e1 - math.abs(x)) * e2
+     * x * (e1 * e2 - math.abs(x) * e2)
+     * x * (1 - math.abs(x) * e2)
+     * x - (x * math.abs(x) * e2)
+     */
+    
+    extension (bias: Bias) {
+        /** Get the underlying byte value */
+        def toByte: Byte = bias
+        
+        /**
+         * Applies the specified cognitive bias to a belief difference.
+         *
+         * @param beliefDifference The raw belief difference value
+         * @return The modified belief difference after applying the bias
+         */
+        def apply(beliefDifference: Float): Float = {
+            bias match {
+                case DEGROOT => beliefDifference
+                case CONFIRMATION => beliefDifference - (beliefDifference * math.abs(beliefDifference) * INV_EPSILON_PLUS_ONE)
+                case BACKFIRE => -beliefDifference * (beliefDifference * beliefDifference)
+                case AUTHORITY => math.signum(beliefDifference)
+                case INSULAR => 0
+                case _ => throw new IllegalArgumentException(s"Unknown bias code: $bias")
+            }
+        }
+        
+        /** Converts a bias to its name as a string representation. */
+        def name: String = bias match {
+            case DEGROOT => "DeGroot"
+            case CONFIRMATION => "Confirmation"
+            case BACKFIRE => "Backfire"
+            case AUTHORITY => "Authority"
+            case INSULAR => "Insular"
         }
     }
     
-    def applyBias(biasType: CognitiveBiasType, beliefDifference: Float): Float = {
-        biasType match {
-            case CognitiveBiasType.DeGroot => CognitiveBiases.DeGroot(beliefDifference)
-            case CognitiveBiasType.Confirmation => CognitiveBiases.confirmation(beliefDifference)
-            case CognitiveBiasType.Backfire => CognitiveBiases.backfire(beliefDifference)
-            case CognitiveBiasType.Authority => CognitiveBiases.authority(beliefDifference)
-            case CognitiveBiasType.Insular => CognitiveBiases.insular(beliefDifference)
-        }
-    }
-    
-    def toBiasType(f: BiasFunction): CognitiveBiasType = {
-        if (f eq CognitiveBiases.DeGroot) CognitiveBiasType.DeGroot
-        else if (f eq CognitiveBiases.confirmation) CognitiveBiasType.Confirmation
-        else if (f eq CognitiveBiases.backfire) CognitiveBiasType.Backfire
-        else if (f eq CognitiveBiases.authority) CognitiveBiasType.Authority
-        else if (f eq CognitiveBiases.insular) CognitiveBiasType.Insular
-        else throw new IllegalArgumentException("Unknown bias function")
-    }
-    
-    val biasArr: Array[CognitiveBiasType] = Array(
-        CognitiveBiasType.DeGroot,
-        CognitiveBiasType.Confirmation,
-        CognitiveBiasType.Backfire,
-        CognitiveBiasType.Authority,
-        CognitiveBiasType.Insular
-        )
-    
-    def toBiasType(code: Byte): CognitiveBiasType = biasArr(code)
-    
-    def toBiasCode(biasType: CognitiveBiasType): Byte = biasType match {
-        case CognitiveBiasType.DeGroot => 0
-        case CognitiveBiasType.Confirmation => 1
-        case CognitiveBiasType.Backfire => 2
-        case CognitiveBiasType.Authority => 3
-        case CognitiveBiasType.Insular => 4
-    }
-    
-    def fromString(bias: String): Option[CognitiveBiasType] = bias match {
-        case "DeGroot" => Some(CognitiveBiasType.DeGroot)
-        case "Confirmation" => Some(CognitiveBiasType.Confirmation)
-        case "Backfire" => Some(CognitiveBiasType.Backfire)
-        case "Authority" => Some(CognitiveBiasType.Authority)
-        case "Insular" => Some(CognitiveBiasType.Insular)
+    /** Converts a byte to a <code>Bias</code>, only for comp time type checking */
+    def fromByte(b: Byte): Bias = b
+            
+    /**
+     * Converts a bias name string to its corresponding byte code.
+     *
+     * @param biasName The name of the bias (case-sensitive)
+     * @return Some(bias code) if valid, None otherwise
+     */
+    def fromString(biasName: String): Option[Bias] = biasName match {
+        case "DeGroot" => Some(DEGROOT)
+        case "Confirmation" => Some(CONFIRMATION)
+        case "Backfire" => Some(BACKFIRE)
+        case "Authority" => Some(AUTHORITY)
+        case "Insular" => Some(INSULAR)
         case _ => None
     }
     
