@@ -116,7 +116,8 @@ class AgentProcessor(
                 
                 if (!hasUpdatedInfluences) generateInfluencesAndBiases()
                 
-                if (runMetadata.saveMode.includesAgents) {
+                // Add null check before accessing ids array
+                if (runMetadata.saveMode.includesAgents && ids != null) {
                     agentsStaticStates(i) = StaticAgentData(
                         id = ids(i),
                         numberOfNeighbors = neighborsSize(i),
@@ -137,7 +138,8 @@ class AgentProcessor(
                 tolOffset(i) = tolOffset(i) - radius // Become lower
                 //Logger.log(s"New radius: ${tolRadius(i)}, new offset(lower): ${tolOffset(i)}")
                 
-                if (runMetadata.saveMode.includesNeighbors) {
+                // Add null check before accessing ids array
+                if (runMetadata.saveMode.includesNeighbors && ids != null) {
                     var j = indexOffset(math.max(0, i - 1))
                     while (j < indexOffset(i)) {
                         neighborActors.addOne(NeighborStructure(
@@ -151,12 +153,14 @@ class AgentProcessor(
                 }
                 i += 1
             }
+            
+            // Only send database messages if ids array is not null
             if (runMetadata.saveMode.includesFirstRound) snapshotAgentState(true, null, speakingBuffer1)
-            if (runMetadata.saveMode.includesNeighbors) neighborSaver ! SendNeighbors(neighborActors)
-            if (runMetadata.saveMode.includesAgents) agentStaticDataSaver ! SendStaticAgentData(agentsStaticStates)
+            if (runMetadata.saveMode.includesNeighbors && ids != null) neighborSaver ! SendNeighbors(neighborActors)
+            if (runMetadata.saveMode.includesAgents && ids != null) agentStaticDataSaver ! SendStaticAgentData(agentsStaticStates)
+            
             sendRoundToWebSocketServer(beliefBuffer1, speakingBuffer1)
             context.parent ! RunFirstRound
-        
         
         case UpdateAgent1R =>
             // Update belief 1 = read buffers, 2 = write buffers
@@ -396,18 +400,24 @@ class AgentProcessor(
     // ============================================================================
     private def snapshotAgentState(forceSnapshot: Boolean, pastBeliefs: Array[Float],
         speakingState: Array[Byte]): Unit = {
+        if (ids == null) return
+        
         val roundDataSpeaking: ArrayBuffer[AgentState] = new ArrayBuffer[AgentState](numberOfAgents * 3 / 2)
         val roundDataSilent: ArrayBuffer[AgentState] = new ArrayBuffer[AgentState](numberOfAgents / 4)
         var i = startsAt
         while (i < (startsAt + numberOfAgents)) {
-            if (forceSnapshot || math.abs(belief(i) - pastBeliefs(i)) != 0) {
+            if (forceSnapshot || pastBeliefs == null || math.abs(belief(i) - pastBeliefs(i)) != 0) {
                 if (silenceEffect(i) == SilenceEffects.MEMORY) encoder.encodeFloat("publicBelief", publicBelief(i))
-                if (threshold.contains(i)) encoder.encodeFloat("threshold", threshold(i))
                 
-                if (confidence.contains(i)) {
+                // Replace threshold.contains(i) with proper check for THRESHOLD strategy
+                if (threshold != null && silenceStrategy(i) == SilenceStrategies.THRESHOLD) 
+                    encoder.encodeFloat("threshold", threshold(i))
+                
+                // Replace confidence.contains(i) with proper check for CONFIDENCE strategy
+                if (confidence != null && silenceStrategy(i) == SilenceStrategies.CONFIDENCE) {
                     val unboundedConfidence = confidence(i)
-                    val threshold = confidenceThreshold(i)
-                    encoder.encodeFloat("confidenceThreshold", threshold)
+                    val confThreshold = confidenceThreshold(i)
+                    encoder.encodeFloat("confidenceThreshold", confThreshold)
                     encoder.encodeFloat("confidence", (2f / (1f + Math.exp(-unboundedConfidence).toFloat)) - 1)
                 }
                 
@@ -416,7 +426,6 @@ class AgentProcessor(
                 } else {
                     roundDataSilent.addOne(AgentState(ids(i), belief(i), encoder.getBytes))
                 }
-                //log(encoder.getBytes.array().mkString(s"${i + startsAt} Array(", ", ", ")"))
                 encoder.reset()
             }
             i += 1

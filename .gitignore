@@ -31,3 +31,13 @@ project/plugins/project/
 *.csv
 *.gif
 *.svg
+
+# .env
+.env
+.env.*
+
+# vscode
+.vscode
+
+# metals
+.metals

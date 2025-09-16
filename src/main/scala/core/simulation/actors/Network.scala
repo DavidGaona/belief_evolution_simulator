@@ -81,9 +81,15 @@ class Network(networkId: UUID, runMetadata: RunMetadata,
     // ============================================================================
     // CONDITIONAL AGENT PROPERTIES - Only allocated if agent types require them
     // ============================================================================
-    private val hasThreshold: Boolean = agentTypeCount.exists(_._1 == SilenceStrategies.THRESHOLD)
-    private val hasConfidence: Boolean = agentTypeCount.exists(_._1 == SilenceStrategies.CONFIDENCE)
-    private val hasPublicBelief: Boolean = agentTypeCount.exists(_._2 == SilenceEffects.MEMORY)
+    private val hasThreshold: Boolean = agentTypeCount != null && agentTypeCount.exists(_._1 == SilenceStrategies.THRESHOLD)
+    private val hasConfidence: Boolean = agentTypeCount != null && agentTypeCount.exists(_._1 == SilenceStrategies.CONFIDENCE)
+    private val hasPublicBelief: Boolean = agentTypeCount != null && agentTypeCount.exists(_._2 == SilenceEffects.MEMORY)
+
+    // Fix by accessing enum constants directly from CognitiveBiases object
+    private val hasConfirmationBias = agentBiases != null && agentBiases.exists(_._1 == core.model.agent.behavior.bias.CognitiveBiases.CONFIRMATION)
+    private val hasBackfireBias = agentBiases != null && agentBiases.exists(_._1 == core.model.agent.behavior.bias.CognitiveBiases.BACKFIRE)
+    private val hasAuthorityBias = agentBiases != null && agentBiases.exists(_._1 == core.model.agent.behavior.bias.CognitiveBiases.AUTHORITY)
+    private val hasInsularBias = agentBiases != null && agentBiases.exists(_._1 == core.model.agent.behavior.bias.CognitiveBiases.INSULAR)
     var threshold: Array[Float] = if (hasThreshold) new Array[Float](runMetadata.agentsPerNetwork) else null
     var confidence: Array[Float] = if (hasConfidence) new Array[Float](runMetadata.agentsPerNetwork) else null
     var confidenceThreshold: Array[Float] = if (hasConfidence) new Array[Float](runMetadata.agentsPerNetwork) else null
