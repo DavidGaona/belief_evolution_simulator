@@ -6,10 +6,10 @@ import java.util.concurrent.locks.ReentrantLock
 /**
  * Thread-safe Snowflake ID generator that produces unique 64-bit identifiers.
  *
- * Snowflake IDs are composed of: <br>
- * - 41 bits: timestamp (milliseconds since custom epoch) <br>
- * - 10 bits: machine identifier (derived from hostname hash) <br>
- * - 12 bits: sequence number (for multiple IDs within same millisecond)
+ * Snowflake IDs are composed of:
+ *  -  41 bits: timestamp (milliseconds since custom epoch)
+ *  -  10 bits: machine identifier (derived from hostname hash)
+ *  -  12 bits: sequence number (for multiple IDs within same millisecond)
  *
  * This implementation uses January 1, 2024 as the custom epoch, providing
  * approximately 69 years of unique timestamp space. The machine ID is derived

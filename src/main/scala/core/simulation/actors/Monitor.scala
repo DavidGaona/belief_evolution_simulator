@@ -158,7 +158,16 @@ class Monitor extends Actor {
                 0,
                 customInfo.stopThreshold
             )
-            val runActor = context.actorOf(Props(new Run(runMetadata, customInfo)), s"R$totalRuns")
+            val map = mutable.HashMap[(SilenceStrategy, SilenceEffect), Int]().withDefaultValue(0)
+            for (i <- customInfo.agentSilenceStrategy.indices) {
+                val id = (customInfo.agentSilenceStrategy(i), customInfo.agentSilenceEffect(i))
+                map(id) += 1
+            }
+            
+            val agentTypeCount: Array[(SilenceStrategy, SilenceEffect, Int)] =
+                map.map { case ((strategy, effect), count) => (strategy, effect, count) }.toArray
+            
+            val runActor = context.actorOf(Props(new Run(runMetadata, customInfo, agentTypeCount)), s"R$totalRuns")
             trackRunMemory(runActor, 1, customInfo.agentBeliefs.length, customInfo.target.length)
             simulationTimers.start(s"${runActor.path.name}")
 

@@ -481,7 +481,7 @@ object Server {
                 stopThreshold, iterationLimit,
                 "uniform"
             ).get
-        } else {
+        } else if (!GlobalState.APP_MODE.skipDatabase) {
             DatabaseManager.saveGeneratedRun(
                 id = runID,
                 seed = seed,
@@ -631,7 +631,7 @@ object Server {
                 stopThreshold, iterationLimit,
                 "uniform"
             ).get
-        } else {
+        } else if (!GlobalState.APP_MODE.skipDatabase) {
             DatabaseManager.saveCustomRun(
                 id = runID,
                 iterationLimit = iterationLimit,

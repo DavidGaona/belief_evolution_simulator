@@ -95,6 +95,10 @@ object SilenceStrategies {
             case CONFIDENCE => "Confidence"
             case _ => throw new IllegalArgumentException(s"Unknown strategy code: $strategy")
         }
+        
+        def <<(shift: Int): Int = strategy.toInt << shift
+        def |(or: Int): Int = strategy.toInt | or
+        def toInt: Int = strategy.toInt
     }
     
     /** Converts a byte to a <code>SilenceStrategy</code>, only for comp time type checking */

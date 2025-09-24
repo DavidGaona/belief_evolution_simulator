@@ -67,6 +67,10 @@ object SilenceEffects {
             case MEMORYLESS => "Memoryless"
             case _ => throw new IllegalArgumentException(s"Unknown effect code: $effect")
         }
+        
+        def <<(shift: Int): Int = effect.toInt << shift
+        def |(or: Int): Int = effect.toInt | or
+        def toInt: Int = effect.toInt
     }
     
     /** Converts a byte to a <code>SilenceEffect</code>, only for comp time type checking */
