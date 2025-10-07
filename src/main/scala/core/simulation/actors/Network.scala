@@ -158,7 +158,8 @@ class Network(networkId: UUID, runMetadata: RunMetadata,
             
             // Neighbors
             val neighborsLength = customRunInfo.influences.length
-            Array.copy(customRunInfo.indexOffset, 0, indexOffset, 0, arrayLength)
+            Array.copy(customRunInfo.indexOffset, 1, indexOffset, 0, arrayLength - 1)
+            indexOffset(arrayLength - 1) = neighborsLength
             neighborsRefs = customRunInfo.target
             neighborsWeights = customRunInfo.influences
             neighborBiases = customRunInfo.bias
@@ -405,7 +406,7 @@ class Network(networkId: UUID, runMetadata: RunMetadata,
             if (pendingResponses == 0) {
                 logAgentRoundState()
                 round += 1
-                sendNeighbors()
+                if (!GlobalState.APP_MODE.skipWS) sendNeighbors()
                 runRound()
                 pendingResponses = agents.length
             }
