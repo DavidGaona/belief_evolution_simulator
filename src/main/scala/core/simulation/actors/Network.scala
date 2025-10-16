@@ -158,8 +158,7 @@ class Network(networkId: UUID, runMetadata: RunMetadata,
             
             // Neighbors
             val neighborsLength = customRunInfo.influences.length
-            Array.copy(customRunInfo.indexOffset, 1, indexOffset, 0, arrayLength - 1)
-            indexOffset(arrayLength - 1) = neighborsLength
+            Array.copy(customRunInfo.indexOffset, 0, indexOffset, 0, arrayLength)
             neighborsRefs = customRunInfo.target
             neighborsWeights = customRunInfo.influences
             neighborBiases = customRunInfo.bias

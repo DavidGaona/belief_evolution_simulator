@@ -613,13 +613,13 @@ object Server {
         
         val indexOffset = new Array[Int](numberOfAgents)
         var count = 0
-        for (i <- 1 until numberOfNeighbors) {
-            if (sortedSource(i - 1) != sortedSource(i)) {
-                indexOffset(count) = i - 1
+        for (i <- 0 until numberOfNeighbors) {
+            if ((i != 0) && sortedSource(i - 1) != sortedSource(i)) {
+                indexOffset(count) = i
                 count += 1
             }
         }
-        indexOffset(indexOffset.length - 1) = numberOfNeighbors - 1
+        indexOffset(indexOffset.length - 1) = numberOfNeighbors
         
         var runID = SnowflakeID.generateId()
         val convertedSaveMode = if (GlobalState.APP_MODE.skipDatabase) SaveModes.DEBUG
