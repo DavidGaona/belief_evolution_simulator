@@ -4,7 +4,7 @@ import akka.actor.{Actor, ActorRef, PoisonPill, Props}
 import core.model.agent.behavior.bias.CognitiveBiases.Bias
 import core.model.agent.behavior.silence.SilenceEffects.SilenceEffect
 import core.model.agent.behavior.silence.SilenceStrategies.SilenceStrategy
-import core.simulation.config.RunMode
+import core.simulation.config.{GlobalState, RunMode}
 import io.db.DatabaseManager
 import io.persistence.RoundRouter
 import io.web.CustomRunInfo
@@ -103,19 +103,21 @@ class Run extends Actor {
       Option[Array[Byte]])]] = None
     var BuildMessage: Any = null
     var totalLoaded: Int = 0
-    val preFetchThreshold: Float = 0.75
     
     // Run a custom network
-    def this (runMetadata: RunMetadata, customRunInfo: CustomRunInfo) = {
+    def this (runMetadata: RunMetadata, customRunInfo: CustomRunInfo,
+        agentTypeCount: Array[(SilenceStrategy, SilenceEffect, Int)]
+    ) = {
         this()
         
         globalTimers.start(s"Total_time")
         
         this.runMetadata = runMetadata
+        this.agentTypeCount = agentTypeCount
         globalTimers.start("Building")
         val networkId: UUID = uuids.v7()
         val network = context.actorOf(
-            Props(new Network(networkId, runMetadata, null, null)) // customRunInfo.networkName
+            Props(new Network(networkId, runMetadata, agentTypeCount, null)) // customRunInfo.networkName
         )
         if (runMetadata.saveMode.includesNetworks) {
             DatabaseManager.createNetwork(networkId, customRunInfo.networkName, runMetadata.runID, 
@@ -241,7 +243,9 @@ class Run extends Actor {
                     RoundRouter.saveRemainingData()
                 }
                 
-                DatabaseManager.submitNetworkResults(runMetadata.runID, networkResults)
+                if (!GlobalState.APP_MODE.skipDatabase) {
+                    DatabaseManager.submitNetworkResults(runMetadata.runID, networkResults)
+                }
                 
                 if (!runMetadata.saveMode.savesToDB) {
                     scala.util.Sorting.quickSort(networkBuildTimes)

@@ -405,7 +405,7 @@ class Network(networkId: UUID, runMetadata: RunMetadata,
             if (pendingResponses == 0) {
                 logAgentRoundState()
                 round += 1
-                sendNeighbors()
+                if (!GlobalState.APP_MODE.skipWS) sendNeighbors()
                 runRound()
                 pendingResponses = agents.length
             }
