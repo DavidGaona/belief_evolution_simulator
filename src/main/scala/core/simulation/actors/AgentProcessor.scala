@@ -158,8 +158,8 @@ class AgentProcessor(
             if (runMetadata.saveMode.includesFirstRound) snapshotAgentState(true, null, speakingBuffer1)
             if (runMetadata.saveMode.includesNeighbors && ids != null) neighborSaver ! SendNeighbors(neighborActors)
             if (runMetadata.saveMode.includesAgents && ids != null) agentStaticDataSaver ! SendStaticAgentData(agentsStaticStates)
-            
-            sendRoundToWebSocketServer(beliefBuffer1, speakingBuffer1)
+            if (!GlobalState.APP_MODE.skipWS) sendRoundToWebSocketServer(beliefBuffer1, speakingBuffer1)
+
             context.parent ! RunFirstRound
         
         case UpdateAgent1R =>
