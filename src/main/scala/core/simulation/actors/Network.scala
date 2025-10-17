@@ -384,7 +384,7 @@ class Network(networkId: UUID, runMetadata: RunMetadata,
                 count += density
                 i += 1
             }
-            
+
             // ============================================================================
             // FINALIZATION
             // ============================================================================
@@ -571,21 +571,44 @@ class Network(networkId: UUID, runMetadata: RunMetadata,
     private def sendNeighbors(): Unit = {
         val numberOfAgents = indexOffset.length
         val numberOfNeighbors = neighborsRefs.length
-        val buffer = ByteBuffer.allocate(24 + (numberOfAgents * 4) + (numberOfNeighbors * 8))
-        
-        // HEADER (24 bytes total)
+        // Allocate 1 extra byte for the packet type identifier
+        val bufferSize = 4 + 32 + (numberOfAgents * 4) + (numberOfNeighbors * 9)
+        val buffer = ByteBuffer.allocate(bufferSize)
+
+        // PACKET ID (1 byte)
+        buffer.put(0x01.toByte) // 0x01 for Topology Packet
+        buffer.put(0.toByte)    // Padding
+        buffer.put(0.toByte)    // Padding
+        buffer.put(0.toByte)    // Padding
+
+        // HEADER (32 bytes total)
         buffer.putLong(networkId.getMostSignificantBits)
         buffer.putLong(networkId.getLeastSignificantBits)
         buffer.putLong(runMetadata.runID)
-        buffer.putInt(indexOffset.length)
-        buffer.putInt(neighborsRefs.length)
-        
+        buffer.putInt(numberOfAgents)
+        buffer.putInt(numberOfNeighbors)
+
         // BODY (variable bytes)
-        buffer.asIntBuffer().put(indexOffset)
-        buffer.asIntBuffer().put(neighborsRefs)
-        buffer.asFloatBuffer().put(neighborsWeights)
-        buffer.put(neighborBiases.asInstanceOf[Array[Byte]])
+        var i = 0
+        while (i < numberOfAgents) {
+            buffer.putInt(indexOffset(i))
+            i += 1
+        }
+
+        i = 0
+        while (i < numberOfNeighbors) {
+            buffer.putInt(neighborsRefs(i))
+            i += 1
+        }
         
+        i = 0
+        while (i < numberOfNeighbors) {
+            buffer.putFloat(neighborsWeights(i))
+            i += 1
+        }
+        buffer.put(neighborBiases.asInstanceOf[Array[Byte]])
+
+        println(buffer)
         Server.sendNeighborBinaryData(runMetadata.channelId, buffer)
     }
     

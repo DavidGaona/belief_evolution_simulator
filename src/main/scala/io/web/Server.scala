@@ -426,8 +426,11 @@ object Server {
                 if (GlobalState.APP_MODE.hasServerLogs) logBufferDebugInfo(buffer)
                 
                 implicit val materializer: Materializer = Materializer(system.get)
+                buffer.flip()
                 val message = BinaryMessage(ByteString(buffer))
                 Source.single(message).runWith(publisher)
+                println(message)
+                println(channelId)
             case None =>
                 Logger.logError(s"Error: No WebSocket clients connected to channel $channelId")
         }

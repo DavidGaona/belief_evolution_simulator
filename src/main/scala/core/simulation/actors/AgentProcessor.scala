@@ -92,7 +92,7 @@ class AgentProcessor(
     val random = new Random(runMetadata.seed + runMetadata.runID + startsAt.toLong + networkNumber)
     
     val encoder: Encoder = Encoder()
-    val buffer = ByteBuffer.allocate((numberOfAgents * 9) + 36)
+    val buffer = ByteBuffer.allocate(4 + (numberOfAgents * 9) + 36)
     
     def receive: Receive = {
         case MarkAsCustomRun =>
@@ -470,6 +470,12 @@ class AgentProcessor(
     private def sendRoundToWebSocketServer(beliefBuffer: Array[Float], speakingBuffer: Array[Byte]): Unit = {
         buffer.clear()
         buffer.order(ByteOrder.LITTLE_ENDIAN)
+
+        // PACKET ID (1 byte)
+        buffer.put(0x02.toByte) // 0x02 for Round Data Packet
+        buffer.put(0.toByte)          // Padding
+        buffer.put(0.toByte)          // Padding
+        buffer.put(0.toByte)          // Padding
         
         buffer.putLong(networkId.getMostSignificantBits)
         buffer.putLong(networkId.getLeastSignificantBits)

@@ -161,3 +161,184 @@ This project is licensed under the MIT License - see the [LICENSE](https://opens
 
 - Thanks to all contributors and reviewers of our research
 
+
+```
+belief_evolution_simulator
+├─ build.sbt
+├─ db
+│  ├─ init
+│  │  ├─ legacy_schema.sql
+│  │  └─ schema.sql
+│  ├─ init_db.sh
+│  └─ postgres-entrypoint.sh
+├─ docker-compose.yml
+├─ Dockerfile
+├─ Dockerfile_db
+├─ project
+│  └─ build.properties
+├─ README.md
+└─ src
+   ├─ main
+   │  ├─ resources
+   │  │  └─ application.conf
+   │  └─ scala
+   │     ├─ benchmarking
+   │     │  └─ rdtsc.scala
+   │     ├─ CLI
+   │     │  └─ CLI.scala
+   │     ├─ core
+   │     │  ├─ model
+   │     │  │  ├─ agent
+   │     │  │  │  └─ behavior
+   │     │  │  │     ├─ bias
+   │     │  │  │     │  └─ CognitiveBiases.scala
+   │     │  │  │     └─ silence
+   │     │  │  │        ├─ SilenceEffects.scala
+   │     │  │  │        └─ SilenceStrategies.scala
+   │     │  │  └─ AgentStates.scala
+   │     │  └─ simulation
+   │     │     ├─ actors
+   │     │     │  ├─ AgentProcessor.scala
+   │     │     │  ├─ Monitor.scala
+   │     │     │  ├─ Network.scala
+   │     │     │  └─ Run.scala
+   │     │     └─ config
+   │     │        ├─ AppMode.scala
+   │     │        ├─ GlobalState.scala
+   │     │        ├─ RunMode.scala
+   │     │        └─ SaveModes.scala
+   │     ├─ io
+   │     │  ├─ db
+   │     │  │  └─ DatabaseManager.scala
+   │     │  ├─ persistence
+   │     │  │  ├─ actors
+   │     │  │  │  ├─ AgentStaticDataSaver.scala
+   │     │  │  │  ├─ NeighborSaver.scala
+   │     │  │  │  └─ RoundDataCollector.scala
+   │     │  │  └─ RoundRouter.scala
+   │     │  ├─ serialization
+   │     │  │  └─ binary
+   │     │  │     ├─ Decoder.scala
+   │     │  │     ├─ Encoder.scala
+   │     │  │     └─ EncodingTable.scala
+   │     │  └─ web
+   │     │     └─ Server.scala
+   │     ├─ Main.scala
+   │     └─ utils
+   │        ├─ datastructures
+   │        │  ├─ ArrayList.scala
+   │        │  ├─ FenwickTree.scala
+   │        │  ├─ SnowflakeID.scala
+   │        │  └─ UUIDS.scala
+   │        ├─ logging
+   │        │  └─ Logger.scala
+   │        ├─ rng
+   │        │  ├─ distributions
+   │        │  │  ├─ BimodalDistribution.scala
+   │        │  │  └─ distributions.scala
+   │        │  ├─ Xoshiro.scala
+   │        │  └─ Xoshiro128.scala
+   │        ├─ timers
+   │        │  └─ CustomTimer.scala
+   │        └─ Utilities.scala
+   ├─ scripts
+   │  ├─ exploration.R
+   │  ├─ multi_round_analysis.R
+   │  ├─ new_exploration.R
+   │  └─ per_round_exploration.R
+   └─ test
+      └─ asm
+         ├─ rdtsc.asm
+         └─ rdtsc.def
+
+```
+```
+belief_evolution_simulator
+├─ build.sbt
+├─ db
+│  ├─ init
+│  │  ├─ legacy_schema.sql
+│  │  └─ schema.sql
+│  ├─ init_db.sh
+│  └─ postgres-entrypoint.sh
+├─ docker-compose.yml
+├─ Dockerfile
+├─ Dockerfile_db
+├─ project
+│  └─ build.properties
+├─ README.md
+└─ src
+   ├─ main
+   │  ├─ resources
+   │  │  └─ application.conf
+   │  └─ scala
+   │     ├─ benchmarking
+   │     │  └─ rdtsc.scala
+   │     ├─ CLI
+   │     │  └─ CLI.scala
+   │     ├─ core
+   │     │  ├─ model
+   │     │  │  ├─ agent
+   │     │  │  │  └─ behavior
+   │     │  │  │     ├─ bias
+   │     │  │  │     │  └─ CognitiveBiases.scala
+   │     │  │  │     └─ silence
+   │     │  │  │        ├─ SilenceEffects.scala
+   │     │  │  │        └─ SilenceStrategies.scala
+   │     │  │  └─ AgentStates.scala
+   │     │  └─ simulation
+   │     │     ├─ actors
+   │     │     │  ├─ AgentProcessor.scala
+   │     │     │  ├─ Monitor.scala
+   │     │     │  ├─ Network.scala
+   │     │     │  └─ Run.scala
+   │     │     └─ config
+   │     │        ├─ AppMode.scala
+   │     │        ├─ GlobalState.scala
+   │     │        ├─ RunMode.scala
+   │     │        └─ SaveModes.scala
+   │     ├─ io
+   │     │  ├─ db
+   │     │  │  └─ DatabaseManager.scala
+   │     │  ├─ persistence
+   │     │  │  ├─ actors
+   │     │  │  │  ├─ AgentStaticDataSaver.scala
+   │     │  │  │  ├─ NeighborSaver.scala
+   │     │  │  │  └─ RoundDataCollector.scala
+   │     │  │  └─ RoundRouter.scala
+   │     │  ├─ serialization
+   │     │  │  └─ binary
+   │     │  │     ├─ Decoder.scala
+   │     │  │     ├─ Encoder.scala
+   │     │  │     └─ EncodingTable.scala
+   │     │  └─ web
+   │     │     └─ Server.scala
+   │     ├─ Main.scala
+   │     └─ utils
+   │        ├─ datastructures
+   │        │  ├─ ArrayList.scala
+   │        │  ├─ FenwickTree.scala
+   │        │  ├─ SnowflakeID.scala
+   │        │  └─ UUIDS.scala
+   │        ├─ logging
+   │        │  └─ Logger.scala
+   │        ├─ rng
+   │        │  ├─ distributions
+   │        │  │  ├─ BimodalDistribution.scala
+   │        │  │  └─ distributions.scala
+   │        │  ├─ Xoshiro.scala
+   │        │  └─ Xoshiro128.scala
+   │        ├─ timers
+   │        │  └─ CustomTimer.scala
+   │        └─ Utilities.scala
+   ├─ scripts
+   │  ├─ exploration.R
+   │  ├─ multi_round_analysis.R
+   │  ├─ new_exploration.R
+   │  └─ per_round_exploration.R
+   └─ test
+      └─ asm
+         ├─ rdtsc.asm
+         └─ rdtsc.def
+
+```
