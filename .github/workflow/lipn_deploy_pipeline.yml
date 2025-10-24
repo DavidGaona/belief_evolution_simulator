@@ -3,7 +3,7 @@ name: Trigger LIPN Deploy Pipeline
 on:
   push:
     branches:
-      - main
+      - master
 
 jobs:
   trigger_deploy_pipeline:
