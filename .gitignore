@@ -32,3 +32,4 @@ project/plugins/project/
 *.csv
 *.gif
 *.svg
+.env
