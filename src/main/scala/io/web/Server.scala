@@ -18,7 +18,7 @@ import core.model.agent.behavior.bias.CognitiveBiases.Bias
 import core.model.agent.behavior.silence.SilenceEffects.SilenceEffect
 import core.model.agent.behavior.silence.{SilenceEffects, SilenceStrategies}
 import core.model.agent.behavior.silence.SilenceStrategies.SilenceStrategy
-import core.simulation.actors.{AddNetworks, RunCustomNetwork}
+import core.simulation.actors.{AddNetworks, CoevolutionConfig, RunCustomNetwork}
 import core.simulation.config.*
 import core.simulation.config.SaveModes.SaveMode
 import utils.logging.Logger
@@ -47,7 +47,8 @@ case class CustomRunInfo(
     indexOffset: Array[Int],
     target: Array[Int],
     influences: Array[Float],
-    bias: Array[Bias]
+    bias: Array[Bias],
+    coevolutionConfig: Option[CoevolutionConfig] = None
 )
 
 /**
@@ -165,16 +166,28 @@ object Server {
         val apiRoute: Route = addCorsHeaders {
             pathPrefix("run") {
                 post {
-                    entity(as[Payload]) { payload =>
-                        val channelId = parseGeneratedRun(payload.data)
-                        complete(channelId) 
+                    parameters("pBreak".as[Float].?, "pCreate".as[Float].?, "rewiring".as[Int].?) { (pBreak, pCreate, rewiring) =>
+                        entity(as[Payload]) { payload =>
+                            val config = (pBreak, pCreate, rewiring) match {
+                                case (Some(b), Some(c), Some(r)) => Some(CoevolutionConfig(b, c, r))
+                                case _ => None
+                            }
+                            val channelId = parseGeneratedRun(payload.data, config)
+                            complete(channelId)
+                        }
                     }
                 }
             } ~ pathPrefix("custom") {
                 post {
-                    entity(as[Payload]) { payload =>
-                        val channelId = parseCustomRun(payload.data)
-                        complete(channelId)
+                    parameters("pBreak".as[Float].?, "pCreate".as[Float].?, "rewiring".as[Int].?) { (pBreak, pCreate, rewiring) =>
+                        entity(as[Payload]) { payload =>
+                            val config = (pBreak, pCreate, rewiring) match {
+                                case (Some(b), Some(c), Some(r)) => Some(CoevolutionConfig(b, c, r))
+                                case _ => None
+                            }
+                            val channelId = parseCustomRun(payload.data, config)
+                            complete(channelId)
+                        }
                     }
                 }
             } ~ pathPrefix("neighbors") {
@@ -433,7 +446,7 @@ object Server {
         }
     }
     
-    private def parseGeneratedRun(data: Array[Byte]): String = {
+    private def parseGeneratedRun(data: Array[Byte], config: Option[CoevolutionConfig] = None): String = {
         val saveMode = data(1)
         val agentTypeCount = data(2)
         val biasTypeCount = data(3)
@@ -510,13 +523,14 @@ object Server {
             iterationLimit,
             seed,
             2.5f,
-            stopThreshold
+            stopThreshold,
+            config
         )
         
         channelId
     }
     
-    private def parseCustomRun(data: Array[Byte]): String = {
+    private def parseCustomRun(data: Array[Byte], config: Option[CoevolutionConfig] = None): String = {
         // Header
         val stopThreshold = bytesToFloat(data, 0)
         val iterationLimit = bytesToInt(data, 4)
@@ -675,7 +689,8 @@ object Server {
             indexOffset = indexOffset,
             target = sortedTarget,
             influences = sortedInfluences,
-            bias = sortedBiases
+            bias = sortedBiases,
+            coevolutionConfig = config
         )
         
         monitor.get ! RunCustomNetwork(customRunInfo)

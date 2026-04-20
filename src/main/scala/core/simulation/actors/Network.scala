@@ -444,6 +444,28 @@ class Network(networkId: UUID, runMetadata: RunMetadata,
                     if (finishState == 0) context.stop(self)
                     finishedIterating = true
                 } else {
+                    // --- COEVOLUTION HOOK ---
+                    runMetadata.coevolutionConfig match {
+                        case Some(config) =>
+                            val currentBeliefs = if (bufferSwitch) beliefBuffer1 else beliefBuffer2
+                            val currentSpeaking = if (bufferSwitch) speakingBuffer1 else speakingBuffer2
+
+                            val (newOffsets, newRefs, newWeights, newBiases) = core.simulation.topology.CoevolutionEngine.evolveTopology(
+                                runMetadata.agentsPerNetwork, indexOffset, neighborsRefs, neighborsWeights, neighborBiases,
+                                currentBeliefs, publicBelief, currentSpeaking, hasMemory, tolRadius,
+                                config.pBreak, config.pCreate, config.rewiringStrategy,
+                                new scala.util.Random(runMetadata.seed + round) // deterministic per-round seed
+                            )
+
+                            Array.copy(newOffsets, 0, indexOffset, 0, indexOffset.length)
+                            neighborsRefs = newRefs
+                            neighborsWeights = newWeights
+                            neighborBiases = newBiases
+
+                        case None => // Static topology
+                    }
+                    // ------------------------
+
                     round += 1
                     runRound()
                     minBelief = 2.0

@@ -13,12 +13,12 @@ RUN apt-get update && apt-get install -y \
     build-essential \
     && rm -rf /var/lib/apt/lists/*
 
-# Install OpenJDK 24
-RUN wget https://download.oracle.com/java/24/latest/jdk-24_linux-x64_bin.deb
-RUN dpkg -i jdk-24_linux-x64_bin.deb
+# Install OpenJDK 25
+RUN wget https://download.oracle.com/java/25/latest/jdk-25_linux-x64_bin.deb
+RUN dpkg -i jdk-25_linux-x64_bin.deb
 
 # Set JAVA_HOME
-ENV JAVA_HOME=/usr/lib/jvm/jdk-24-oracle-x64
+ENV JAVA_HOME=/usr/lib/jvm/jdk-25-oracle-x64
 ENV PATH=$JAVA_HOME/bin:$PATH
 
 # Install SBT

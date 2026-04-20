@@ -52,12 +52,19 @@ case class RunMetadata(
     var agentsPerNetwork: Int,
     iterationLimit: Int,
     seed: Long,
-    stopThreshold: Float
+    stopThreshold: Float,
+    coevolutionConfig: Option[CoevolutionConfig] = None
 )
 
 case class OptionalMetadata(
     density: Option[Int],
     degreeDistribution: Option[Float]
+)
+
+case class CoevolutionConfig(
+    pBreak: Float,
+    pCreate: Float,
+    rewiringStrategy: Int // 0 = Proposal A (Uniform), 1 = Proposal B (Homophily)
 )
 
 // Messages
@@ -76,7 +83,8 @@ case class AddNetworks(
     iterationLimit: Int,
     seed: Long,
     degreeDistribution: Float,
-    stopThreshold: Float
+    stopThreshold: Float,
+    coevolutionConfig: Option[CoevolutionConfig] = None
 )
 
 case class AddNetworksFromCSV(path: String, silenceEffect: SilenceEffect, silenceStrategy: SilenceStrategy, bias: Bias)
@@ -156,7 +164,8 @@ class Monitor extends Actor {
                 customInfo.agentBeliefs.length, 
                 customInfo.iterationLimit, 
                 0,
-                customInfo.stopThreshold
+                customInfo.stopThreshold,
+                customInfo.coevolutionConfig
             )
             val map = mutable.HashMap[(SilenceStrategy, SilenceEffect), Int]().withDefaultValue(0)
             for (i <- customInfo.agentSilenceStrategy.indices) {
@@ -173,7 +182,7 @@ class Monitor extends Actor {
 
         
         case AddNetworks(runID, channelId, agentTypeCount, agentBiases, optionalParams, distribution, saveMode,
-        numberOfNetworks, density, iterationLimit, seed, degreeDistribution, stopThreshold) =>
+        numberOfNetworks, density, iterationLimit, seed, degreeDistribution, stopThreshold, coevolutionConfig) =>
             val optionalMetadata = Some(OptionalMetadata(Some(density), Some(degreeDistribution)))
             val runMetadata = RunMetadata(
                 runID,
@@ -188,7 +197,8 @@ class Monitor extends Actor {
                 agentTypeCount.map(_._3).sum,
                 iterationLimit,
                 seed,
-                stopThreshold
+                stopThreshold,
+                coevolutionConfig
             )
             totalRuns += 1
             val n = runMetadata.agentsPerNetwork
