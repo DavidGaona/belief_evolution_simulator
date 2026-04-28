@@ -64,7 +64,9 @@ case class OptionalMetadata(
 case class CoevolutionConfig(
     pBreak: Float,
     pCreate: Float,
-    rewiringStrategy: Int // 0 = Proposal A (Uniform), 1 = Proposal B (Homophily)
+    rewiringStrategy: Int,                  // 0 = Proposal A (Uniform), 1 = Proposal B (Homophily)
+    assortivityStopThreshold: Float = 1.1f, // >1 = disabled; e.g. 0.95 stops when r^t >= threshold
+    fragmentationStop: Boolean = false      // true = stop as soon as Phi_t > 0 (any SCC split)
 )
 
 // Messages

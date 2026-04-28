@@ -432,3 +432,35 @@ ALTER TYPE public.cognitive_bias OWNER TO postgres;
 ALTER TYPE public.initial_distribution OWNER TO postgres;
 ALTER TYPE public.silence_effect OWNER TO postgres;
 ALTER TYPE public.silence_strategy OWNER TO postgres;
+
+--
+-- Add `round` column to neighbors for multi-snapshot topology tracking
+-- DEFAULT 0 keeps the existing initial-topology writes (round 0) backward compatible.
+--
+
+DO
+$$
+    BEGIN
+        IF NOT EXISTS (
+            SELECT 1 FROM information_schema.columns
+            WHERE table_schema = 'public' AND table_name = 'neighbors' AND column_name = 'round'
+        ) THEN
+            ALTER TABLE public.neighbors ADD COLUMN round integer NOT NULL DEFAULT 0;
+        END IF;
+    END
+$$;
+
+DO
+$$
+    BEGIN
+        IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'neighbors_pkey') THEN
+            ALTER TABLE public.neighbors
+                ADD CONSTRAINT neighbors_pkey PRIMARY KEY (source, target, round);
+        END IF;
+    END
+$$;
+
+-- Replace the single-column index with a compound one that covers the new R query pattern
+-- (filter by source AND round simultaneously).
+DROP INDEX IF EXISTS public.idx_neighbors_source;
+CREATE INDEX IF NOT EXISTS idx_neighbors_source_round ON public.neighbors USING btree (source, round);

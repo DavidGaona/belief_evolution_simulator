@@ -39,11 +39,18 @@ SELECT * FROM agent_states_silent WHERE agent_id in (
 );
 ")
 
-neighbors <- str_glue("
-SELECT * FROM neighbors WHERE source in (
-    SELECT id
-    FROM agents
-    WHERE network_id = '{current_network}'
+neighbors_initial <- str_glue("
+SELECT * FROM neighbors WHERE round = 0
+AND source IN (
+    SELECT id FROM agents WHERE network_id = '{current_network}'
+);
+")
+
+neighbors_final <- str_glue("
+SELECT n.* FROM neighbors n
+WHERE n.round = (SELECT final_round FROM networks WHERE id = CAST('{current_network}' AS uuid))
+AND n.source IN (
+    SELECT id FROM agents WHERE network_id = '{current_network}'
 );
 ")
 
@@ -59,9 +66,14 @@ SELECT * FROM agents WHERE network_id = '{current_network}';
 
 speaking_agents <- as.data.table(dbGetQuery(conn, speaking_agents))
 silent_agents <- as.data.table(dbGetQuery(conn, silent_agents))
-neighbors <- as.data.table(dbGetQuery(conn, neighbors))
+neighbors_initial <- as.data.table(dbGetQuery(conn, neighbors_initial))
+neighbors_final   <- as.data.table(dbGetQuery(conn, neighbors_final))
 agents <- as.data.table(dbGetQuery(conn, agents))
 dbDisconnect(conn)
+
+# Use initial topology for static analysis; use neighbors_final for co-evolution comparisons.
+# For scripts that previously expected a single `neighbors` object, alias to initial:
+neighbors <- neighbors_initial
 
 speaking_agents[, is_speaking := TRUE]
 silent_agents[, is_speaking := FALSE]

@@ -631,14 +631,14 @@ object DatabaseManager {
     }
     
     // ToDo optimize insert to maybe use copy or batched concurrency
-    def insertNeighborsBatch(networkStructures: ArrayBuffer[NeighborStructure]): Unit = {
+    def insertNeighborsBatch(networkStructures: ArrayBuffer[NeighborStructure], round: Int = 0): Unit = {
         val conn = getConnectionLegacy
         try {
             val sql =
                 """
             INSERT INTO public.neighbors (
-                source, target, value, cognitive_bias
-            ) VALUES (CAST(? AS uuid), CAST(? AS uuid), ?, CAST(? AS cognitive_bias));
+                source, target, value, cognitive_bias, round
+            ) VALUES (CAST(? AS uuid), CAST(? AS uuid), ?, CAST(? AS cognitive_bias), ?);
             """
             val stmt = conn.prepareStatement(sql)
             var i = 0
@@ -649,6 +649,7 @@ object DatabaseManager {
                 stmt.setObject(2, networkStructure.target)
                 stmt.setFloat(3, networkStructure.value)
                 stmt.setString(4, networkStructure.bias.name)
+                stmt.setInt(5, round)
                 stmt.addBatch()
                 i += 1
             }

@@ -166,10 +166,17 @@ object Server {
         val apiRoute: Route = addCorsHeaders {
             pathPrefix("run") {
                 post {
-                    parameters("pBreak".as[Float].?, "pCreate".as[Float].?, "rewiring".as[Int].?) { (pBreak, pCreate, rewiring) =>
+                    parameters(
+                        "pBreak".as[Float].?, "pCreate".as[Float].?, "rewiring".as[Int].?,
+                        "assortStop".as[Float].?, "fragStop".as[Boolean].?
+                    ) { (pBreak, pCreate, rewiring, assortStop, fragStop) =>
                         entity(as[Payload]) { payload =>
                             val config = (pBreak, pCreate, rewiring) match {
-                                case (Some(b), Some(c), Some(r)) => Some(CoevolutionConfig(b, c, r))
+                                case (Some(b), Some(c), Some(r)) => Some(CoevolutionConfig(
+                                    b, c, r,
+                                    assortStop.getOrElse(1.1f),
+                                    fragStop.getOrElse(false)
+                                ))
                                 case _ => None
                             }
                             val channelId = parseGeneratedRun(payload.data, config)
@@ -179,10 +186,17 @@ object Server {
                 }
             } ~ pathPrefix("custom") {
                 post {
-                    parameters("pBreak".as[Float].?, "pCreate".as[Float].?, "rewiring".as[Int].?) { (pBreak, pCreate, rewiring) =>
+                    parameters(
+                        "pBreak".as[Float].?, "pCreate".as[Float].?, "rewiring".as[Int].?,
+                        "assortStop".as[Float].?, "fragStop".as[Boolean].?
+                    ) { (pBreak, pCreate, rewiring, assortStop, fragStop) =>
                         entity(as[Payload]) { payload =>
                             val config = (pBreak, pCreate, rewiring) match {
-                                case (Some(b), Some(c), Some(r)) => Some(CoevolutionConfig(b, c, r))
+                                case (Some(b), Some(c), Some(r)) => Some(CoevolutionConfig(
+                                    b, c, r,
+                                    assortStop.getOrElse(1.1f),
+                                    fragStop.getOrElse(false)
+                                ))
                                 case _ => None
                             }
                             val channelId = parseCustomRun(payload.data, config)

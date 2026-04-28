@@ -9,7 +9,7 @@ import core.model.agent.behavior.silence.SilenceStrategies.SilenceStrategy
 import core.simulation.config.{AppMode, GlobalState}
 import io.db.DatabaseManager
 import io.web.Server
-import io.persistence.actors.{AgentStaticDataSaver, NeighborSaver}
+import io.persistence.actors.{AgentStaticDataSaver, NeighborSaver, NeighborStructure}
 import io.web.CustomRunInfo
 import utils.datastructures.{FenwickTree, UUIDS}
 import utils.logging.Logger
@@ -430,6 +430,7 @@ class Network(networkId: UUID, runMetadata: RunMetadata,
                       s"Belief diff: of ${maxBelief - minBelief} ($maxBelief - $minBelief)")
                     context.parent ! RunningComplete(networkId, round, 1)
                     if (runMetadata.saveMode.includesNetworks) DatabaseManager.updateNetworkFinalRound(networkId, round, true)
+                    saveTopologySnapshot(round)
                     if (runMetadata.saveMode.includesLastRound) agents.foreach { agent => agent ! SnapShotAgent }
                     
                     if (finishState == 0) context.stop(self)
@@ -440,6 +441,7 @@ class Network(networkId: UUID, runMetadata: RunMetadata,
                       s"Belief diff: of ${maxBelief - minBelief} ($maxBelief - $minBelief)")
                     context.parent ! RunningComplete(networkId, round, 0)
                     if (runMetadata.saveMode.includesNetworks) DatabaseManager.updateNetworkFinalRound(networkId, round, false)
+                    saveTopologySnapshot(round)
                     if (runMetadata.saveMode.includesLastRound) agents.foreach { agent => agent ! SnapShotAgent }
                     if (finishState == 0) context.stop(self)
                     finishedIterating = true
@@ -462,14 +464,42 @@ class Network(networkId: UUID, runMetadata: RunMetadata,
                             neighborsWeights = newWeights
                             neighborBiases = newBiases
 
+                            // --- STRUCTURAL CONVERGENCE METRICS ---
+                            val assort   = core.simulation.topology.ConvergenceMetrics.computeAssortativity(
+                                runMetadata.agentsPerNetwork, indexOffset, neighborsRefs, neighborsWeights, currentBeliefs)
+                            val sccCount = core.simulation.topology.ConvergenceMetrics.countSCC(
+                                runMetadata.agentsPerNetwork, indexOffset, neighborsRefs)
+                            val frag     = core.simulation.topology.ConvergenceMetrics.computeFragmentation(
+                                sccCount, runMetadata.agentsPerNetwork)
+                            Logger.log(s"[Coevolution] Round $round — Assortativity: $assort, Fragmentation: $frag (SCCs: $sccCount)")
+
+                            val assortTriggered = config.assortivityStopThreshold <= 1.0f &&
+                                !assort.isNaN && assort >= config.assortivityStopThreshold
+                            val fragTriggered   = config.fragmentationStop && frag > 0f
+
+                            if (assortTriggered || fragTriggered) {
+                                Logger.log(s"Structural convergence stop — r=$assort, Φ=$frag")
+                                context.parent ! RunningComplete(networkId, round, 0)
+                                if (runMetadata.saveMode.includesNetworks) DatabaseManager.updateNetworkFinalRound(networkId, round, false)
+                                saveTopologySnapshot(round)
+                                if (runMetadata.saveMode.includesLastRound) agents.foreach { agent => agent ! SnapShotAgent }
+                                if (finishState == 0) context.stop(self)
+                                finishedIterating = true
+                            } else {
+                                round += 1
+                                runRound()
+                                minBelief = 2.0
+                                maxBelief = -1.0
+                            }
+                            // ----------------------------------------
+
                         case None => // Static topology
+                            round += 1
+                            runRound()
+                            minBelief = 2.0
+                            maxBelief = -1.0
                     }
                     // ------------------------
-
-                    round += 1
-                    runRound()
-                    minBelief = 2.0
-                    maxBelief = -1.0
                 }
                 pendingResponses = agents.length
             }
@@ -490,6 +520,40 @@ class Network(networkId: UUID, runMetadata: RunMetadata,
         }
         shouldContinue = false
         bufferSwitch = !bufferSwitch
+    }
+
+    /**
+     * Persists a snapshot of the current CSR topology to the `neighbors` table, tagged with
+     * `roundNum` so that initial (round=0) and final topologies can be compared in R.
+     *
+     * Guards:
+     *   - Legacy DB mode only (agentsIds is null in the new-DB path)
+     *   - `includesNeighbors` SaveMode flag must be set
+     *   - Co-evolution must be active (static networks never change topology)
+     */
+    private def saveTopologySnapshot(roundNum: Int): Unit = {
+        if (!GlobalState.APP_MODE.usesLegacyDB) return
+        if (!runMetadata.saveMode.includesNeighbors) return
+        if (runMetadata.coevolutionConfig.isEmpty) return
+
+        val buffer = new scala.collection.mutable.ArrayBuffer[NeighborStructure](neighborsRefs.length)
+        var i = 0
+        while (i < runMetadata.agentsPerNetwork) {
+            val start = if (i == 0) 0 else indexOffset(i - 1)
+            val end   = indexOffset(i)
+            var k = start
+            while (k < end) {
+                buffer.addOne(NeighborStructure(
+                    agentsIds(i),
+                    agentsIds(neighborsRefs(k)),
+                    neighborsWeights(k),
+                    neighborBiases(k)
+                ))
+                k += 1
+            }
+            i += 1
+        }
+        DatabaseManager.insertNeighborsBatch(buffer, roundNum)
     }
     
     
