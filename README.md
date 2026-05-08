@@ -51,32 +51,139 @@ Each agent can also have a different cognitive bias for each neighbor.
 
 ## Prerequisites
 
-- Java JDK 17 or higher
-- Scala 3 or higher
-- SBT (Scala Build Tool) 1.5.x or higher
-- PostgreSQL 17+ (for storing simulation results)
+- [Docker](https://docs.docker.com/get-docker/) and [Docker Compose](https://docs.docker.com/compose/install/) (v2 recommended)
+- A [Firebase](https://firebase.google.com/) project with **Authentication** enabled
+- The Firebase service account JSON downloaded from **Firebase Console → Project Settings → Service Accounts → Generate new private key**
 
-## Setup
+## Setup with Docker
 
-1. Clone the repository:
-   ```bash
-   git clone https://github.com/YOUR_USERNAME/spiral-of-silence.git
-   cd spiral-of-silence
-   ```
+### 1. Clone the repository
 
-2. Configure the database connection in `src/main/resources/application.conf`:
-   ```hocon
-   database {
-     url = "jdbc:postgresql://localhost:5432/your_database"
-     user = "your_username"
-     password = "your_password"
-   }
-   ```
+```bash
+git clone https://github.com/YOUR_USERNAME/belief_evolution_simulator.git
+cd belief_evolution_simulator
+```
 
-3. Build the project:
-   ```bash
-   sbt compile
-   ```
+### 2. Create the `.env` file
+
+Copy the template below into a file named `.env` at the project root and fill in the values marked with `<...>`:
+
+```dotenv
+# ── PostgreSQL ────────────────────────────────────────────────────────────────
+POSTGRES_DB=promueva
+POSTGRES_USER=postgres
+POSTGRES_PASSWORD=<choose-a-strong-password>
+
+POSTGRES_DB_LEGACY=promueva_legacy
+POSTGRES_USER_LEGACY=postgres
+POSTGRES_PASSWORD_LEGACY=<choose-a-strong-password>
+
+# ── Backend → DB ──────────────────────────────────────────────────────────────
+DB_HOST=postgres
+DB_PORT=5432
+DB_HOST_LEGACY=postgres
+DB_PORT_LEGACY=5432
+
+# ── Server ────────────────────────────────────────────────────────────────────
+SERVER_HOST=0.0.0.0
+SERVER_PORT=9000
+
+# ── App flags ─────────────────────────────────────────────────────────────────
+APP_SKIP_DATABASE=false
+APP_SERVER_MODE=true
+APP_LOCAL_MODE=false
+APP_LEGACY_DB=false
+APP_SERVER_LOGS=false
+APP_GENERAL_LOGS=true
+APP_SIMULATION_LOGS=false
+APP_SKIP_WS=false
+
+# ── Firebase ──────────────────────────────────────────────────────────────────
+# Path of the service account JSON inside the container (keep as-is)
+GOOGLE_APPLICATION_CREDENTIALS=/secrets/firebase-sa.json
+
+# Your Firebase project ID (Firebase Console → Project Settings → General)
+FIREBASE_PROJECT_ID=<your-firebase-project-id>
+
+# ── Bootstrap admin ───────────────────────────────────────────────────────────
+# Comma-separated list of emails that get the Administrator role automatically
+# on first login. Add at least your own email here.
+BOOTSTRAP_ADMIN_EMAILS=<your-email@domain.com>
+
+# ── Firebase service account on the HOST machine ──────────────────────────────
+# Absolute path to the JSON file you downloaded from Firebase Console.
+FIREBASE_SA_HOST_PATH=/absolute/path/to/firebase-sa.json
+```
+
+### 3. Fix the Firebase volume mount in `docker-compose.yml`
+
+The `backend` service mounts the service account file. Update the `volumes` entry to use `FIREBASE_SA_HOST_PATH`:
+
+```yaml
+    volumes:
+      - ${FIREBASE_SA_HOST_PATH}:/secrets/firebase-sa.json:ro
+```
+
+> If `docker-compose.yml` still has a hard-coded path (e.g. `/home/krud3/secrets/...`), replace it with the line above.
+
+### 4. Build and start the stack
+
+```bash
+docker-compose down          # stop any old containers first
+docker-compose build         # compile the Scala app (takes ~2-5 min on first run)
+docker-compose up -d         # start postgres + backend in the background
+```
+
+Watch the logs to confirm startup:
+
+```bash
+docker-compose logs -f backend
+# Expected output:
+#   [info] done compiling
+#   [info] Server online at http://0:0:0:0:0:0:0:0:9000/
+```
+
+### 5. Database migrations
+
+Migrations run **automatically** on every startup. The init script applies:
+
+| File | What it does |
+|---|---|
+| `db/init/schema.sql` | Creates all tables for the main DB |
+| `db/init/legacy_schema.sql` | Creates tables for the legacy DB |
+| `db/init/migrations/*.sql` | Incremental changes (auth schema, usage tracking, …) — all idempotent |
+
+No manual step is needed.
+
+### 6. Create the first admin user
+
+The server uses Firebase Authentication for all protected endpoints. To get an ID token:
+
+1. In your Firebase project, enable the **Email/Password** sign-in provider (or Google, etc.).
+2. Create a user in **Firebase Console → Authentication → Users**, or register via the Firebase client SDK.
+3. Obtain an ID token for that user (see [Firebase REST API](https://firebase.google.com/docs/reference/rest/auth#section-sign-in-email-password) or use the Firebase JS/Android/iOS SDK).
+
+Once you have the token, call `POST /api/users/sync` — this registers the user in the local DB and, if the email is in `BOOTSTRAP_ADMIN_EMAILS`, automatically grants the **Administrator** role:
+
+```bash
+TOKEN="<firebase-id-token>"
+curl -s -X POST http://localhost:9000/api/users/sync \
+  -H "Authorization: Bearer $TOKEN"
+```
+
+You only need to do this once per user. Subsequent logins auto-upsert the user record.
+
+### 7. Explore the API
+
+Interactive API docs (Swagger UI) are available at:
+
+```
+http://localhost:9000/docs
+```
+
+The raw OpenAPI spec is at `http://localhost:9000/openapi.yaml`.
+
+---
 
 ## Running Simulations
 
@@ -149,7 +256,6 @@ If you use this simulator in your research, please cite our paper:
 
 ## Future Plans
 
-- Docker Compose integration for easier setup and deployment
 - Web-based visualization of simulation results
 - Additional network topologies
 

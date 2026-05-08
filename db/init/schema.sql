@@ -240,7 +240,7 @@ $$
     BEGIN
         IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'generated_run_agent_type_distribution_pkey') THEN
             ALTER TABLE public.agent_type_distributions
-                ADD CONSTRAINT generated_run_agent_type_distribution_pkey PRIMARY KEY (run_id);
+                ADD CONSTRAINT generated_run_agent_type_distribution_pkey PRIMARY KEY (run_id, silence_strategy, silence_effect);
         END IF;
     END
 $$;

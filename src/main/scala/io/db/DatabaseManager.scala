@@ -152,7 +152,8 @@ object DatabaseManager {
     def saveGeneratedRun(id: Long, seed: Long, density: Int, iterationLimit: Int,
         totalNetworks: Int, agentsPerNetwork: Int, stopThreshold: Float,
         agentTypeDistributions: Array[(SilenceStrategy, SilenceEffect, Int)],
-        cognitiveBiasDistributions: Array[(Bias, Int)]): Unit = {
+        cognitiveBiasDistributions: Array[(Bias, Int)],
+        userId: Option[Int] = None): Unit = {
         if (GlobalState.APP_MODE.skipDatabase) return
         val connection = getConnection
         try {
@@ -160,10 +161,10 @@ object DatabaseManager {
             val generatedRunsQuery =
                 """
                 INSERT INTO generated_runs (id, seed, density, iteration_limit, total_networks,
-                                           agents_per_network, stop_threshold)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
+                                           agents_per_network, stop_threshold, user_id)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 """
-            
+
             val generatedRunsStmt = connection.prepareStatement(generatedRunsQuery)
             generatedRunsStmt.setLong(1, id)
             generatedRunsStmt.setLong(2, seed)
@@ -172,6 +173,10 @@ object DatabaseManager {
             generatedRunsStmt.setInt(5, totalNetworks)
             generatedRunsStmt.setInt(6, agentsPerNetwork)
             generatedRunsStmt.setFloat(7, stopThreshold)
+            userId match {
+                case Some(uid) => generatedRunsStmt.setInt(8, uid)
+                case None      => generatedRunsStmt.setNull(8, java.sql.Types.INTEGER)
+            }
             generatedRunsStmt.executeUpdate()
             
             val agentTypeQuery =
@@ -232,23 +237,28 @@ object DatabaseManager {
      * @param customNeighborsData Container with network topology and influence data
      */
     def saveCustomRun(id: Long, iterationLimit: Int, stopThreshold: Float, runName: String,
-        customAgentsData: CustomAgentsData, customNeighborsData: CustomNeighborsData): Unit = {
+        customAgentsData: CustomAgentsData, customNeighborsData: CustomNeighborsData,
+        userId: Option[Int] = None): Unit = {
         if (GlobalState.APP_MODE.skipDatabase) return
         val connection = getConnection
         try {
             connection.setAutoCommit(false)
-            
+
             val customRunsQuery =
                 """
-                  |INSERT INTO custom_runs (id, iteration_limit, stop_threshold, run_name)
-                  |values (?, ?, ?, ?)
+                  |INSERT INTO custom_runs (id, iteration_limit, stop_threshold, run_name, user_id)
+                  |values (?, ?, ?, ?, ?)
                   |""".stripMargin
-            
+
             val customRunsStmt: PreparedStatement = connection.prepareStatement(customRunsQuery)
             customRunsStmt.setLong(1, id)
             customRunsStmt.setInt(2, iterationLimit)
             customRunsStmt.setFloat(3, stopThreshold)
             customRunsStmt.setString(4, runName)
+            userId match {
+                case Some(uid) => customRunsStmt.setInt(5, uid)
+                case None      => customRunsStmt.setNull(5, java.sql.Types.INTEGER)
+            }
             customRunsStmt.executeUpdate()
             
             val customAgentsQuery =
@@ -355,124 +365,194 @@ object DatabaseManager {
         }
     }
     
+    // ============================================================================
+    // USER MANAGEMENT
+    // ============================================================================
+
     case class UserData(
-        id: Long,
+        id: Int,
         firebaseUid: String,
         email: String,
         name: String,
-        role: String,
-        isActive: Boolean,
+        photo: Option[String],
+        roles: Seq[String],
+        deactivated: Boolean,
         createdAt: String,
         updatedAt: String
     )
-    
-    def createOrUpdateUser(firebaseUid: String, email: String, name: String, role: String = "Guest"): Option[UserData] = {
+
+    case class UsageLimits(maxAgents: Int, maxIterations: Int, densityFactor: Double)
+
+    private val ROLE_PRIORITY: Map[String, Int] = Map(
+        "Administrator" -> 3, "Researcher" -> 2, "BaseUser" -> 1, "Guest" -> 0
+    )
+
+    def getUsageLimits(roles: Seq[String]): UsageLimits = {
+        val top = roles.maxByOption(ROLE_PRIORITY.getOrElse(_, 0)).getOrElse("Guest")
+        top match {
+            case "Administrator" => UsageLimits(Int.MaxValue, Int.MaxValue, 1.0)
+            case "Researcher"    => UsageLimits(1000, 1000, 0.75)
+            case "BaseUser"      => UsageLimits(100, 100, 0.5)
+            case _               => UsageLimits(10, 10, 0.5)
+        }
+    }
+
+    def createOrUpdateUser(firebaseUid: String, email: String, name: String,
+                           photo: Option[String]): Option[UserData] = {
         val connection = getConnection
         try {
             val sql =
                 """
-                       INSERT INTO users (firebase_uid, email, name, role, created_at, updated_at, is_active)
-                       VALUES (?::uuid, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, true)
-                       ON CONFLICT (firebase_uid)
-                       DO UPDATE SET
-                           email = EXCLUDED.email,
-                           name = EXCLUDED.name,
-                           updated_at = CURRENT_TIMESTAMP
-                       RETURNING id, firebase_uid, created_at, updated_at, role, email, name, is_active
-                   """
-            
+                  INSERT INTO users (firebase_uid, email, name, photo, created_at, updated_at, deactivated)
+                  VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, false)
+                  ON CONFLICT (firebase_uid)
+                  DO UPDATE SET
+                      email      = EXCLUDED.email,
+                      name       = EXCLUDED.name,
+                      photo      = COALESCE(EXCLUDED.photo, users.photo),
+                      updated_at = CURRENT_TIMESTAMP
+                  RETURNING id, firebase_uid, email, name, photo, deactivated, created_at, updated_at
+                """
             val stmt = connection.prepareStatement(sql)
             stmt.setString(1, firebaseUid)
             stmt.setString(2, email)
             stmt.setString(3, name)
-            stmt.setString(4, role)
-            
-            val resultSet = stmt.executeQuery()
-            
-            if (resultSet.next()) {
-                Some(UserData(
-                    id = resultSet.getLong("id"),
-                    firebaseUid = resultSet.getString("firebase_uid"),
-                    email = resultSet.getString("email"),
-                    name = resultSet.getString("name"),
-                    role = resultSet.getString("role"),
-                    isActive = resultSet.getBoolean("is_active"),
-                    createdAt = resultSet.getTimestamp("created_at").toString,
-                    updatedAt = resultSet.getTimestamp("updated_at").toString
-                ))
-            } else {
-                None
+            photo match {
+                case Some(p) => stmt.setString(4, p)
+                case None    => stmt.setNull(4, java.sql.Types.VARCHAR)
             }
+
+            val rs = stmt.executeQuery()
+            if (rs.next()) {
+                val userId = rs.getInt("id")
+                ensureHasRole(connection, userId, "Guest")
+                val roles = loadUserRoles(userId, connection)
+                Some(UserData(
+                    id          = userId,
+                    firebaseUid = rs.getString("firebase_uid"),
+                    email       = rs.getString("email"),
+                    name        = rs.getString("name"),
+                    photo       = Option(rs.getString("photo")),
+                    roles       = roles,
+                    deactivated = rs.getBoolean("deactivated"),
+                    createdAt   = rs.getTimestamp("created_at").toString,
+                    updatedAt   = rs.getTimestamp("updated_at").toString
+                ))
+            } else None
         } catch {
             case ex: Exception =>
-                println(s"Error creating/updating user: ${ex.getMessage}")
+                Logger.logError(s"Error creating/updating user: ${ex.getMessage}")
                 None
         } finally {
             connection.close()
         }
     }
-    
+
     def getUserByFirebaseUid(firebaseUid: String): Option[UserData] = {
         val connection = getConnection
         try {
             val sql =
                 """
-                       SELECT id, firebase_uid, created_at, updated_at, role, email, name, is_active
-                       FROM users
-                       WHERE firebase_uid = ?::uuid
-                   """
-            
+                  SELECT u.id, u.firebase_uid, u.email, u.name, u.photo,
+                         u.deactivated, u.created_at, u.updated_at,
+                         COALESCE(
+                             array_agg(r.role::text) FILTER (WHERE r.role IS NOT NULL),
+                             '{}'::text[]
+                         ) AS roles
+                  FROM users u
+                  LEFT JOIN user_roles r ON r.user_id = u.id
+                  WHERE u.firebase_uid = ?
+                  GROUP BY u.id
+                """
             val stmt = connection.prepareStatement(sql)
             stmt.setString(1, firebaseUid)
-            
-            val resultSet = stmt.executeQuery()
-            
-            if (resultSet.next()) {
+            val rs = stmt.executeQuery()
+            if (rs.next()) {
+                val rolesArr = rs.getArray("roles")
+                val roles = if (rolesArr != null)
+                    rolesArr.getArray.asInstanceOf[Array[Object]].map(_.toString).toSeq
+                else Seq("Guest")
                 Some(UserData(
-                    id = resultSet.getLong("id"),
-                    firebaseUid = resultSet.getString("firebase_uid"),
-                    email = resultSet.getString("email"),
-                    name = resultSet.getString("name"),
-                    role = resultSet.getString("role"),
-                    isActive = resultSet.getBoolean("is_active"),
-                    createdAt = resultSet.getTimestamp("created_at").toString,
-                    updatedAt = resultSet.getTimestamp("updated_at").toString
+                    id          = rs.getInt("id"),
+                    firebaseUid = rs.getString("firebase_uid"),
+                    email       = rs.getString("email"),
+                    name        = rs.getString("name"),
+                    photo       = Option(rs.getString("photo")),
+                    roles       = roles,
+                    deactivated = rs.getBoolean("deactivated"),
+                    createdAt   = rs.getTimestamp("created_at").toString,
+                    updatedAt   = rs.getTimestamp("updated_at").toString
                 ))
-            } else {
-                None
-            }
+            } else None
         } catch {
             case ex: Exception =>
-                println(s"Error getting user: ${ex.getMessage}")
+                Logger.logError(s"Error getting user: ${ex.getMessage}")
                 None
         } finally {
             connection.close()
         }
     }
-    
-    def updateUserRole(firebaseUid: String, newRole: String): Boolean = {
+
+    def addUserRole(firebaseUid: String, role: String): Boolean = {
         val connection = getConnection
         try {
             val sql =
                 """
-                       UPDATE users
-                       SET role = ?, updated_at = CURRENT_TIMESTAMP
-                       WHERE firebase_uid = ?::uuid
-                   """
-            
+                  INSERT INTO user_roles (user_id, role)
+                  SELECT id, ?::public.user_role FROM users WHERE firebase_uid = ?
+                  ON CONFLICT DO NOTHING
+                """
             val stmt = connection.prepareStatement(sql)
-            stmt.setString(1, newRole)
+            stmt.setString(1, role)
             stmt.setString(2, firebaseUid)
-            
-            val rowsAffected = stmt.executeUpdate()
-            rowsAffected > 0
+            stmt.executeUpdate() >= 0
         } catch {
             case ex: Exception =>
-                println(s"Error updating user role: ${ex.getMessage}")
+                Logger.logError(s"Error adding role: ${ex.getMessage}")
                 false
         } finally {
             connection.close()
         }
+    }
+
+    def removeUserRole(firebaseUid: String, role: String): Boolean = {
+        val connection = getConnection
+        try {
+            val sql =
+                """
+                  DELETE FROM user_roles
+                  WHERE user_id = (SELECT id FROM users WHERE firebase_uid = ?)
+                    AND role = ?::public.user_role
+                """
+            val stmt = connection.prepareStatement(sql)
+            stmt.setString(1, firebaseUid)
+            stmt.setString(2, role)
+            stmt.executeUpdate() > 0
+        } catch {
+            case ex: Exception =>
+                Logger.logError(s"Error removing role: ${ex.getMessage}")
+                false
+        } finally {
+            connection.close()
+        }
+    }
+
+    private def ensureHasRole(conn: Connection, userId: Int, role: String): Unit = {
+        val stmt = conn.prepareStatement(
+            "INSERT INTO user_roles (user_id, role) VALUES (?, ?::public.user_role) ON CONFLICT DO NOTHING"
+        )
+        stmt.setInt(1, userId)
+        stmt.setString(2, role)
+        stmt.executeUpdate()
+    }
+
+    private def loadUserRoles(userId: Int, conn: Connection): Seq[String] = {
+        val stmt = conn.prepareStatement("SELECT role::text FROM user_roles WHERE user_id = ?")
+        stmt.setInt(1, userId)
+        val rs = stmt.executeQuery()
+        val buf = mutable.ArrayBuffer[String]()
+        while (rs.next()) buf += rs.getString(1)
+        buf.toSeq
     }
     
     /**
@@ -1288,5 +1368,196 @@ object DatabaseManager {
             writer.close()
         }
     }
-    
+
+    // ============================================================================
+    // SIMULATION LISTING
+    // ============================================================================
+
+    private val snowflakeEpoch = 1704067200000L // 2024-01-01T00:00:00Z
+
+    private def snowflakeToIso(id: Long): String = {
+        val ms = (id >> 22) + snowflakeEpoch
+        java.time.Instant.ofEpochMilli(ms).toString
+    }
+
+    case class RunSummary(
+        id: Long,
+        runType: String,
+        name: Option[String],
+        networkCount: Int,
+        iterationLimit: Int,
+        stopThreshold: Float,
+        createdAt: String,
+        userId: Option[Int],
+        status: String
+    )
+
+    private def queryRuns(userClause: String, limit: Int, offset: Int, params: Seq[Any]): Seq[RunSummary] = {
+        val conn = getConnection
+        try {
+            val sql =
+                s"""
+                   |SELECT id, 'generated' AS run_type, NULL AS name,
+                   |       total_networks AS network_count, iteration_limit, stop_threshold, user_id, status::text AS status
+                   |FROM generated_runs $userClause
+                   |UNION ALL
+                   |SELECT id, 'custom' AS run_type, run_name AS name,
+                   |       1 AS network_count, iteration_limit, stop_threshold, user_id, status::text AS status
+                   |FROM custom_runs $userClause
+                   |ORDER BY id DESC
+                   |LIMIT ? OFFSET ?
+                   |""".stripMargin
+            val stmt = conn.prepareStatement(sql)
+            var idx = 1
+            params.foreach {
+                case v: Int  => stmt.setInt(idx, v);  idx += 1
+                case v: Long => stmt.setLong(idx, v); idx += 1
+            }
+            // Two UNION halves, each needs the same params
+            params.foreach {
+                case v: Int  => stmt.setInt(idx, v);  idx += 1
+                case v: Long => stmt.setLong(idx, v); idx += 1
+            }
+            stmt.setInt(idx, limit);     idx += 1
+            stmt.setInt(idx, offset)
+            val rs = stmt.executeQuery()
+            val buf = scala.collection.mutable.ArrayBuffer[RunSummary]()
+            while (rs.next()) {
+                buf += RunSummary(
+                    id           = rs.getLong("id"),
+                    runType      = rs.getString("run_type"),
+                    name         = Option(rs.getString("name")),
+                    networkCount = rs.getInt("network_count"),
+                    iterationLimit = rs.getInt("iteration_limit"),
+                    stopThreshold  = rs.getFloat("stop_threshold"),
+                    createdAt    = snowflakeToIso(rs.getLong("id")),
+                    userId       = Option(rs.getObject("user_id")).map(_.toString.toInt),
+                    status       = rs.getString("status")
+                )
+            }
+            buf.toSeq
+        } catch {
+            case ex: Exception =>
+                Logger.logError(s"queryRuns failed: ${ex.getMessage}")
+                Seq.empty
+        } finally {
+            conn.close()
+        }
+    }
+
+    def getRunsForUser(userId: Int, limit: Int, offset: Int): Seq[RunSummary] =
+        queryRuns("WHERE user_id = ?", limit, offset, Seq(userId))
+
+    def getAllRuns(limit: Int, offset: Int): Seq[RunSummary] =
+        queryRuns("", limit, offset, Seq.empty)
+
+    def getRunOwner(runId: Long): Option[Int] = {
+        val conn = getConnection
+        try {
+            val sql =
+                """
+                  |SELECT user_id FROM generated_runs WHERE id = ?
+                  |UNION ALL
+                  |SELECT user_id FROM custom_runs WHERE id = ?
+                  |LIMIT 1
+                  |""".stripMargin
+            val stmt = conn.prepareStatement(sql)
+            stmt.setLong(1, runId)
+            stmt.setLong(2, runId)
+            val rs = stmt.executeQuery()
+            if (rs.next()) Option(rs.getObject("user_id")).map(_.toString.toInt)
+            else None
+        } catch {
+            case ex: Exception =>
+                Logger.logError(s"getRunOwner failed: ${ex.getMessage}")
+                None
+        } finally {
+            conn.close()
+        }
+    }
+
+    def logLegacyUsage(endpoint: String, userId: Option[Int], userAgent: Option[String], ip: Option[String]): Unit = {
+        val conn = getConnection
+        try {
+            val sql = "INSERT INTO public.legacy_endpoint_usage(endpoint, user_id, user_agent, ip) VALUES (?, ?, ?, ?::inet)"
+            val stmt = conn.prepareStatement(sql)
+            stmt.setString(1, endpoint)
+            userId match { case Some(id) => stmt.setInt(2, id); case None => stmt.setNull(2, java.sql.Types.BIGINT) }
+            userAgent match { case Some(ua) => stmt.setString(3, ua); case None => stmt.setNull(3, java.sql.Types.VARCHAR) }
+            ip match { case Some(addr) => stmt.setString(4, addr); case None => stmt.setNull(4, java.sql.Types.OTHER) }
+            stmt.executeUpdate()
+        } catch {
+            case ex: Exception => Logger.logError(s"logLegacyUsage failed: ${ex.getMessage}")
+        } finally {
+            conn.close()
+        }
+    }
+
+    def getRunSummary(runId: Long): Option[RunSummary] = {
+        val conn = getConnection
+        try {
+            val sql =
+                """
+                  |SELECT id, 'generated' AS run_type, NULL AS name,
+                  |       total_networks AS network_count, iteration_limit, stop_threshold, user_id, status::text AS status
+                  |FROM generated_runs WHERE id = ?
+                  |UNION ALL
+                  |SELECT id, 'custom' AS run_type, run_name AS name,
+                  |       1 AS network_count, iteration_limit, stop_threshold, user_id, status::text AS status
+                  |FROM custom_runs WHERE id = ?
+                  |LIMIT 1
+                  |""".stripMargin
+            val stmt = conn.prepareStatement(sql)
+            stmt.setLong(1, runId)
+            stmt.setLong(2, runId)
+            val rs = stmt.executeQuery()
+            if (rs.next()) Some(RunSummary(
+                id             = rs.getLong("id"),
+                runType        = rs.getString("run_type"),
+                name           = Option(rs.getString("name")),
+                networkCount   = rs.getInt("network_count"),
+                iterationLimit = rs.getInt("iteration_limit"),
+                stopThreshold  = rs.getFloat("stop_threshold"),
+                createdAt      = snowflakeToIso(rs.getLong("id")),
+                userId         = Option(rs.getObject("user_id")).map(_.toString.toInt),
+                status         = rs.getString("status")
+            ))
+            else None
+        } catch {
+            case ex: Exception =>
+                Logger.logError(s"getRunSummary failed: ${ex.getMessage}")
+                None
+        } finally {
+            conn.close()
+        }
+    }
+
+    def setRunStatus(runId: Long, status: String): Boolean = {
+        if (GlobalState.APP_MODE.skipDatabase) return false
+        val conn = getConnection
+        try {
+            val updateGenerated = conn.prepareStatement(
+                "UPDATE generated_runs SET status = ?::run_status WHERE id = ?"
+            )
+            updateGenerated.setString(1, status)
+            updateGenerated.setLong(2, runId)
+            val genRows = updateGenerated.executeUpdate()
+
+            val updateCustom = conn.prepareStatement(
+                "UPDATE custom_runs SET status = ?::run_status WHERE id = ?"
+            )
+            updateCustom.setString(1, status)
+            updateCustom.setLong(2, runId)
+            val customRows = updateCustom.executeUpdate()
+
+            (genRows + customRows) > 0
+        } catch {
+            case ex: Exception =>
+                Logger.logError(s"setRunStatus($runId, $status) failed: ${ex.getMessage}")
+                false
+        } finally {
+            conn.close()
+        }
+    }
+
 }

@@ -8,9 +8,8 @@ import core.model.agent.behavior.silence.SilenceEffects.SilenceEffect
 import core.model.agent.behavior.silence.SilenceStrategies.SilenceStrategy
 import core.simulation.config.{AppMode, GlobalState}
 import io.db.DatabaseManager
-import io.web.Server
+import io.web.{CustomRunInfo, ResultsSnapshot, Server, SimulationCache, TopologySnapshot}
 import io.persistence.actors.{AgentStaticDataSaver, NeighborSaver, NeighborStructure}
-import io.web.CustomRunInfo
 import utils.datastructures.{FenwickTree, UUIDS}
 import utils.logging.Logger
 import utils.rng.distributions.BimodalDistribution
@@ -405,7 +404,14 @@ class Network(networkId: UUID, runMetadata: RunMetadata,
             if (pendingResponses == 0) {
                 logAgentRoundState()
                 round += 1
-                if (!GlobalState.APP_MODE.skipWS) sendNeighbors()
+                SimulationCache.storeTopology(runMetadata.runID, networkId.toString, buildTopologySnapshot())
+                if (!GlobalState.APP_MODE.skipWS) {
+                    sendNeighbors()
+                    Server.sendControlEvent(runMetadata.channelId,
+                        s"""{"event":"topology_ready","runId":"${runMetadata.runID}","networkId":"$networkId"}""")
+                }
+                Server.sendControlEvent(runMetadata.channelId,
+                    s"""{"event":"network_started","runId":"${runMetadata.runID}","networkId":"$networkId"}""")
                 runRound()
                 pendingResponses = agents.length
             }
@@ -428,20 +434,32 @@ class Network(networkId: UUID, runMetadata: RunMetadata,
                 if ((maxBelief - minBelief) < runMetadata.stopThreshold) {
                     Logger.log(s"Consensus! \nFinal round: $round\n" +
                       s"Belief diff: of ${maxBelief - minBelief} ($maxBelief - $minBelief)")
+                    SimulationCache.storeResults(runMetadata.runID, networkId.toString, buildResultsSnapshot(round, consensus = true))
                     context.parent ! RunningComplete(networkId, round, 1)
+                    Server.sendControlEvent(runMetadata.channelId,
+                        s"""{"event":"network_converged","runId":"${runMetadata.runID}","networkId":"$networkId","round":$round,"consensus":true}""")
                     if (runMetadata.saveMode.includesNetworks) DatabaseManager.updateNetworkFinalRound(networkId, round, true)
                     saveTopologySnapshot(round)
+                    SimulationCache.storeFinalTopology(runMetadata.runID, networkId.toString, buildTopologySnapshot())
+                    Server.sendControlEvent(runMetadata.channelId,
+                        s"""{"event":"final_topology_ready","runId":"${runMetadata.runID}","networkId":"$networkId","round":$round}""")
                     if (runMetadata.saveMode.includesLastRound) agents.foreach { agent => agent ! SnapShotAgent }
-                    
+
                     if (finishState == 0) context.stop(self)
                     finishedIterating = true
                 }
                 else if (round == runMetadata.iterationLimit || !shouldContinue) {
                     Logger.log(s"Dissensus \nFinal round: $round\n" +
                       s"Belief diff: of ${maxBelief - minBelief} ($maxBelief - $minBelief)")
+                    SimulationCache.storeResults(runMetadata.runID, networkId.toString, buildResultsSnapshot(round, consensus = false))
                     context.parent ! RunningComplete(networkId, round, 0)
+                    Server.sendControlEvent(runMetadata.channelId,
+                        s"""{"event":"network_converged","runId":"${runMetadata.runID}","networkId":"$networkId","round":$round,"consensus":false}""")
                     if (runMetadata.saveMode.includesNetworks) DatabaseManager.updateNetworkFinalRound(networkId, round, false)
                     saveTopologySnapshot(round)
+                    SimulationCache.storeFinalTopology(runMetadata.runID, networkId.toString, buildTopologySnapshot())
+                    Server.sendControlEvent(runMetadata.channelId,
+                        s"""{"event":"final_topology_ready","runId":"${runMetadata.runID}","networkId":"$networkId","round":$round}""")
                     if (runMetadata.saveMode.includesLastRound) agents.foreach { agent => agent ! SnapShotAgent }
                     if (finishState == 0) context.stop(self)
                     finishedIterating = true
@@ -479,9 +497,15 @@ class Network(networkId: UUID, runMetadata: RunMetadata,
 
                             if (assortTriggered || fragTriggered) {
                                 Logger.log(s"Structural convergence stop — r=$assort, Φ=$frag")
+                                SimulationCache.storeResults(runMetadata.runID, networkId.toString, buildResultsSnapshot(round, consensus = false))
                                 context.parent ! RunningComplete(networkId, round, 0)
+                                Server.sendControlEvent(runMetadata.channelId,
+                                    s"""{"event":"network_converged","runId":"${runMetadata.runID}","networkId":"$networkId","round":$round,"consensus":false,"structural":true}""")
                                 if (runMetadata.saveMode.includesNetworks) DatabaseManager.updateNetworkFinalRound(networkId, round, false)
                                 saveTopologySnapshot(round)
+                                SimulationCache.storeFinalTopology(runMetadata.runID, networkId.toString, buildTopologySnapshot())
+                                Server.sendControlEvent(runMetadata.channelId,
+                                    s"""{"event":"final_topology_ready","runId":"${runMetadata.runID}","networkId":"$networkId","round":$round}""")
                                 if (runMetadata.saveMode.includesLastRound) agents.foreach { agent => agent ! SnapShotAgent }
                                 if (finishState == 0) context.stop(self)
                                 finishedIterating = true
@@ -743,5 +767,33 @@ class Network(networkId: UUID, runMetadata: RunMetadata,
             case e: Exception =>
                 Logger.logError(s"Unexpected error while exporting neighbor data to '$filePath': ${e.getMessage}")
         }
+    }
+
+    private def buildTopologySnapshot(): TopologySnapshot =
+        TopologySnapshot(
+            agentCount        = indexOffset.length,
+            edgeCount         = if (neighborsRefs != null) neighborsRefs.length else 0,
+            names             = if (names != null) names.clone() else null,
+            initialBeliefs    = beliefBuffer1.clone(),
+            tolRadius         = tolRadius.clone(),
+            tolOffset         = tolOffset.clone(),
+            silenceStrategies = silenceStrategy.asInstanceOf[Array[Byte]].clone(),
+            silenceEffects    = silenceEffect.asInstanceOf[Array[Byte]].clone(),
+            indexOffset       = indexOffset.clone(),
+            neighborsRefs     = if (neighborsRefs != null) neighborsRefs.clone() else Array.emptyIntArray,
+            neighborsWeights  = if (neighborsWeights != null) neighborsWeights.clone() else Array.emptyFloatArray,
+            neighborBiases    = if (neighborBiases != null) neighborBiases.asInstanceOf[Array[Byte]].clone() else Array.emptyByteArray
+        )
+
+    private def buildResultsSnapshot(finalRound: Int, consensus: Boolean): ResultsSnapshot = {
+        val pub = if (bufferSwitch) beliefBuffer2 else beliefBuffer1
+        ResultsSnapshot(
+            finalRound    = finalRound,
+            consensus     = consensus,
+            agentCount    = indexOffset.length,
+            names         = if (names != null) names.clone() else null,
+            finalBeliefs  = privateBeliefs.clone(),
+            publicBeliefs = pub.clone()
+        )
     }
 }

@@ -2,10 +2,10 @@ package io.web
 
 import akka.actor.{ActorRef, ActorSystem}
 import akka.http.scaladsl.Http
-import akka.http.scaladsl.model.HttpMethods.{GET, OPTIONS, POST}
+import akka.http.scaladsl.model.HttpMethods.{DELETE, GET, OPTIONS, POST, PUT}
 import akka.http.scaladsl.model.headers.*
 import akka.http.scaladsl.model.ws.{BinaryMessage, Message}
-import akka.http.scaladsl.model.{ContentTypes, HttpEntity, HttpResponse, StatusCodes}
+import akka.http.scaladsl.model.{ContentType, ContentTypes, HttpCharsets, HttpEntity, HttpResponse, MediaType, MediaTypes, StatusCodes}
 import akka.http.scaladsl.server.Directives.*
 import akka.http.scaladsl.server.{Directive0, Route}
 import akka.http.scaladsl.unmarshalling.{FromEntityUnmarshaller, Unmarshaller}
@@ -18,17 +18,73 @@ import core.model.agent.behavior.bias.CognitiveBiases.Bias
 import core.model.agent.behavior.silence.SilenceEffects.SilenceEffect
 import core.model.agent.behavior.silence.{SilenceEffects, SilenceStrategies}
 import core.model.agent.behavior.silence.SilenceStrategies.SilenceStrategy
-import core.simulation.actors.{AddNetworks, CoevolutionConfig, RunCustomNetwork}
+import core.simulation.actors.{AddNetworks, CancelRun, CoevolutionConfig, RunCustomNetwork}
 import core.simulation.config.*
 import core.simulation.config.SaveModes.SaveMode
 import utils.logging.Logger
 import io.db.DatabaseManager
+import io.web.auth.ErrorResponses.*
+import io.web.auth.FirebaseAuthDirective.*
 import utils.datastructures.SnowflakeID
 import utils.rng.distributions.Uniform
+import spray.json.*
+import DefaultJsonProtocol.*
 
 import java.nio.{ByteBuffer, ByteOrder}
 import scala.collection.mutable
 import scala.concurrent.{ExecutionContext, ExecutionContextExecutor}
+
+// ── JSON shapes for /simulations/* requests ──────────────────────────────────
+
+case class AgentTypeReq(silenceStrategy: Int, silenceEffect: Int, count: Int)
+case class BiasTypeReq(biasType: Int, count: Int)
+case class CoevolutionReq(
+    pBreak: Float,
+    pCreate: Float,
+    rewiringStrategy: Int,
+    assortStop: Option[Float] = None,
+    fragStop: Option[Boolean] = None
+)
+case class GeneratedRunReq(
+    numberOfNetworks: Int,
+    density: Int,
+    iterationLimit: Int,
+    stopThreshold: Float,
+    seed: Option[Long],
+    saveMode: Int,
+    agentTypes: Seq[AgentTypeReq],
+    biasTypes: Seq[BiasTypeReq],
+    coevolution: Option[CoevolutionReq] = None
+)
+
+case class AgentReq(
+    name: String,
+    belief: Float,
+    toleranceRadius: Float,
+    toleranceOffset: Float,
+    silenceStrategy: Int,
+    silenceEffect: Int
+)
+case class EdgeReq(source: String, target: String, influence: Float, bias: Int)
+case class CustomRunReq(
+    name: String,
+    iterationLimit: Int,
+    stopThreshold: Float,
+    saveMode: Int,
+    agents: Seq[AgentReq],
+    edges: Seq[EdgeReq],
+    coevolution: Option[CoevolutionReq] = None
+)
+
+object SimulationJsonProtocol {
+    implicit val agentTypeReqFmt: RootJsonFormat[AgentTypeReq]       = jsonFormat3(AgentTypeReq.apply)
+    implicit val biasTypeReqFmt: RootJsonFormat[BiasTypeReq]         = jsonFormat2(BiasTypeReq.apply)
+    implicit val coevolutionReqFmt: RootJsonFormat[CoevolutionReq]   = jsonFormat5(CoevolutionReq.apply)
+    implicit val generatedRunReqFmt: RootJsonFormat[GeneratedRunReq] = jsonFormat9(GeneratedRunReq.apply)
+    implicit val agentReqFmt: RootJsonFormat[AgentReq]               = jsonFormat6(AgentReq.apply)
+    implicit val edgeReqFmt: RootJsonFormat[EdgeReq]                 = jsonFormat4(EdgeReq.apply)
+    implicit val customRunReqFmt: RootJsonFormat[CustomRunReq]       = jsonFormat7(CustomRunReq.apply)
+}
 
 // Data containers:
 case class CustomRunInfo(
@@ -108,8 +164,7 @@ object Server {
     private val channelPublishers = mutable.Map[String, Sink[Message, Any]]()
     private val channelSources = mutable.Map[String, Source[Message, Any]]()
     private var channels: Long = 0L
-    
-    case class UserSyncRequest(firebaseUid: String, email: String, name: String)
+    private val runChannelMap = mutable.Map[Long, String]()
     
     def initialize(actorSystem: ActorSystem, monitor: ActorRef): Unit = {
         if (initialized) return
@@ -135,7 +190,7 @@ object Server {
         
         val corsResponseHeaders = List(
             `Access-Control-Allow-Origin`.*,
-            `Access-Control-Allow-Methods`(POST, GET, OPTIONS),
+            `Access-Control-Allow-Methods`(POST, GET, PUT, DELETE, OPTIONS),
             `Access-Control-Allow-Headers`("Content-Type", "Authorization", "X-Requested-With", "Accept", "Origin"),
             `Access-Control-Max-Age`(86400),
             `Access-Control-Allow-Credentials`(false)
@@ -154,10 +209,36 @@ object Server {
         val webSocketRoute: Route = addCorsHeaders {
             path("ws" / Segment) { channelId =>
                 get {
-                    optionalHeaderValueByName("Origin") { origin =>
-                        // ToDo add origin validation here
-                        val channelFlow = createChannelFlow(channelId)
-                        handleWebSocketMessages(channelFlow)
+                    withDeprecation("/simulations/{runId}/stream") {
+                        optionalHeaderValueByName("User-Agent") { ua =>
+                            optionalHeaderValueByName("X-Forwarded-For") { xff =>
+                                logLegacy(s"/ws/$channelId", ua, xff)
+                                optionalHeaderValueByName("Origin") { _ =>
+                                    val channelFlow = createChannelFlow(channelId)
+                                    handleWebSocketMessages(channelFlow)
+                                }
+                            }
+                        }
+                    }
+                }
+            } ~
+            path("simulations" / LongNumber / "stream") { runId =>
+                get {
+                    parameter("ticket") { ticket =>
+                        TicketStore.consume(ticket, runId) match {
+                            case None =>
+                                complete(StatusCodes.Forbidden ->
+                                    errorJson("forbidden", "Invalid or expired ticket"))
+                            case Some(_) =>
+                                runChannelMap.get(runId) match {
+                                    case None =>
+                                        complete(StatusCodes.NotFound ->
+                                            errorJson("not_found", "Run not active"))
+                                    case Some(channelId) =>
+                                        val channelFlow = createChannelFlow(channelId)
+                                        handleWebSocketMessages(channelFlow)
+                                }
+                        }
                     }
                 }
             }
@@ -166,49 +247,70 @@ object Server {
         val apiRoute: Route = addCorsHeaders {
             pathPrefix("run") {
                 post {
-                    parameters(
-                        "pBreak".as[Float].?, "pCreate".as[Float].?, "rewiring".as[Int].?,
-                        "assortStop".as[Float].?, "fragStop".as[Boolean].?
-                    ) { (pBreak, pCreate, rewiring, assortStop, fragStop) =>
-                        entity(as[Payload]) { payload =>
-                            val config = (pBreak, pCreate, rewiring) match {
-                                case (Some(b), Some(c), Some(r)) => Some(CoevolutionConfig(
-                                    b, c, r,
-                                    assortStop.getOrElse(1.1f),
-                                    fragStop.getOrElse(false)
-                                ))
-                                case _ => None
+                    withDeprecation("/simulations/generated") {
+                        optionalHeaderValueByName("User-Agent") { ua =>
+                            optionalHeaderValueByName("X-Forwarded-For") { xff =>
+                                logLegacy("/run", ua, xff)
+                                parameters(
+                                    "pBreak".as[Float].?, "pCreate".as[Float].?, "rewiring".as[Int].?,
+                                    "assortStop".as[Float].?, "fragStop".as[Boolean].?
+                                ) { (pBreak, pCreate, rewiring, assortStop, fragStop) =>
+                                    entity(as[Payload]) { payload =>
+                                        val config = (pBreak, pCreate, rewiring) match {
+                                            case (Some(b), Some(c), Some(r)) => Some(CoevolutionConfig(
+                                                b, c, r,
+                                                assortStop.getOrElse(1.1f),
+                                                fragStop.getOrElse(false)
+                                            ))
+                                            case _ => None
+                                        }
+                                        val channelId = parseGeneratedRun(payload.data, config)
+                                        complete(channelId)
+                                    }
+                                }
                             }
-                            val channelId = parseGeneratedRun(payload.data, config)
-                            complete(channelId)
                         }
                     }
                 }
             } ~ pathPrefix("custom") {
                 post {
-                    parameters(
-                        "pBreak".as[Float].?, "pCreate".as[Float].?, "rewiring".as[Int].?,
-                        "assortStop".as[Float].?, "fragStop".as[Boolean].?
-                    ) { (pBreak, pCreate, rewiring, assortStop, fragStop) =>
-                        entity(as[Payload]) { payload =>
-                            val config = (pBreak, pCreate, rewiring) match {
-                                case (Some(b), Some(c), Some(r)) => Some(CoevolutionConfig(
-                                    b, c, r,
-                                    assortStop.getOrElse(1.1f),
-                                    fragStop.getOrElse(false)
-                                ))
-                                case _ => None
+                    withDeprecation("/simulations/custom") {
+                        optionalHeaderValueByName("User-Agent") { ua =>
+                            optionalHeaderValueByName("X-Forwarded-For") { xff =>
+                                logLegacy("/custom", ua, xff)
+                                parameters(
+                                    "pBreak".as[Float].?, "pCreate".as[Float].?, "rewiring".as[Int].?,
+                                    "assortStop".as[Float].?, "fragStop".as[Boolean].?
+                                ) { (pBreak, pCreate, rewiring, assortStop, fragStop) =>
+                                    entity(as[Payload]) { payload =>
+                                        val config = (pBreak, pCreate, rewiring) match {
+                                            case (Some(b), Some(c), Some(r)) => Some(CoevolutionConfig(
+                                                b, c, r,
+                                                assortStop.getOrElse(1.1f),
+                                                fragStop.getOrElse(false)
+                                            ))
+                                            case _ => None
+                                        }
+                                        val (_, channelId) = parseCustomRun(payload.data, config)
+                                        complete(channelId)
+                                    }
+                                }
                             }
-                            val channelId = parseCustomRun(payload.data, config)
-                            complete(channelId)
                         }
                     }
                 }
             } ~ pathPrefix("neighbors") {
                 get {
-                    entity(as[Payload]) { payload =>
-                        val channelId = parseCustomRun(payload.data)
-                        complete(channelId)
+                    withDeprecation("/simulations/custom") {
+                        optionalHeaderValueByName("User-Agent") { ua =>
+                            optionalHeaderValueByName("X-Forwarded-For") { xff =>
+                                logLegacy("/neighbors", ua, xff)
+                                entity(as[Payload]) { payload =>
+                                    val (_, channelId) = parseCustomRun(payload.data)
+                                    complete(channelId)
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -216,49 +318,397 @@ object Server {
         
         val userRoutes: Route = addCorsHeaders {
             pathPrefix("api" / "users") {
+                // POST /api/users/sync — authenticated; uid comes from token, not body
                 path("sync") {
                     post {
-                        entity(as[String]) { jsonString =>
-                            parseUserSyncRequest(jsonString) match {
-                                case Some(userRequest) =>
-                                    DatabaseManager.createOrUpdateUser(
-                                        userRequest.firebaseUid,
-                                        userRequest.email,
-                                        userRequest.name
-                                    ) match {
-                                        case Some(user) =>
-                                            complete(StatusCodes.OK -> s"User synced: ${user.email}")
-                                        case None =>
-                                            complete(StatusCodes.InternalServerError -> "Failed to sync user")
-                                    }
-                                case None =>
-                                    complete(StatusCodes.BadRequest -> "Invalid user data")
+                        authenticate { authUser =>
+                            val limits = DatabaseManager.getUsageLimits(authUser.roles)
+                            val responseJson = s"""{
+                              |  "uid": "${authUser.uid}",
+                              |  "email": "${authUser.email}",
+                              |  "name": "${authUser.name}",
+                              |  "photo": ${authUser.photo.map(p => s""""$p"""").getOrElse("null")},
+                              |  "roles": [${authUser.roles.map(r => s""""$r"""").mkString(",")}],
+                              |  "usageLimits": {
+                              |    "maxAgents": ${if (limits.maxAgents == Int.MaxValue) "null" else limits.maxAgents},
+                              |    "maxIterations": ${if (limits.maxIterations == Int.MaxValue) "null" else limits.maxIterations},
+                              |    "densityFactor": ${limits.densityFactor}
+                              |  },
+                              |  "deactivated": false
+                              |}""".stripMargin
+                            complete(StatusCodes.OK ->
+                                HttpEntity(ContentTypes.`application/json`, responseJson))
+                        }
+                    }
+                } ~
+                // GET /api/users/info/{uid} — owner or admin only
+                path("info" / Segment) { targetUid =>
+                    get {
+                        authenticate { authUser =>
+                            if (authUser.uid == targetUid || authUser.isAdmin) {
+                                DatabaseManager.getUserByFirebaseUid(targetUid) match {
+                                    case Some(user) =>
+                                        val rolesJson = user.roles.map(r => s""""$r"""").mkString(",")
+                                        complete(StatusCodes.OK -> HttpEntity(ContentTypes.`application/json`,
+                                            s"""{"uid":"${user.firebaseUid}","email":"${user.email}","name":"${user.name}","roles":[$rolesJson],"deactivated":${user.deactivated}}"""))
+                                    case None =>
+                                        complete(StatusCodes.NotFound ->
+                                            errorJson("not_found", "User not found"))
+                                }
+                            } else {
+                                complete(StatusCodes.Forbidden ->
+                                    errorJson("forbidden", "Cannot access another user's info"))
                             }
                         }
                     }
                 } ~
-                  path("info" / Segment) { firebaseUid =>
-                      get {
-                          DatabaseManager.getUserByFirebaseUid(firebaseUid) match {
-                              case Some(user) =>
-                                  complete(StatusCodes.OK -> s"User: ${user.email}, Role: ${user.role}")
-                              case None =>
-                                  complete(StatusCodes.NotFound -> "User not found")
-                          }
-                      }
-                  } ~
-                  path("role" / Segment / Segment) { (firebaseUid, newRole) =>
-                      put {
-                          if (DatabaseManager.updateUserRole(firebaseUid, newRole)) {
-                              complete(StatusCodes.OK -> s"Role updated to: $newRole")
-                          } else {
-                              complete(StatusCodes.InternalServerError -> "Failed to update role")
-                          }
-                      }
-                  }
+                // PUT /api/users/role/{uid}/{role} — admin only
+                path("role" / Segment / Segment) { (targetUid, newRole) =>
+                    put {
+                        requireAdmin { _ =>
+                            val validRoles = Set("Administrator", "Researcher", "BaseUser", "Guest")
+                            if (!validRoles.contains(newRole)) {
+                                complete(StatusCodes.BadRequest ->
+                                    errorJson("invalid_body", s"Invalid role: $newRole"))
+                            } else if (DatabaseManager.addUserRole(targetUid, newRole)) {
+                                complete(StatusCodes.OK -> HttpEntity(ContentTypes.`application/json`,
+                                    s"""{"uid":"$targetUid","role":"$newRole","action":"added"}"""))
+                            } else {
+                                complete(StatusCodes.InternalServerError ->
+                                    errorJson("internal_error", "Failed to update role"))
+                            }
+                        }
+                    }
+                }
             }
         }
         
+        // Periodic cleanup every 60 seconds
+        import scala.concurrent.duration.*
+        actorSystem.scheduler.scheduleWithFixedDelay(60.seconds, 60.seconds)(() => {
+            TicketStore.cleanup()
+            SimulationCache.cleanup()
+        })(actorSystem.dispatcher)
+
+        import SimulationJsonProtocol.*
+
+        def simCreatedJson(runId: Long, networkCount: Int, channelId: String, uid: String): String = {
+            val ticket = TicketStore.issue(runId, uid)
+            s"""{
+               |  "runId": "$runId",
+               |  "status": "running",
+               |  "networkCount": $networkCount,
+               |  "channelId": "$channelId",
+               |  "wsTicket": "$ticket",
+               |  "wsUrl": "/simulations/$runId/stream"
+               |}""".stripMargin
+        }
+
+        def runSummaryJson(r: DatabaseManager.RunSummary): String =
+            s"""{
+               |  "id": "${r.id}",
+               |  "type": "${r.runType}",
+               |  "name": ${r.name.map(n => s""""$n"""").getOrElse("null")},
+               |  "networkCount": ${r.networkCount},
+               |  "iterationLimit": ${r.iterationLimit},
+               |  "stopThreshold": ${r.stopThreshold},
+               |  "createdAt": "${r.createdAt}",
+               |  "status": "${r.status}"
+               |}""".stripMargin
+
+        def jsonOk(body: String): HttpResponse =
+            HttpResponse(StatusCodes.OK,
+                entity = HttpEntity(ContentTypes.`application/json`, body))
+
+        val simulationRoutes: Route = addCorsHeaders {
+            pathPrefix("simulations") {
+                // POST /simulations/generated  — JSON body
+                path("generated") {
+                    post {
+                        authenticate { authUser =>
+                            entity(as[GeneratedRunReq]) { req =>
+                                val limits = DatabaseManager.getUsageLimits(authUser.roles)
+                                val agentsPerNetwork = req.agentTypes.map(_.count).sum
+                                if (agentsPerNetwork > limits.maxAgents)
+                                    complete(StatusCodes.UnprocessableEntity ->
+                                        usageLimitJson("Agent count exceeds your limit", limits.maxAgents, agentsPerNetwork))
+                                else if (req.iterationLimit > limits.maxIterations)
+                                    complete(StatusCodes.UnprocessableEntity ->
+                                        usageLimitJson("Iteration limit exceeds your limit", limits.maxIterations, req.iterationLimit))
+                                else {
+                                    val effectiveDensity = (req.density * limits.densityFactor).toInt
+                                    val seed = req.seed.getOrElse(-1L) match {
+                                        case -1L => System.currentTimeMillis() ^ System.nanoTime()
+                                        case s   => s
+                                    }
+                                    val agentTypesArr = req.agentTypes.map { a =>
+                                        (SilenceStrategies.fromByte(a.silenceStrategy.toByte),
+                                         SilenceEffects.fromByte(a.silenceEffect.toByte),
+                                         a.count)
+                                    }.toArray
+                                    val biasArr = req.biasTypes.map { b =>
+                                        (CognitiveBiases.fromByte(b.biasType.toByte), b.count)
+                                    }.toArray
+                                    val (runId, channelId) = executeGeneratedRun(
+                                        seed, req.saveMode.toByte, req.numberOfNetworks,
+                                        effectiveDensity, req.iterationLimit, req.stopThreshold,
+                                        agentTypesArr, biasArr,
+                                        agentsPerNetwork,
+                                        userId = Some(authUser.dbUserId),
+                                        coevolutionConfig = req.coevolution.map(c => CoevolutionConfig(
+                                            c.pBreak, c.pCreate, c.rewiringStrategy,
+                                            c.assortStop.getOrElse(1.1f),
+                                            c.fragStop.getOrElse(false)
+                                        ))
+                                    )
+                                    complete(jsonOk(simCreatedJson(runId, req.numberOfNetworks, channelId, authUser.uid)))
+                                }
+                            }
+                        }
+                    }
+                } ~
+                // POST /simulations/custom — binary or JSON based on Content-Type
+                path("custom") {
+                    post {
+                        authenticate { authUser =>
+                            extractRequest { req =>
+                                val ct = req.entity.contentType.mediaType.toString
+                                if (ct.contains("octet-stream")) {
+                                    entity(as[Payload]) { payload =>
+                                        val (runId, channelId) = parseCustomRun(payload.data, userId = Some(authUser.dbUserId))
+                                        complete(jsonOk(simCreatedJson(runId, 1, channelId, authUser.uid)))
+                                    }
+                                } else {
+                                    entity(as[CustomRunReq]) { runReq =>
+                                        val limits = DatabaseManager.getUsageLimits(authUser.roles)
+                                        val agentCount = runReq.agents.size
+                                        if (agentCount > limits.maxAgents)
+                                            complete(StatusCodes.UnprocessableEntity ->
+                                                usageLimitJson("Agent count exceeds your limit", limits.maxAgents, agentCount))
+                                        else if (runReq.iterationLimit > limits.maxIterations)
+                                            complete(StatusCodes.UnprocessableEntity ->
+                                                usageLimitJson("Iteration limit exceeds your limit", limits.maxIterations, runReq.iterationLimit))
+                                        else {
+                                            val coevCfg = runReq.coevolution.map(c => CoevolutionConfig(
+                                                c.pBreak, c.pCreate, c.rewiringStrategy,
+                                                c.assortStop.getOrElse(1.1f),
+                                                c.fragStop.getOrElse(false)
+                                            ))
+                                            val (runId, channelId) = executeCustomRunFromJson(
+                                                runReq, Some(authUser.dbUserId), coevCfg)
+                                            complete(jsonOk(simCreatedJson(runId, 1, channelId, authUser.uid)))
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                } ~
+                // GET /simulations/mine — paginated list for authenticated user
+                path("mine") {
+                    get {
+                        authenticate { authUser =>
+                            parameters("limit".as[Int].withDefault(20), "offset".as[Int].withDefault(0)) { (limit, offset) =>
+                                val runs = DatabaseManager.getRunsForUser(authUser.dbUserId, limit, offset)
+                                val items = runs.map(runSummaryJson).mkString(",")
+                                complete(jsonOk(s"""{"runs":[$items],"limit":$limit,"offset":$offset}"""))
+                            }
+                        }
+                    }
+                } ~
+                // GET /simulations — admin: all runs
+                pathEndOrSingleSlash {
+                    get {
+                        requireAdmin { _ =>
+                            parameters("limit".as[Int].withDefault(20), "offset".as[Int].withDefault(0)) { (limit, offset) =>
+                                val runs = DatabaseManager.getAllRuns(limit, offset)
+                                val items = runs.map(runSummaryJson).mkString(",")
+                                complete(jsonOk(s"""{"runs":[$items],"limit":$limit,"offset":$offset}"""))
+                            }
+                        }
+                    }
+                } ~
+                // Routes by runId
+                pathPrefix(LongNumber) { runId =>
+                    // GET /simulations/{runId}
+                    pathEndOrSingleSlash {
+                        get {
+                            authenticate { authUser =>
+                                DatabaseManager.getRunSummary(runId) match {
+                                    case None => complete(StatusCodes.NotFound ->
+                                        errorJson("not_found", "Run not found"))
+                                    case Some(run) =>
+                                        if (run.userId.contains(authUser.dbUserId) || authUser.isAdmin)
+                                            complete(jsonOk(runSummaryJson(run)))
+                                        else
+                                            complete(StatusCodes.Forbidden ->
+                                                errorJson("forbidden", "Access denied"))
+                                }
+                            }
+                        }
+                    } ~
+                    // DELETE /simulations/{runId}
+                    delete {
+                        authenticate { authUser =>
+                            DatabaseManager.getRunOwner(runId) match {
+                                case None => complete(StatusCodes.NotFound ->
+                                    errorJson("not_found", "Run not found"))
+                                case Some(ownerId) =>
+                                    if (ownerId == authUser.dbUserId || authUser.isAdmin) {
+                                        DatabaseManager.setRunStatus(runId, "cancelled")
+                                        monitor ! CancelRun(runId)
+                                        complete(jsonOk(s"""{"runId":"$runId","cancelled":true}"""))
+                                    } else {
+                                        complete(StatusCodes.Forbidden ->
+                                            errorJson("forbidden", "Access denied"))
+                                    }
+                            }
+                        }
+                    } ~
+                    // GET /simulations/{runId}/networks
+                    path("networks") {
+                        get {
+                            authenticate { authUser =>
+                                DatabaseManager.getRunOwner(runId) match {
+                                    case None => complete(StatusCodes.NotFound ->
+                                        errorJson("not_found", "Run not found"))
+                                    case Some(ownerId) if ownerId != authUser.dbUserId && !authUser.isAdmin =>
+                                        complete(StatusCodes.Forbidden ->
+                                            errorJson("forbidden", "Access denied"))
+                                    case _ =>
+                                        val ids = SimulationCache.getNetworkIds(runId)
+                                        val items = ids.map(id => s""""$id"""").mkString(",")
+                                        complete(jsonOk(s"""{"runId":"$runId","networks":[$items]}"""))
+                                }
+                            }
+                        }
+                    } ~
+                    // GET /simulations/{runId}/networks/{networkId}/topology
+                    // GET /simulations/{runId}/networks/{networkId}/results
+                    pathPrefix("networks" / Segment) { networkId =>
+                        authenticate { authUser =>
+                            DatabaseManager.getRunOwner(runId) match {
+                                case None => complete(StatusCodes.NotFound ->
+                                    errorJson("not_found", "Run not found"))
+                                case Some(ownerId) if ownerId != authUser.dbUserId && !authUser.isAdmin =>
+                                    complete(StatusCodes.Forbidden ->
+                                        errorJson("forbidden", "Access denied"))
+                                case _ =>
+                                    path("topology") {
+                                        get {
+                                            parameters(
+                                                "agentOffset".as[Int].withDefault(0),
+                                                "agentLimit".as[Int].withDefault(500),
+                                                "edgeOffset".as[Int].withDefault(0),
+                                                "edgeLimit".as[Int].withDefault(1000)
+                                            ) { (aOff, aLim, eOff, eLim) =>
+                                                SimulationCache.getTopology(runId, networkId) match {
+                                                    case None => complete(StatusCodes.Accepted ->
+                                                        errorJson("not_ready", "Topology not yet available"))
+                                                    case Some(snap) =>
+                                                        complete(jsonOk(topologyPageJson(snap, runId, networkId, aOff, aLim, eOff, eLim)))
+                                                }
+                                            }
+                                        }
+                                    } ~
+                                    path("results") {
+                                        get {
+                                            parameters(
+                                                "offset".as[Int].withDefault(0),
+                                                "limit".as[Int].withDefault(500)
+                                            ) { (off, lim) =>
+                                                SimulationCache.getResults(runId, networkId) match {
+                                                    case None => complete(StatusCodes.Accepted ->
+                                                        errorJson("not_ready", "Results not yet available — run may still be in progress"))
+                                                    case Some(snap) =>
+                                                        complete(jsonOk(resultsPageJson(snap, runId, networkId, off, lim)))
+                                                }
+                                            }
+                                        }
+                                    } ~
+                                    path("topology" / "final") {
+                                        get {
+                                            parameters(
+                                                "agentOffset".as[Int].withDefault(0),
+                                                "agentLimit".as[Int].withDefault(500),
+                                                "edgeOffset".as[Int].withDefault(0),
+                                                "edgeLimit".as[Int].withDefault(1000)
+                                            ) { (aOff, aLim, eOff, eLim) =>
+                                                SimulationCache.getFinalTopology(runId, networkId) match {
+                                                    case None => complete(StatusCodes.NotFound ->
+                                                        errorJson("not_ready", "Final topology not yet available — run may still be in progress"))
+                                                    case Some(snap) =>
+                                                        complete(jsonOk(topologyPageJson(snap, runId, networkId, aOff, aLim, eOff, eLim)))
+                                                }
+                                            }
+                                        }
+                                    }
+                            }
+                        }
+                    } ~
+                    // POST /simulations/{runId}/ws-ticket — issue a new ticket for reconnections
+                    path("ws-ticket") {
+                        post {
+                            authenticate { authUser =>
+                                DatabaseManager.getRunOwner(runId) match {
+                                    case None => complete(StatusCodes.NotFound ->
+                                        errorJson("not_found", "Run not found"))
+                                    case Some(ownerId) =>
+                                        if (ownerId == authUser.dbUserId || authUser.isAdmin) {
+                                            val ticket = TicketStore.issue(runId, authUser.uid)
+                                            complete(jsonOk(s"""{"wsTicket":"$ticket"}"""))
+                                        } else {
+                                            complete(StatusCodes.Forbidden ->
+                                                errorJson("forbidden", "Access denied"))
+                                        }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        val openapiYaml: String = scala.io.Source.fromResource("openapi.yaml").mkString
+
+        val docsRoute: Route = addCorsHeaders {
+            path("openapi.yaml") {
+                get {
+                    complete(HttpEntity(
+                        ContentType(MediaType.applicationWithFixedCharset("x-yaml", HttpCharsets.`UTF-8`)),
+                        openapiYaml
+                    ))
+                }
+            } ~
+            path("docs") {
+                get {
+                    complete(HttpEntity(ContentTypes.`text/html(UTF-8)`,
+                        s"""<!DOCTYPE html>
+                           |<html>
+                           |<head>
+                           |  <title>BES API Docs</title>
+                           |  <meta charset="utf-8"/>
+                           |  <meta name="viewport" content="width=device-width, initial-scale=1">
+                           |  <link rel="stylesheet" href="https://unpkg.com/swagger-ui-dist@5/swagger-ui.css"/>
+                           |</head>
+                           |<body>
+                           |<div id="swagger-ui"></div>
+                           |<script src="https://unpkg.com/swagger-ui-dist@5/swagger-ui-bundle.js"></script>
+                           |<script>
+                           |SwaggerUIBundle({
+                           |  url: "/openapi.yaml",
+                           |  dom_id: '#swagger-ui',
+                           |  deepLinking: true,
+                           |  presets: [SwaggerUIBundle.presets.apis, SwaggerUIBundle.SwaggerUIStandalonePreset],
+                           |  layout: "BaseLayout"
+                           |})
+                           |</script>
+                           |</body>
+                           |</html>""".stripMargin))
+                }
+            }
+        }
+
         val homeRoute: Route = addCorsHeaders {
             pathEndOrSingleSlash {
                 get {
@@ -280,7 +730,7 @@ object Server {
             }
         }
         
-        val routes: Route = corsHandler ~ webSocketRoute ~ apiRoute ~ userRoutes ~ homeRoute
+        val routes: Route = corsHandler ~ webSocketRoute ~ apiRoute ~ userRoutes ~ simulationRoutes ~ docsRoute ~ homeRoute
         val bindingFuture = Http().newServerAt(serverHost, serverPort).bind(routes)
         
         bindingFuture.onComplete {
@@ -296,26 +746,6 @@ object Server {
         }
         
         initialized = true
-    }
-    
-    private def parseUserSyncRequest(jsonString: String): Option[UserSyncRequest] = {
-        try {
-            val firebaseUidPattern = """"firebaseUid"\s*:\s*"([^"]+)"""".r
-            val emailPattern = """"email"\s*:\s*"([^"]+)"""".r
-            val namePattern = """"name"\s*:\s*"([^"]+)"""".r
-            
-            val firebaseUid = firebaseUidPattern.findFirstMatchIn(jsonString).map(_.group(1)).getOrElse("")
-            val email = emailPattern.findFirstMatchIn(jsonString).map(_.group(1)).getOrElse("")
-            val name = namePattern.findFirstMatchIn(jsonString).map(_.group(1)).getOrElse("")
-            
-            if (firebaseUid.nonEmpty) {
-                Some(UserSyncRequest(firebaseUid, email, name))
-            } else {
-                None
-            }
-        } catch {
-            case _: Exception => None
-        }
     }
     
     private def createChannelFlow(channelId: String): Flow[Message, Message, Any] = {
@@ -460,6 +890,121 @@ object Server {
         }
     }
     
+    def sendControlEvent(channelId: String, json: String): Unit = {
+        if (!initialized || system.isEmpty) return
+        channelPublishers.get(channelId) match {
+            case Some(publisher) =>
+                implicit val materializer: Materializer = Materializer(system.get)
+                Source.single(akka.http.scaladsl.model.ws.TextMessage(json)).runWith(publisher)
+            case None =>
+                Logger.logError(s"sendControlEvent: no channel $channelId")
+        }
+    }
+
+    private def topologyPageJson(snap: TopologySnapshot, runId: Long, networkId: String,
+        aOff: Int, aLim: Int, eOff: Int, eLim: Int): String = {
+        val aEnd = math.min(aOff + aLim, snap.agentCount)
+        val agents = (math.min(aOff, snap.agentCount) until aEnd).map { i =>
+            val name = if (snap.names != null) s""""${snap.names(i)}"""" else "null"
+            s"""{"index":$i,"name":$name,"initialBelief":${snap.initialBeliefs(i)},"toleranceRadius":${snap.tolRadius(i)},"toleranceOffset":${snap.tolOffset(i)},"silenceStrategy":${snap.silenceStrategies(i) & 0xFF},"silenceEffect":${snap.silenceEffects(i) & 0xFF}}"""
+        }.mkString(",")
+        val eStart = math.min(eOff, snap.edgeCount)
+        val eEnd   = math.min(eOff + eLim, snap.edgeCount)
+        val edges  = edgesPageJson(snap, eStart, eEnd)
+        s"""{"runId":"$runId","networkId":"$networkId","agentCount":${snap.agentCount},"edgeCount":${snap.edgeCount},"agentOffset":$aOff,"agentLimit":$aLim,"edgeOffset":$eOff,"edgeLimit":$eLim,"agents":[$agents],"edges":[$edges]}"""
+    }
+
+    private def edgesPageJson(snap: TopologySnapshot, eStart: Int, eEnd: Int): String = {
+        if (eStart >= eEnd || snap.edgeCount == 0) return ""
+        val sb  = new StringBuilder
+        var src = 0
+        while (src < snap.agentCount - 1 && snap.indexOffset(src) <= eStart) src += 1
+        var first = true
+        for (j <- eStart until eEnd) {
+            while (src < snap.agentCount - 1 && snap.indexOffset(src) <= j) src += 1
+            if (!first) sb.append(',')
+            first = false
+            sb.append(s"""{"source":$src,"target":${snap.neighborsRefs(j)},"influence":${snap.neighborsWeights(j)},"bias":${snap.neighborBiases(j) & 0xFF}}""")
+        }
+        sb.toString
+    }
+
+    private def resultsPageJson(snap: ResultsSnapshot, runId: Long, networkId: String, off: Int, lim: Int): String = {
+        val start = math.min(off, snap.agentCount)
+        val end   = math.min(off + lim, snap.agentCount)
+        val agents = (start until end).map { i =>
+            val name = if (snap.names != null) s""""${snap.names(i)}"""" else "null"
+            s"""{"index":$i,"name":$name,"finalBelief":${snap.finalBeliefs(i)},"publicBelief":${snap.publicBeliefs(i)}}"""
+        }.mkString(",")
+        s"""{"runId":"$runId","networkId":"$networkId","finalRound":${snap.finalRound},"consensus":${snap.consensus},"agentCount":${snap.agentCount},"offset":$off,"limit":$lim,"agents":[$agents]}"""
+    }
+
+    private val deprecationSunset = "Tue, 01 Sep 2026 00:00:00 GMT"
+
+    private def withDeprecation(successor: String): Directive0 =
+        respondWithHeaders(
+            RawHeader("Deprecation", "true"),
+            RawHeader("Sunset", deprecationSunset),
+            RawHeader("Link", s"<$successor>; rel=\"successor-version\""),
+            RawHeader("Warning", s"""299 - "Deprecated API. Migrate to $successor." """)
+        )
+
+    private def logLegacy(endpoint: String, userAgent: Option[String], ip: Option[String]): Unit =
+        if (!GlobalState.APP_MODE.skipDatabase) {
+            import scala.concurrent.Future
+            implicit val ec: ExecutionContextExecutor = system.get.dispatcher
+            Future(DatabaseManager.logLegacyUsage(endpoint, None, userAgent, ip))
+        }
+
+    private def executeGeneratedRun(
+        seed: Long, saveMode: Byte, numberOfNetworks: Int, density: Int,
+        iterationLimit: Int, stopThreshold: Float,
+        agentTypes: Array[(SilenceStrategy, SilenceEffect, Int)],
+        biases: Array[(Bias, Int)],
+        agentsPerNetwork: Int,
+        confidenceParams: mutable.Map[Int, (Float, Float)] = mutable.Map(),
+        userId: Option[Int] = None,
+        coevolutionConfig: Option[CoevolutionConfig] = None
+    ): (Long, String) = {
+        var runID = SnowflakeID.generateId()
+        val convertedSaveMode = if (GlobalState.APP_MODE.skipDatabase || !GlobalState.APP_MODE.usesLegacyDB)
+            SaveModes.DEBUG
+        else
+            SaveModes.codeToSaveMode(saveMode)
+
+        if (GlobalState.APP_MODE.usesLegacyDB && convertedSaveMode.savesToDB) {
+            runID = DatabaseManager.createRun(
+                RunMode.GENERATED, saveMode, numberOfNetworks, Some(density), Some(2.5f),
+                stopThreshold, iterationLimit, "uniform"
+            ).get
+        } else if (!GlobalState.APP_MODE.skipDatabase) {
+            DatabaseManager.saveGeneratedRun(
+                id = runID,
+                seed = seed,
+                density = density,
+                iterationLimit = iterationLimit,
+                totalNetworks = numberOfNetworks,
+                agentsPerNetwork = agentsPerNetwork,
+                stopThreshold = stopThreshold,
+                agentTypeDistributions = agentTypes,
+                cognitiveBiasDistributions = biases,
+                userId = userId
+            )
+        }
+
+        val channelId = takeChannel()
+        runChannelMap(runID) = channelId
+
+        monitor.get ! AddNetworks(
+            runID, channelId, agentTypes, biases, confidenceParams,
+            Uniform, convertedSaveMode, numberOfNetworks, density,
+            iterationLimit, seed, 2.5f, stopThreshold,
+            coevolutionConfig
+        )
+
+        (runID, channelId)
+    }
+
     private def parseGeneratedRun(data: Array[Byte], config: Option[CoevolutionConfig] = None): String = {
         val saveMode = data(1)
         val agentTypeCount = data(2)
@@ -473,7 +1018,7 @@ object Server {
         } else {
             bytesToLong(data, 20)
         }
-        
+
         val agentTypes = new Array[(SilenceStrategy, SilenceEffect, Int)](agentTypeCount)
         val confidenceParams: mutable.Map[Int, (Float, Float)] = mutable.Map()
         var curOffset = 28
@@ -486,65 +1031,24 @@ object Server {
             curOffset += 6
             agentsPerNetwork += count
         }
-        
+
         val biases = new Array[(Bias, Int)](biasTypeCount)
-        
         for (i <- 0 until biasTypeCount) {
             val count = bytesToInt(data, curOffset)
             val biasType: Bias = CognitiveBiases.fromByte(data(curOffset + 4))
             biases(i) = (biasType, count)
             curOffset += 5
         }
-        
-        var runID = SnowflakeID.generateId()
-        val convertedSaveMode = if (GlobalState.APP_MODE.skipDatabase || !GlobalState.APP_MODE.usesLegacyDB)
-            SaveModes.DEBUG
-        else
-            SaveModes.codeToSaveMode(saveMode)
-            
-        if (GlobalState.APP_MODE.usesLegacyDB && convertedSaveMode.savesToDB) {
-            runID = DatabaseManager.createRun(
-                RunMode.GENERATED, saveMode, numberOfNetworks, Some(density), Some(2.5f),
-                stopThreshold, iterationLimit,
-                "uniform"
-            ).get
-        } else if (!GlobalState.APP_MODE.skipDatabase) {
-            DatabaseManager.saveGeneratedRun(
-                id = runID,
-                seed = seed,
-                density = density,
-                iterationLimit = iterationLimit,
-                totalNetworks = numberOfNetworks,
-                agentsPerNetwork = agentsPerNetwork,
-                stopThreshold = stopThreshold,
-                agentTypeDistributions = agentTypes,
-                cognitiveBiasDistributions = biases
-            )
-        }
-        
-        val channelId = takeChannel()
-        
-        monitor.get ! AddNetworks(
-            runID,
-            channelId,
-            agentTypes,
-            biases,
-            confidenceParams,
-            Uniform,
-            convertedSaveMode,
-            numberOfNetworks,
-            density,
-            iterationLimit,
-            seed,
-            2.5f,
-            stopThreshold,
-            config
+
+        val (_, channelId) = executeGeneratedRun(
+            seed, saveMode, numberOfNetworks, density, iterationLimit, stopThreshold,
+            agentTypes, biases, agentsPerNetwork, confidenceParams,
+            coevolutionConfig = config
         )
-        
         channelId
     }
     
-    private def parseCustomRun(data: Array[Byte], config: Option[CoevolutionConfig] = None): String = {
+    private def parseCustomRun(data: Array[Byte], config: Option[CoevolutionConfig] = None, userId: Option[Int] = None): (Long, String) = {
         // Header
         val stopThreshold = bytesToFloat(data, 0)
         val iterationLimit = bytesToInt(data, 4)
@@ -680,13 +1184,14 @@ object Server {
                     sortedTarget,
                     sortedInfluences,
                     sortedBiases
-                )
+                ),
+                userId = userId
             )
         }
-        
-        
+
+
         val channelId = takeChannel()
-        
+
         val customRunInfo = CustomRunInfo(
             runID = runID,
             channelId = channelId,
@@ -708,10 +1213,91 @@ object Server {
         )
         
         monitor.get ! RunCustomNetwork(customRunInfo)
-        
-        channelId
+
+        (runID, channelId)
     }
-    
+
+    private def executeCustomRunFromJson(req: CustomRunReq, userId: Option[Int],
+        coevolutionConfig: Option[CoevolutionConfig] = None): (Long, String) = {
+        val agentIndexes = req.agents.zipWithIndex.map { case (a, i) => a.name -> i }.toMap
+        val agentNames         = req.agents.map(_.name).toArray
+        val initialBeliefs     = req.agents.map(_.belief).toArray
+        val toleranceRadius    = req.agents.map(_.toleranceRadius).toArray
+        val toleranceOffset    = req.agents.map(_.toleranceOffset).toArray
+        val silenceStrategies  = req.agents.map(a => SilenceStrategies.fromByte(a.silenceStrategy.toByte)).toArray
+        val silenceEffects     = req.agents.map(a => SilenceEffects.fromByte(a.silenceEffect.toByte)).toArray
+
+        val srcArr  = req.edges.map(e => agentIndexes(e.source)).toArray
+        val tgtArr  = req.edges.map(e => agentIndexes(e.target)).toArray
+        val infArr  = req.edges.map(_.influence).toArray
+        val biasArr = req.edges.map(e => CognitiveBiases.fromByte(e.bias.toByte)).toArray
+
+        val sortedIdx    = srcArr.indices.sortBy(srcArr(_))
+        val sortedSrc    = sortedIdx.map(srcArr(_)).toArray
+        val sortedTgt    = sortedIdx.map(tgtArr(_)).toArray
+        val sortedInf    = sortedIdx.map(infArr(_)).toArray
+        val sortedBiases = sortedIdx.map(biasArr(_)).toArray
+
+        val nAgents    = req.agents.size
+        val nNeighbors = req.edges.size
+        val indexOffset = new Array[Int](nAgents)
+        var count = 0
+        for (i <- sortedSrc.indices) {
+            if (i != 0 && sortedSrc(i - 1) != sortedSrc(i)) {
+                indexOffset(count) = i
+                count += 1
+            }
+        }
+        if (nNeighbors > 0) indexOffset(indexOffset.length - 1) = nNeighbors
+
+        var runID = SnowflakeID.generateId()
+        val saveMode = req.saveMode.toByte
+        val convertedSaveMode = if (GlobalState.APP_MODE.skipDatabase || !GlobalState.APP_MODE.usesLegacyDB)
+                                    SaveModes.DEBUG
+                                else SaveModes.codeToSaveMode(saveMode)
+
+        if (GlobalState.APP_MODE.usesLegacyDB && SaveModes.savesToDB(convertedSaveMode)) {
+            runID = DatabaseManager.createRun(
+                RunMode.GENERATED, saveMode, 1, None, None,
+                req.stopThreshold, req.iterationLimit, "uniform"
+            ).get
+        } else if (!GlobalState.APP_MODE.skipDatabase) {
+            DatabaseManager.saveCustomRun(
+                id                = runID,
+                iterationLimit    = req.iterationLimit,
+                stopThreshold     = req.stopThreshold,
+                runName           = req.name,
+                customAgentsData  = CustomAgentsData(initialBeliefs, toleranceRadius, toleranceOffset,
+                                      silenceStrategies, silenceEffects, agentNames, None, None),
+                customNeighborsData = CustomNeighborsData(sortedSrc, sortedTgt, sortedInf, sortedBiases),
+                userId = userId
+            )
+        }
+
+        val channelId = takeChannel()
+        runChannelMap(runID) = channelId
+        monitor.get ! RunCustomNetwork(CustomRunInfo(
+            runID                = runID,
+            channelId            = channelId,
+            stopThreshold        = req.stopThreshold,
+            iterationLimit       = req.iterationLimit,
+            saveMode             = convertedSaveMode,
+            networkName          = req.name,
+            agentBeliefs         = initialBeliefs,
+            agentToleranceRadii  = toleranceRadius,
+            agentToleranceOffsets= toleranceOffset,
+            agentSilenceStrategy = silenceStrategies,
+            agentSilenceEffect   = silenceEffects,
+            agentNames           = agentNames,
+            indexOffset          = indexOffset,
+            target               = sortedTgt,
+            influences           = sortedInf,
+            bias                 = sortedBiases,
+            coevolutionConfig    = coevolutionConfig
+        ))
+        (runID, channelId)
+    }
+
     // Bit operation methods for channels
     private def takeChannel(): String = {
         val index = java.lang.Long.numberOfTrailingZeros(~channels).toString
