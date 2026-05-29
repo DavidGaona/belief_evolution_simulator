@@ -16,10 +16,10 @@ import org.postgresql.core.BaseConnection
 import utils.logging.Logger
 
 import java.io.{ByteArrayInputStream, PrintWriter}
-import java.sql.{Connection, PreparedStatement, Statement}
+import java.sql.{Connection, PreparedStatement, Statement, Types}
 import java.util.UUID
-import scala.collection.mutable.ArrayBuffer
 import scala.collection.mutable
+import scala.collection.mutable.ArrayBuffer
 
 object DatabaseManager {
     // ============================================================================
@@ -743,7 +743,45 @@ object DatabaseManager {
             if (conn != null) conn.close()
         }
     }
-    
+
+    // metrics: ArrayBuffer of (roundNumber, assortativity, fragmentation, sccCount)
+    // assortativity may be Float.NaN when beliefs are uniform — stored as SQL NULL.
+    def insertCoevolutionMetricsBatch(
+        networkId: UUID,
+        metrics: ArrayBuffer[(Int, Float, Float, Int)]
+    ): Unit = {
+        val conn = getConnectionLegacy
+        var stmt: PreparedStatement = null
+        try {
+            val sql =
+                """
+            INSERT INTO public.network_coevolution_metrics
+                (network_id, round_number, assortativity, fragmentation, scc_count)
+            VALUES (CAST(? AS uuid), ?, ?, ?, ?);
+            """
+            stmt = conn.prepareStatement(sql)
+            var i = 0
+            val size = metrics.size
+            while (i < size) {
+                val (roundNum, assort, frag, scc) = metrics(i)
+                stmt.setObject(1, networkId)
+                stmt.setInt(2, roundNum)
+                if (assort.isNaN) stmt.setNull(3, Types.REAL)
+                else stmt.setFloat(3, assort)
+                stmt.setFloat(4, frag)
+                stmt.setInt(5, scc)
+                stmt.addBatch()
+                i += 1
+            }
+            stmt.executeBatch()
+        } catch {
+            case e: Exception => e.printStackTrace()
+        } finally {
+            if (stmt != null) stmt.close()
+            if (conn != null) conn.close()
+        }
+    }
+
     private def createUnloggedTable(tableName: String): Unit = {
         val conn = getConnectionLegacy
         var stmt: Statement = null

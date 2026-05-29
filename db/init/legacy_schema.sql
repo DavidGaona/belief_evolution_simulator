@@ -199,6 +199,19 @@ CREATE TABLE IF NOT EXISTS public.neighbors
     cognitive_bias public.cognitive_bias NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS public.network_coevolution_metrics
+(
+    network_id    uuid    NOT NULL,
+    round_number  integer NOT NULL,
+    assortativity real,
+    fragmentation real    NOT NULL,
+    scc_count     integer NOT NULL,
+    CONSTRAINT network_coevolution_metrics_pkey PRIMARY KEY (network_id, round_number)
+);
+
+CREATE INDEX IF NOT EXISTS network_coevolution_metrics_network_id_idx
+    ON public.network_coevolution_metrics (network_id);
+
 CREATE TABLE IF NOT EXISTS public.optional_variables
 (
     id     bit(8)                 NOT NULL,

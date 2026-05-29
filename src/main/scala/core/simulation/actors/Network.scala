@@ -127,6 +127,15 @@ class Network(networkId: UUID, runMetadata: RunMetadata,
     }
     
     // ============================================================================
+    // CO-EVOLUTION METRICS BUFFER
+    // ============================================================================
+    // Accumulates (round, assortativity, fragmentation, sccCount) tuples each time
+    // the topology is evolved. Flushed to DB at simulation end when usesLegacyDB &&
+    // saveMode.includesRounds.  Always allocated; left empty for static networks.
+    val coevolutionMetrics: mutable.ArrayBuffer[(Int, Float, Float, Int)] =
+        new mutable.ArrayBuffer[(Int, Float, Float, Int)]()
+
+    // ============================================================================
     // UTILITIES
     // ============================================================================
     val bimodal = new BimodalDistribution(0.25, 0.75)
@@ -439,6 +448,8 @@ class Network(networkId: UUID, runMetadata: RunMetadata,
                     Server.sendControlEvent(runMetadata.channelId,
                         s"""{"event":"network_converged","runId":"${runMetadata.runID}","networkId":"$networkId","round":$round,"consensus":true}""")
                     if (runMetadata.saveMode.includesNetworks) DatabaseManager.updateNetworkFinalRound(networkId, round, true)
+                    if (GlobalState.APP_MODE.usesLegacyDB && coevolutionMetrics.nonEmpty)
+                        DatabaseManager.insertCoevolutionMetricsBatch(networkId, coevolutionMetrics)
                     saveTopologySnapshot(round)
                     SimulationCache.storeFinalTopology(runMetadata.runID, networkId.toString, buildTopologySnapshot())
                     Server.sendControlEvent(runMetadata.channelId,
@@ -456,6 +467,8 @@ class Network(networkId: UUID, runMetadata: RunMetadata,
                     Server.sendControlEvent(runMetadata.channelId,
                         s"""{"event":"network_converged","runId":"${runMetadata.runID}","networkId":"$networkId","round":$round,"consensus":false}""")
                     if (runMetadata.saveMode.includesNetworks) DatabaseManager.updateNetworkFinalRound(networkId, round, false)
+                    if (GlobalState.APP_MODE.usesLegacyDB && coevolutionMetrics.nonEmpty)
+                        DatabaseManager.insertCoevolutionMetricsBatch(networkId, coevolutionMetrics)
                     saveTopologySnapshot(round)
                     SimulationCache.storeFinalTopology(runMetadata.runID, networkId.toString, buildTopologySnapshot())
                     Server.sendControlEvent(runMetadata.channelId,
@@ -490,6 +503,8 @@ class Network(networkId: UUID, runMetadata: RunMetadata,
                             val frag     = core.simulation.topology.ConvergenceMetrics.computeFragmentation(
                                 sccCount, runMetadata.agentsPerNetwork)
                             Logger.log(s"[Coevolution] Round $round — Assortativity: $assort, Fragmentation: $frag (SCCs: $sccCount)")
+                            if (GlobalState.APP_MODE.usesLegacyDB && runMetadata.saveMode.includesRounds)
+                                coevolutionMetrics.addOne((round, assort, frag, sccCount))
 
                             val assortTriggered = config.assortivityStopThreshold <= 1.0f &&
                                 !assort.isNaN && assort >= config.assortivityStopThreshold
@@ -502,6 +517,8 @@ class Network(networkId: UUID, runMetadata: RunMetadata,
                                 Server.sendControlEvent(runMetadata.channelId,
                                     s"""{"event":"network_converged","runId":"${runMetadata.runID}","networkId":"$networkId","round":$round,"consensus":false,"structural":true}""")
                                 if (runMetadata.saveMode.includesNetworks) DatabaseManager.updateNetworkFinalRound(networkId, round, false)
+                                if (GlobalState.APP_MODE.usesLegacyDB && coevolutionMetrics.nonEmpty)
+                                    DatabaseManager.insertCoevolutionMetricsBatch(networkId, coevolutionMetrics)
                                 saveTopologySnapshot(round)
                                 SimulationCache.storeFinalTopology(runMetadata.runID, networkId.toString, buildTopologySnapshot())
                                 Server.sendControlEvent(runMetadata.channelId,

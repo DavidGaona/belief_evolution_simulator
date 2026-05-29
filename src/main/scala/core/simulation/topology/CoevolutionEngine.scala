@@ -156,6 +156,40 @@ object CoevolutionEngine {
                         }
                     }
                 }
+            } else if (newCandidates.nonEmpty) {
+                // Proposal C: Global homophilic renormalization (pure-creation scenario, pBreak=0).
+                // No weight was lost, so Proposals A/B would assign zero weight to new edges.
+                // Instead, treat attention as a zero-sum resource: add new neighbors with placeholder
+                // weight 0 then renormalize the ENTIRE local neighborhood (kept + new) by homophily
+                // similarity, preserving the stochastic row-sum invariant (Σ I_ji = 1).
+                var c = 0
+                while (c < newCandidates.length) {
+                    newNeighborsRefs.addOne(newCandidates(c))
+                    newNeighborsWeights.addOne(0f)
+                    newNeighborBiases.addOne(CognitiveBiases.DEGROOT)
+                    c += 1
+                }
+
+                // Compute similarity for every neighbor in [startOfNewAgentIdx, end)
+                val endIdx = newNeighborsRefs.length
+                val similarities = new Array[Float](endIdx - startOfNewAgentIdx)
+                var similaritySum = 0f
+                var idx = startOfNewAgentIdx
+                while (idx < endIdx) {
+                    val sim = 1f - math.abs(beliefs(newNeighborsRefs(idx)) - beliefs(i))
+                    similarities(idx - startOfNewAgentIdx) = sim
+                    similaritySum += sim
+                    idx += 1
+                }
+
+                // Assign renormalized weights; fall back to uniform if all similarities are zero
+                idx = startOfNewAgentIdx
+                while (idx < endIdx) {
+                    newNeighborsWeights(idx) =
+                        if (similaritySum > 0f) similarities(idx - startOfNewAgentIdx) / similaritySum
+                        else 1f / (endIdx - startOfNewAgentIdx).toFloat
+                    idx += 1
+                }
             }
             newIndexOffset(i) = newNeighborsRefs.length
             i += 1
