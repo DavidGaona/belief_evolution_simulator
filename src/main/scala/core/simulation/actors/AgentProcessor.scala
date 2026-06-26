@@ -34,6 +34,7 @@ case object UpdateAgent2R // Network -> Agent
 case object SnapShotAgent // Network -> Agent
 
 case class FirstUpdate(neighborSaver: ActorRef, staticSaver: ActorRef, agents: Array[ActorRef]) // Network -> Agent
+case class UpdateTopology(newRefs: Array[Int], newWeights: Array[Float], newBiases: Array[Bias]) // Network -> Agent
 
 
 // Data saving messages
@@ -67,8 +68,8 @@ class AgentProcessor(
     runMetadata: RunMetadata, beliefBuffer1: Array[Float], beliefBuffer2: Array[Float],
     speakingBuffer1: Array[Byte], speakingBuffer2: Array[Byte], belief: Array[Float],
     publicBelief: Array[Float], tolRadius: Array[Float], tolOffset: Array[Float],
-    indexOffset: Array[Int], timesStable: Array[Int], neighborsRefs: Array[Int],
-    neighborsWeights: Array[Float], neighborBiases: Array[Bias],
+    indexOffset: Array[Int], timesStable: Array[Int], var neighborsRefs: Array[Int],
+    var neighborsWeights: Array[Float], var neighborBiases: Array[Bias],
     hasMemory: Array[Byte], neighborsBiasesToAssign: Option[mutable.HashMap[Bias, Int]],
     networkId: UUID, numberOfAgents: Int, startsAt: Int, names: Array[String]
 )
@@ -117,15 +118,15 @@ class AgentProcessor(
                 if (!hasUpdatedInfluences) generateInfluencesAndBiases()
                 
                 if (runMetadata.saveMode.includesAgents) {
-                    agentsStaticStates(i) = StaticAgentData(
+                    agentsStaticStates(i - startsAt) = StaticAgentData(
                         id = ids(i),
                         numberOfNeighbors = neighborsSize(i),
                         toleranceRadius = tolRadius(i),
                         tolOffset = tolOffset(i),
                         beliefExpressionThreshold = None,
                         openMindedness = None,
-                        causeOfSilence = silenceStrategy(i).toString,
-                        effectOfSilence = silenceEffect(i).toString,
+                        causeOfSilence = silenceStrategy(i).name,
+                        effectOfSilence = silenceEffect(i).name,
                         beliefUpdateMethod = "DeGroot",
                         name = if (isGenerated) None else Option(names(i))
                     )
@@ -168,6 +169,11 @@ class AgentProcessor(
             bufferSwitch = false
             updateBuffers(beliefBuffer2, beliefBuffer1, speakingBuffer2, speakingBuffer1)
         
+        case UpdateTopology(newRefs, newWeights, newBiases) =>
+            this.neighborsRefs = newRefs
+            this.neighborsWeights = newWeights
+            this.neighborBiases = newBiases
+            
         case SnapShotAgent =>
             if (bufferSwitch) snapshotAgentState(true, null, speakingBuffer2)
             else snapshotAgentState(true, null, speakingBuffer1)
@@ -402,9 +408,9 @@ class AgentProcessor(
         while (i < (startsAt + numberOfAgents)) {
             if (forceSnapshot || math.abs(belief(i) - pastBeliefs(i)) != 0) {
                 if (silenceEffect(i) == SilenceEffects.MEMORY) encoder.encodeFloat("publicBelief", publicBelief(i))
-                if (threshold.contains(i)) encoder.encodeFloat("threshold", threshold(i))
+                if (threshold != null) encoder.encodeFloat("threshold", threshold(i))
                 
-                if (confidence.contains(i)) {
+                if (confidence != null) {
                     val unboundedConfidence = confidence(i)
                     val threshold = confidenceThreshold(i)
                     encoder.encodeFloat("confidenceThreshold", threshold)

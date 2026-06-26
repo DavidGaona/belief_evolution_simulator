@@ -146,7 +146,7 @@ CREATE TABLE IF NOT EXISTS public.networks
     id                 uuid                          NOT NULL,
     run_time           bigint  DEFAULT '-1'::integer NOT NULL,
     build_time         bigint  DEFAULT '-1'::integer NOT NULL,
-    run_id             integer                       NOT NULL,
+    run_id             bigint                        NOT NULL,
     number_of_agents   integer                       NOT NULL,
     final_round        integer DEFAULT '-1'::integer NOT NULL,
     name               character varying(16)         NOT NULL,
@@ -186,7 +186,7 @@ CREATE TABLE IF NOT EXISTS public.agent_states_speaking
 
 CREATE TABLE IF NOT EXISTS public.generated_run_parameters
 (
-    run_id              integer NOT NULL,
+    run_id              bigint NOT NULL,
     degree_distribution real    NOT NULL,
     density             integer NOT NULL
 );

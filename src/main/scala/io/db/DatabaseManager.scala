@@ -669,7 +669,7 @@ object DatabaseManager {
     }
     
     def insertAgentsBatch(agents: StaticData): Unit = {
-        val conn = getConnection
+        val conn = getConnectionLegacy
         var stmt: PreparedStatement = null
         try {
             conn.setAutoCommit(true)
@@ -1593,6 +1593,50 @@ object DatabaseManager {
             case ex: Exception =>
                 Logger.logError(s"setRunStatus($runId, $status) failed: ${ex.getMessage}")
                 false
+        } finally {
+            conn.close()
+        }
+    }
+
+    def getConsensusCount(runId: Long): Int = {
+        val useLegacy = core.simulation.config.GlobalState.APP_MODE.usesLegacyDB
+        val conn = if (useLegacy) getConnectionLegacy else getConnection
+        try {
+            val sql = if (useLegacy) {
+                "SELECT COUNT(*) FROM public.networks WHERE run_id = ? AND simulation_outcome = true"
+            } else {
+                "SELECT COUNT(*) FROM public.network_results WHERE run_id = ? AND reached_consensus = true"
+            }
+            val stmt = conn.prepareStatement(sql)
+            stmt.setLong(1, runId)
+            val rs = stmt.executeQuery()
+            if (rs.next()) rs.getInt(1) else 0
+        } catch {
+            case ex: Exception =>
+                Logger.logError(s"getConsensusCount($runId) failed: ${ex.getMessage}")
+                0
+        } finally {
+            conn.close()
+        }
+    }
+
+    def getAvgRounds(runId: Long): Float = {
+        val useLegacy = core.simulation.config.GlobalState.APP_MODE.usesLegacyDB
+        val conn = if (useLegacy) getConnectionLegacy else getConnection
+        try {
+            val sql = if (useLegacy) {
+                "SELECT COALESCE(AVG(final_round), 0.0) FROM public.networks WHERE run_id = ?"
+            } else {
+                "SELECT COALESCE(AVG(final_round), 0.0) FROM public.network_results WHERE run_id = ?"
+            }
+            val stmt = conn.prepareStatement(sql)
+            stmt.setLong(1, runId)
+            val rs = stmt.executeQuery()
+            if (rs.next()) rs.getFloat(1) else 0.0f
+        } catch {
+            case ex: Exception =>
+                Logger.logError(s"getAvgRounds($runId) failed: ${ex.getMessage}")
+                0.0f
         } finally {
             conn.close()
         }

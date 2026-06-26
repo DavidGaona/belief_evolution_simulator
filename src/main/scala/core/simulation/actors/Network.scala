@@ -495,6 +495,10 @@ class Network(networkId: UUID, runMetadata: RunMetadata,
                             neighborsWeights = newWeights
                             neighborBiases = newBiases
 
+                            agents.foreach { agent =>
+                                agent ! UpdateTopology(neighborsRefs, neighborsWeights, neighborBiases)
+                            }
+
                             // --- STRUCTURAL CONVERGENCE METRICS ---
                             val assort   = core.simulation.topology.ConvergenceMetrics.computeAssortativity(
                                 runMetadata.agentsPerNetwork, indexOffset, neighborsRefs, neighborsWeights, currentBeliefs)
