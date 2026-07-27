@@ -88,7 +88,7 @@ class ParametricOrchestrator(
             runID = currentRunID,
             channelId = "parametric_test",
             runMode = RunMode.GENERATED,
-            saveMode = SaveModes.FULL, // FULL persists to legacy DB
+            saveMode = if (GlobalState.APP_MODE.skipDatabase) SaveModes.DEBUG else SaveModes.FULL,
             distribution = Uniform,
             startTime = startTime,
             optionalMetaData = Some(OptionalMetadata(Some(densityParam), Some(2.5f))),
@@ -130,19 +130,26 @@ class ParametricOrchestrator(
         startNextRun()
     }
     
+    var lastConsensusCount: Int = 0
+    var lastAvgRounds: Float = 0.0f
+    
     def receive: Receive = {
+        case RunCompleteWithStats(cCount, aRnd) =>
+            lastConsensusCount = cCount
+            lastAvgRounds = aRnd
+
         case RunComplete =>
             val duration = System.currentTimeMillis() - startTime
             println(s"<<< Completed Configuration in ${duration} ms (Run ID: $currentRunID)")
             
-            // Query results from database
+            // Query results from database if available, otherwise use in-memory stats
             val consensusCount = if (!GlobalState.APP_MODE.skipDatabase) {
                 DatabaseManager.getConsensusCount(currentRunID)
-            } else 0
+            } else lastConsensusCount
             
             val avgRounds = if (!GlobalState.APP_MODE.skipDatabase) {
                 DatabaseManager.getAvgRounds(currentRunID)
-            } else 0.0f
+            } else lastAvgRounds
             
             results = ParametricResult(
                 populationSize = sizes(currentSizeIdx),
@@ -179,8 +186,8 @@ object ParametricTestRunner {
         val system = ActorSystem("ParametricSystem", ConfigFactory.load().getConfig("app-dispatcher"))
         val promise = Promise[List[ParametricResult]]()
         
-        // Define base-two population sizes
-        val sizes = Seq(64, 128, 256, 512, 1024, 2048, 4096)
+        // Define base-two population sizes (>4096 agents extended)
+        val sizes = Seq(64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384)
         
         // Define Scenarios
         val scenarios = Seq(

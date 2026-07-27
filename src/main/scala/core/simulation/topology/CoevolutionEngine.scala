@@ -83,11 +83,13 @@ object CoevolutionEngine {
             }
 
             // --- PHASE 2: BOUNDED CREATION ---
+            val beliefI = beliefs(i)
+            val tauI = tolRadius(i)
             var k = 0
             while (k < numAgents) {
                 if (k != i && !isNeighbor.get(k)) {
-                    val distance = math.abs(beliefs(k) - beliefs(i))
-                    if (distance <= tolRadius(i)) {
+                    val distance = math.abs(beliefs(k) - beliefI)
+                    if (distance <= tauI) {
                         if (random.nextFloat() < pCreate) {
                             newCandidates.addOne(k)
                         }

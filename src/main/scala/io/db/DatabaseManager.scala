@@ -91,10 +91,10 @@ object DatabaseManager {
     hikariConfigLegacy.addDataSourceProperty("tcpKeepAlive", "true")
     
     // ============================================================================
-    // DATA SOURCE INSTANCES
+    // DATA SOURCE INSTANCES (lazy so skipping DB doesn't trigger connection initialization)
     // ============================================================================
-    private val dataSource = new HikariDataSource(hikariConfigNew)
-    private val dataSourceLegacy = new HikariDataSource(hikariConfigLegacy)
+    private lazy val dataSource = new HikariDataSource(hikariConfigNew)
+    private lazy val dataSourceLegacy = new HikariDataSource(hikariConfigLegacy)
     
     private inline def getConnection: Connection = dataSource.getConnection
     private inline def getConnectionLegacy: Connection = dataSourceLegacy.getConnection

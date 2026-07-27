@@ -51,6 +51,7 @@ case class NeighborsLoad(
 case object StartRun // Monitor -> Run
 case class BuildingComplete(networkId: UUID) // Network -> Run
 case class RunningComplete(networkId: UUID, round: Int, result: Int) // Network -> Run
+case class RunCompleteWithStats(consensusCount: Int, avgRounds: Float) // Run -> Parent
 
 // Actor
 
@@ -285,6 +286,7 @@ class Run extends Actor {
                                         """.stripMargin
                     )
                 }
+                context.parent ! RunCompleteWithStats(networksConsensus, avgRounds.toFloat / runMetadata.numberOfNetworks)
                 context.parent ! RunComplete
             }
             
@@ -324,7 +326,7 @@ class Run extends Actor {
             agentTypeCount,
             agentBiases
             )), s"N${index + 1}")
-        if (runMetadata.saveMode.includesNetworks) {
+        if (runMetadata.saveMode.includesNetworks && !GlobalState.APP_MODE.skipDatabase) {
             DatabaseManager.createNetwork(networkId, s"N${index + 1}", runMetadata.runID,
                                           runMetadata.agentsPerNetwork)
         }
