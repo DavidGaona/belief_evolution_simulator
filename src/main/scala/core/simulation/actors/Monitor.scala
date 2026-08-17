@@ -8,7 +8,9 @@ import core.simulation.config.*
 import core.simulation.config.SaveModes.SaveMode
 import io.db.DatabaseManager
 import io.persistence.RoundRouter
+import io.persistence.actors.{FlushDone, FrameSaverRouter}
 import io.web.{CustomRunInfo, Server}
+import io.web.ws.WsRegistry
 import utils.datastructures.SnowflakeID
 import utils.logging.Logger
 import utils.rng.distributions.{CustomDistribution, Distribution, Uniform}
@@ -27,7 +29,6 @@ import scala.collection.mutable
  * participating in the run.
  *
  * @param runID Unique identifier for the simulation run
- * @param channelId Web socket communication channel identifier assigned to this run
  * @param runMode Execution mode defining run behavior (Generated, Custom, etc.)
  * @param saveMode Data persistence strategy for legacy database compatibility
  * @param distribution Statistical distribution configuration for the simulation
@@ -42,7 +43,6 @@ import scala.collection.mutable
  */
 case class RunMetadata(
     runID: Long,
-    channelId: String,
     runMode: Byte,
     saveMode: SaveMode,
     distribution: Distribution,
@@ -54,7 +54,8 @@ case class RunMetadata(
     iterationLimit: Int,
     seed: Long,
     stopThreshold: Float,
-    coevolutionConfig: Option[CoevolutionConfig] = None
+    coevolutionConfig: Option[CoevolutionConfig] = None,
+    persistFrames: Boolean = false
 )
 
 case class OptionalMetadata(
@@ -75,7 +76,6 @@ case object GetStatus
 
 case class AddNetworks(
     runID: Long,
-    channelId: String,
     agentTypeCount: Array[(SilenceStrategy, SilenceEffect, Int)],
     agentBiases: Array[(Bias, Int)],
     optionalParams: mutable.Map[Int, (Float, Float)],
@@ -87,7 +87,8 @@ case class AddNetworks(
     seed: Long,
     degreeDistribution: Float,
     stopThreshold: Float,
-    coevolutionConfig: Option[CoevolutionConfig] = None
+    coevolutionConfig: Option[CoevolutionConfig] = None,
+    persistFrames: Boolean = false
 )
 
 case class AddNetworksFromCSV(path: String, silenceEffect: SilenceEffect, silenceStrategy: SilenceStrategy, bias: Bias)
@@ -142,10 +143,10 @@ class Monitor extends Actor {
     // Router
     val saveThreshold: Int = 2_000_000
     RoundRouter.setSavers(context, saveThreshold)
+    io.persistence.actors.FrameSaverRouter.init(context)
     
     // Runs
     val activeRuns: mutable.HashMap[String, (ActorRef, Long)] = mutable.HashMap.empty[String, (ActorRef, Long)]
-    val runChannelIds: mutable.HashMap[String, String] = mutable.HashMap.empty[String, String]
     val runIds: mutable.HashMap[String, Long] = mutable.HashMap.empty[String, Long]
     var totalRuns: Int = 0
     var totalActiveNetworks: Long = 0L
@@ -157,22 +158,22 @@ class Monitor extends Actor {
     def receive: Receive = {
         case RunCustomNetwork(customInfo) =>
             totalRuns += 1
-            
+
             val runMetadata = RunMetadata(
                 customInfo.runID,
-                customInfo.channelId,
                 RunMode.CUSTOM,
                 customInfo.saveMode,
                 CustomDistribution,
                 System.currentTimeMillis(),
                 None,
                 agentLimit,
-                1, 
-                customInfo.agentBeliefs.length, 
-                customInfo.iterationLimit, 
+                1,
+                customInfo.agentBeliefs.length,
+                customInfo.iterationLimit,
                 0,
                 customInfo.stopThreshold,
-                customInfo.coevolutionConfig
+                customInfo.coevolutionConfig,
+                customInfo.persistFrames
             )
             val map = mutable.HashMap[(SilenceStrategy, SilenceEffect), Int]().withDefaultValue(0)
             for (i <- customInfo.agentSilenceStrategy.indices) {
@@ -184,16 +185,15 @@ class Monitor extends Actor {
                 map.map { case ((strategy, effect), count) => (strategy, effect, count) }.toArray
             
             val runActor = context.actorOf(Props(new Run(runMetadata, customInfo, agentTypeCount)), s"R$totalRuns")
-            trackRunMemory(runActor, runMetadata.runID, runMetadata.channelId, 1, customInfo.agentBeliefs.length, customInfo.target.length)
+            trackRunMemory(runActor, runMetadata.runID, 1, customInfo.agentBeliefs.length, customInfo.target.length)
             simulationTimers.start(s"${runActor.path.name}")
 
         
-        case AddNetworks(runID, channelId, agentTypeCount, agentBiases, optionalParams, distribution, saveMode,
-        numberOfNetworks, density, iterationLimit, seed, degreeDistribution, stopThreshold, coevolutionConfig) =>
+        case AddNetworks(runID, agentTypeCount, agentBiases, optionalParams, distribution, saveMode,
+        numberOfNetworks, density, iterationLimit, seed, degreeDistribution, stopThreshold, coevolutionConfig, persistFrames) =>
             val optionalMetadata = Some(OptionalMetadata(Some(density), Some(degreeDistribution)))
             val runMetadata = RunMetadata(
                 runID,
-                channelId,
                 RunMode.GENERATED,
                 saveMode,
                 distribution,
@@ -205,7 +205,8 @@ class Monitor extends Actor {
                 iterationLimit,
                 seed,
                 stopThreshold,
-                coevolutionConfig
+                coevolutionConfig,
+                persistFrames
             )
             totalRuns += 1
             val n = runMetadata.agentsPerNetwork
@@ -213,7 +214,7 @@ class Monitor extends Actor {
             
             val actor = context.actorOf(Props(new Run(runMetadata, agentTypeCount, agentBiases)), s"R$totalRuns")
             val numberOfNeighbors = (m * (m-1)) + (n - m) * (2 * m)
-            trackRunMemory(actor, runMetadata.runID, runMetadata.channelId, numberOfNetworks, runMetadata.agentsPerNetwork, numberOfNeighbors)
+            trackRunMemory(actor, runMetadata.runID, numberOfNetworks, runMetadata.agentsPerNetwork, numberOfNeighbors)
             
             simulationTimers.start(s"${actor.path.name}")
             actor ! StartRun
@@ -223,7 +224,6 @@ class Monitor extends Actor {
             val optionalMetadata = Some(OptionalMetadata(Some(0), Some(0)))
             val runMetadata = RunMetadata(
                 SnowflakeID.generateId(),
-                "0",
                 RunMode.CSV,
                 SaveModes.DEBUG,
                 Uniform,
@@ -239,7 +239,7 @@ class Monitor extends Actor {
             val agentTypeCount = Array((silenceStrategy, silenceEffect, 18470))
             val agentBiases = Array((bias, 61157))
             val actor = context.actorOf(Props(new Run(runMetadata, path, agentTypeCount, agentBiases)), s"R$totalRuns")
-            trackRunMemory(actor, runMetadata.runID, runMetadata.channelId, 1, runMetadata.agentsPerNetwork, 61157)
+            trackRunMemory(actor, runMetadata.runID, 1, runMetadata.agentsPerNetwork, 61157)
             
             simulationTimers.start(s"${actor.path.name}")
             actor ! StartRun
@@ -249,16 +249,18 @@ class Monitor extends Actor {
             val senderActor = sender().path.name
             simulationTimers.stop(senderActor)
             memoryLeft += activeRuns(senderActor)._2
-            for {
-                channelId <- runChannelIds.get(senderActor)
-                runId     <- runIds.get(senderActor)
-            } {
+            // Persist any pending frames before announcing completion so /frames and WS replay
+            // don't see a 'completed but empty' window. FlushDone returns to this actor.
+            runIds.get(senderActor).foreach { runId =>
                 DatabaseManager.setRunStatus(runId, "completed")
-                Server.sendControlEvent(channelId, s"""{"event":"run_completed","runId":"$runId"}""")
+                FrameSaverRouter.flushNow(runId, self)
             }
-            activeRuns    -= senderActor
-            runChannelIds -= senderActor
-            runIds        -= senderActor
+            activeRuns -= senderActor
+            runIds     -= senderActor
+
+        case FlushDone(runId) =>
+            Server.sendControlEvent(runId, s"""{"event":"run_completed","runId":"$runId"}""")
+            WsRegistry.markTerminal(runId)
 
         case CancelRun(runId) =>
             runIds.find { case (_, id) => id == runId } match {
@@ -269,12 +271,13 @@ class Monitor extends Actor {
                         memoryLeft += mem
                     }
                     simulationTimers.stop(senderActor)
-                    activeRuns    -= senderActor
-                    runChannelIds -= senderActor
-                    runIds        -= senderActor
+                    activeRuns -= senderActor
+                    runIds     -= senderActor
+                    WsRegistry.markTerminal(runId)
                 case None =>
                     // Run is no longer active in this Monitor (already completed, never started, or unknown).
                     // The HTTP handler still persists status='cancelled' in DB; this is a no-op for the actor system.
+                    WsRegistry.markTerminal(runId)
             }
 
         case GetStatus =>
@@ -287,24 +290,15 @@ class Monitor extends Actor {
     }
     
     
-    private def trackRunMemory(runActor: ActorRef, runId: Long, channelId: String, numberOfNetworks: Int, agentsPerNetwork: Int, neighborsPerNetwork: Int):
-    Unit = {
-        // ~64 bytes per agent
-        // ~9 bytes per neighbor
-        // 95% memory max
+    private def trackRunMemory(runActor: ActorRef, runId: Long, numberOfNetworks: Int, agentsPerNetwork: Int, neighborsPerNetwork: Int): Unit = {
         val runMemoryUsage = (numberOfNetworks * agentsPerNetwork * 64) +
           (numberOfNetworks * neighborsPerNetwork * 9)
-
-        if (memoryLeft >= runMemoryUsage) {
-
-        } else {
+        if (memoryLeft < runMemoryUsage)
             Logger.logWarning(s"Exceeding memory limits: ${memoryLeft}")
-        }
         memoryLeft -= runMemoryUsage
         val name = runActor.path.name
         activeRuns += (name -> (runActor, runMemoryUsage))
-        runChannelIds += (name -> channelId)
-        runIds += (name -> runId)
+        runIds     += (name -> runId)
     }
     
     

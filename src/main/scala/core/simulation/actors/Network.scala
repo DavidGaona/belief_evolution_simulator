@@ -15,7 +15,7 @@ import utils.logging.Logger
 import utils.rng.distributions.BimodalDistribution
 
 import java.io.{File, FileWriter, PrintWriter}
-import java.nio.ByteBuffer
+import java.nio.{ByteBuffer, ByteOrder}
 import java.util.UUID
 import scala.collection.mutable
 import scala.concurrent.duration.*
@@ -416,10 +416,10 @@ class Network(networkId: UUID, runMetadata: RunMetadata,
                 SimulationCache.storeTopology(runMetadata.runID, networkId.toString, buildTopologySnapshot())
                 if (!GlobalState.APP_MODE.skipWS) {
                     sendNeighbors()
-                    Server.sendControlEvent(runMetadata.channelId,
+                    Server.sendControlEvent(runMetadata.runID,
                         s"""{"event":"topology_ready","runId":"${runMetadata.runID}","networkId":"$networkId"}""")
                 }
-                Server.sendControlEvent(runMetadata.channelId,
+                Server.sendControlEvent(runMetadata.runID,
                     s"""{"event":"network_started","runId":"${runMetadata.runID}","networkId":"$networkId"}""")
                 runRound()
                 pendingResponses = agents.length
@@ -445,14 +445,14 @@ class Network(networkId: UUID, runMetadata: RunMetadata,
                       s"Belief diff: of ${maxBelief - minBelief} ($maxBelief - $minBelief)")
                     SimulationCache.storeResults(runMetadata.runID, networkId.toString, buildResultsSnapshot(round, consensus = true))
                     context.parent ! RunningComplete(networkId, round, 1)
-                    Server.sendControlEvent(runMetadata.channelId,
+                    Server.sendControlEvent(runMetadata.runID,
                         s"""{"event":"network_converged","runId":"${runMetadata.runID}","networkId":"$networkId","round":$round,"consensus":true}""")
                     if (runMetadata.saveMode.includesNetworks) DatabaseManager.updateNetworkFinalRound(networkId, round, true)
                     if (GlobalState.APP_MODE.usesLegacyDB && coevolutionMetrics.nonEmpty)
                         DatabaseManager.insertCoevolutionMetricsBatch(networkId, coevolutionMetrics)
                     saveTopologySnapshot(round)
                     SimulationCache.storeFinalTopology(runMetadata.runID, networkId.toString, buildTopologySnapshot())
-                    Server.sendControlEvent(runMetadata.channelId,
+                    Server.sendControlEvent(runMetadata.runID,
                         s"""{"event":"final_topology_ready","runId":"${runMetadata.runID}","networkId":"$networkId","round":$round}""")
                     if (runMetadata.saveMode.includesLastRound) agents.foreach { agent => agent ! SnapShotAgent }
 
@@ -464,14 +464,14 @@ class Network(networkId: UUID, runMetadata: RunMetadata,
                       s"Belief diff: of ${maxBelief - minBelief} ($maxBelief - $minBelief)")
                     SimulationCache.storeResults(runMetadata.runID, networkId.toString, buildResultsSnapshot(round, consensus = false))
                     context.parent ! RunningComplete(networkId, round, 0)
-                    Server.sendControlEvent(runMetadata.channelId,
+                    Server.sendControlEvent(runMetadata.runID,
                         s"""{"event":"network_converged","runId":"${runMetadata.runID}","networkId":"$networkId","round":$round,"consensus":false}""")
                     if (runMetadata.saveMode.includesNetworks) DatabaseManager.updateNetworkFinalRound(networkId, round, false)
                     if (GlobalState.APP_MODE.usesLegacyDB && coevolutionMetrics.nonEmpty)
                         DatabaseManager.insertCoevolutionMetricsBatch(networkId, coevolutionMetrics)
                     saveTopologySnapshot(round)
                     SimulationCache.storeFinalTopology(runMetadata.runID, networkId.toString, buildTopologySnapshot())
-                    Server.sendControlEvent(runMetadata.channelId,
+                    Server.sendControlEvent(runMetadata.runID,
                         s"""{"event":"final_topology_ready","runId":"${runMetadata.runID}","networkId":"$networkId","round":$round}""")
                     if (runMetadata.saveMode.includesLastRound) agents.foreach { agent => agent ! SnapShotAgent }
                     if (finishState == 0) context.stop(self)
@@ -518,14 +518,14 @@ class Network(networkId: UUID, runMetadata: RunMetadata,
                                 Logger.log(s"Structural convergence stop — r=$assort, Φ=$frag")
                                 SimulationCache.storeResults(runMetadata.runID, networkId.toString, buildResultsSnapshot(round, consensus = false))
                                 context.parent ! RunningComplete(networkId, round, 0)
-                                Server.sendControlEvent(runMetadata.channelId,
+                                Server.sendControlEvent(runMetadata.runID,
                                     s"""{"event":"network_converged","runId":"${runMetadata.runID}","networkId":"$networkId","round":$round,"consensus":false,"structural":true}""")
                                 if (runMetadata.saveMode.includesNetworks) DatabaseManager.updateNetworkFinalRound(networkId, round, false)
                                 if (GlobalState.APP_MODE.usesLegacyDB && coevolutionMetrics.nonEmpty)
                                     DatabaseManager.insertCoevolutionMetricsBatch(networkId, coevolutionMetrics)
                                 saveTopologySnapshot(round)
                                 SimulationCache.storeFinalTopology(runMetadata.runID, networkId.toString, buildTopologySnapshot())
-                                Server.sendControlEvent(runMetadata.channelId,
+                                Server.sendControlEvent(runMetadata.runID,
                                     s"""{"event":"final_topology_ready","runId":"${runMetadata.runID}","networkId":"$networkId","round":$round}""")
                                 if (runMetadata.saveMode.includesLastRound) agents.foreach { agent => agent ! SnapShotAgent }
                                 if (finishState == 0) context.stop(self)
@@ -674,44 +674,55 @@ class Network(networkId: UUID, runMetadata: RunMetadata,
     }
     
     /**
-     * Gather neighbor data to then send via web API.
+     * Emits the network topology snapshot as a binary WS frame, once per network, before
+     * `topology_ready`.
      *
-     * '''Buffer Layout:'''
+     * Wire format (little-endian):
      *
-     * '''HEADER (24 bytes total):'''
-     *  - networkId_msb: 8 bytes (Long) - Most significant bits of network UUID
-     *  - networkId_lsb: 8 bytes (Long) - Least significant bits of network UUID
-     *  - runId: 8 bytes (Long) - Unique identifier for this simulation run
-     *  - numberOfAgents: 4 bytes (Int) - Count of agents in the simulation
-     *  - numberOfNeighbors: 4 bytes (Int) - Count of neighbor relationships
+     * HEADER (32 bytes):
+     *  - 0-7    int64   networkId.mostSigBits
+     *  - 8-15   int64   networkId.leastSigBits
+     *  - 16-23  int64   runId
+     *  - 24-27  int32   numberOfAgents
+     *  - 28-31  int32   numberOfNeighbors
      *
-     * '''BODY (variable bytes):'''
-     *  - indexOffset: (numberOfAgents * 4) bytes (Int[]) - Agent index offsets
-     *  - neighborsRefs: (numberOfNeighbors * 4) bytes (Int[]) - Neighbor reference indices
-     *  - neighborsWeights: (numberOfNeighbors * 4) bytes (Float[]) - Connection weights
-     *  - neighborBiases: (numberOfNeighbors * 1) bytes (Bias[]/Byte[]) - Cognitive bias types
+     * BODY (variable):
+     *  - indexOffset      : numberOfAgents    × int32  (CSR row pointers, cumulative)
+     *  - neighborsRefs    : numberOfNeighbors × int32  (target agent indices)
+     *  - neighborsWeights : numberOfNeighbors × float32
+     *  - neighborBiases   : numberOfNeighbors × uint8
      *
-     * @note Total buffer size: 24 + (numberOfAgents * 4) + (numberOfNeighbors * 9) bytes
+     * Total: 32 + numberOfAgents*4 + numberOfNeighbors*9 bytes.
      */
     private def sendNeighbors(): Unit = {
-        val numberOfAgents = indexOffset.length
+        val numberOfAgents    = indexOffset.length
         val numberOfNeighbors = neighborsRefs.length
-        val buffer = ByteBuffer.allocate(24 + (numberOfAgents * 4) + (numberOfNeighbors * 8))
-        
-        // HEADER (24 bytes total)
+        val headerBytes = 32
+        val bodyBytes   = (numberOfAgents * 4) + (numberOfNeighbors * 9)
+        val buffer = ByteBuffer.allocate(headerBytes + bodyBytes).order(ByteOrder.LITTLE_ENDIAN)
+
+        // HEADER (32 bytes)
         buffer.putLong(networkId.getMostSignificantBits)
         buffer.putLong(networkId.getLeastSignificantBits)
         buffer.putLong(runMetadata.runID)
-        buffer.putInt(indexOffset.length)
-        buffer.putInt(neighborsRefs.length)
-        
-        // BODY (variable bytes)
-        buffer.asIntBuffer().put(indexOffset)
-        buffer.asIntBuffer().put(neighborsRefs)
-        buffer.asFloatBuffer().put(neighborsWeights)
+        buffer.putInt(numberOfAgents)
+        buffer.putInt(numberOfNeighbors)
+
+        // BODY — asIntBuffer/asFloatBuffer views don't advance the parent buffer's position,
+        // so we bulk-write into the view then move the parent cursor by hand.
+        val intView = buffer.asIntBuffer()
+        intView.put(indexOffset)
+        intView.put(neighborsRefs)
+        buffer.position(buffer.position() + (numberOfAgents + numberOfNeighbors) * 4)
+
+        val floatView = buffer.asFloatBuffer()
+        floatView.put(neighborsWeights)
+        buffer.position(buffer.position() + numberOfNeighbors * 4)
+
         buffer.put(neighborBiases.asInstanceOf[Array[Byte]])
-        
-        Server.sendNeighborBinaryData(runMetadata.channelId, buffer)
+
+        buffer.flip()
+        Server.sendNeighborBinaryData(runMetadata.runID, buffer)
     }
     
     /**

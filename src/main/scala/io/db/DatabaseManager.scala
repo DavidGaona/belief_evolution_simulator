@@ -153,7 +153,8 @@ object DatabaseManager {
         totalNetworks: Int, agentsPerNetwork: Int, stopThreshold: Float,
         agentTypeDistributions: Array[(SilenceStrategy, SilenceEffect, Int)],
         cognitiveBiasDistributions: Array[(Bias, Int)],
-        userId: Option[Int] = None): Unit = {
+        userId: Option[Int] = None,
+        frameRetention: String = "ephemeral"): Unit = {
         if (GlobalState.APP_MODE.skipDatabase) return
         val connection = getConnection
         try {
@@ -161,8 +162,8 @@ object DatabaseManager {
             val generatedRunsQuery =
                 """
                 INSERT INTO generated_runs (id, seed, density, iteration_limit, total_networks,
-                                           agents_per_network, stop_threshold, user_id)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                                           agents_per_network, stop_threshold, user_id, frame_retention)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, CAST(? AS frame_retention))
                 """
 
             val generatedRunsStmt = connection.prepareStatement(generatedRunsQuery)
@@ -177,6 +178,7 @@ object DatabaseManager {
                 case Some(uid) => generatedRunsStmt.setInt(8, uid)
                 case None      => generatedRunsStmt.setNull(8, java.sql.Types.INTEGER)
             }
+            generatedRunsStmt.setString(9, frameRetention)
             generatedRunsStmt.executeUpdate()
             
             val agentTypeQuery =
@@ -238,7 +240,8 @@ object DatabaseManager {
      */
     def saveCustomRun(id: Long, iterationLimit: Int, stopThreshold: Float, runName: String,
         customAgentsData: CustomAgentsData, customNeighborsData: CustomNeighborsData,
-        userId: Option[Int] = None): Unit = {
+        userId: Option[Int] = None,
+        frameRetention: String = "ephemeral"): Unit = {
         if (GlobalState.APP_MODE.skipDatabase) return
         val connection = getConnection
         try {
@@ -246,8 +249,8 @@ object DatabaseManager {
 
             val customRunsQuery =
                 """
-                  |INSERT INTO custom_runs (id, iteration_limit, stop_threshold, run_name, user_id)
-                  |values (?, ?, ?, ?, ?)
+                  |INSERT INTO custom_runs (id, iteration_limit, stop_threshold, run_name, user_id, frame_retention)
+                  |values (?, ?, ?, ?, ?, CAST(? AS frame_retention))
                   |""".stripMargin
 
             val customRunsStmt: PreparedStatement = connection.prepareStatement(customRunsQuery)
@@ -259,6 +262,7 @@ object DatabaseManager {
                 case Some(uid) => customRunsStmt.setInt(5, uid)
                 case None      => customRunsStmt.setNull(5, java.sql.Types.INTEGER)
             }
+            customRunsStmt.setString(6, frameRetention)
             customRunsStmt.executeUpdate()
             
             val customAgentsQuery =
@@ -1573,16 +1577,19 @@ object DatabaseManager {
     def setRunStatus(runId: Long, status: String): Boolean = {
         if (GlobalState.APP_MODE.skipDatabase) return false
         val conn = getConnection
+        // Terminal statuses also bump completed_at so the ephemeral-frames cron has a deletion anchor.
+        val terminal = status == "completed" || status == "cancelled" || status == "error"
+        val completedClause = if (terminal) ", completed_at = NOW()" else ""
         try {
             val updateGenerated = conn.prepareStatement(
-                "UPDATE generated_runs SET status = ?::run_status WHERE id = ?"
+                s"UPDATE generated_runs SET status = ?::run_status$completedClause WHERE id = ?"
             )
             updateGenerated.setString(1, status)
             updateGenerated.setLong(2, runId)
             val genRows = updateGenerated.executeUpdate()
 
             val updateCustom = conn.prepareStatement(
-                "UPDATE custom_runs SET status = ?::run_status WHERE id = ?"
+                s"UPDATE custom_runs SET status = ?::run_status$completedClause WHERE id = ?"
             )
             updateCustom.setString(1, status)
             updateCustom.setLong(2, runId)
@@ -1638,6 +1645,171 @@ object DatabaseManager {
                 Logger.logError(s"getAvgRounds($runId) failed: ${ex.getMessage}")
                 0.0f
         } finally {
+            conn.close()
+        }
+    }
+
+    // ============================================================================
+    // FRAME PERSISTENCE (network_frames)
+    // ============================================================================
+
+    // Bulk-inserts a pre-formatted PGCOPY BINARY payload built by FrameStreamBuffer.
+    // Format mirrors the table: (network_id UUID, round INT, starts_at INT, frame BYTEA, run_id BIGINT).
+    def insertFrameBatch(data: Array[Byte]): Unit = {
+        if (GlobalState.APP_MODE.skipDatabase) return
+        val conn = getConnection
+        try {
+            conn.setAutoCommit(false)
+            val copyManager = new CopyManager(conn.unwrap(classOf[BaseConnection]))
+            val reader = new ByteArrayInputStream(data)
+            copyManager.copyIn(
+                "COPY public.network_frames (network_id, round, starts_at, frame, run_id) FROM STDIN WITH (FORMAT BINARY)",
+                reader
+            )
+            conn.commit()
+            reader.close()
+        } catch {
+            case ex: Exception =>
+                Logger.logError(s"insertFrameBatch failed: ${ex.getMessage}")
+                try conn.rollback() catch { case _: Exception => () }
+        } finally {
+            try conn.setAutoCommit(true) catch { case _: Exception => () }
+            conn.close()
+        }
+    }
+
+    // Concatenates all slices in [fromRound, toRound] for a network, ordered by (round, starts_at).
+    // The byte stream matches the WS on-the-wire format so the client can reuse its parser.
+    def getFramesInRange(networkId: UUID, fromRound: Int, toRound: Int): Array[Byte] = {
+        if (GlobalState.APP_MODE.skipDatabase) return Array.emptyByteArray
+        val conn = getConnection
+        var stmt: PreparedStatement = null
+        try {
+            stmt = conn.prepareStatement(
+                """SELECT frame FROM public.network_frames
+                  | WHERE network_id = ? AND round BETWEEN ? AND ?
+                  | ORDER BY round, starts_at""".stripMargin
+            )
+            stmt.setObject(1, networkId)
+            stmt.setInt(2, fromRound)
+            stmt.setInt(3, toRound)
+            val rs = stmt.executeQuery()
+            val out = new java.io.ByteArrayOutputStream(64 * 1024)
+            while (rs.next()) out.write(rs.getBytes(1))
+            out.toByteArray
+        } catch {
+            case ex: Exception =>
+                Logger.logError(s"getFramesInRange($networkId, $fromRound, $toRound) failed: ${ex.getMessage}")
+                Array.emptyByteArray
+        } finally {
+            if (stmt != null) stmt.close()
+            conn.close()
+        }
+    }
+
+    def getLastFrameRound(networkId: UUID): Option[Int] = {
+        if (GlobalState.APP_MODE.skipDatabase) return None
+        val conn = getConnection
+        var stmt: PreparedStatement = null
+        try {
+            stmt = conn.prepareStatement(
+                "SELECT MAX(round) FROM public.network_frames WHERE network_id = ?"
+            )
+            stmt.setObject(1, networkId)
+            val rs = stmt.executeQuery()
+            if (rs.next()) {
+                val v = rs.getInt(1)
+                if (rs.wasNull()) None else Some(v)
+            } else None
+        } catch {
+            case ex: Exception =>
+                Logger.logError(s"getLastFrameRound($networkId) failed: ${ex.getMessage}")
+                None
+        } finally {
+            if (stmt != null) stmt.close()
+            conn.close()
+        }
+    }
+
+    // True if the network's run has frame_retention='persistent'. Used by the /frames endpoint
+    // when we need to decide visibility independently of the actual rows present.
+    case class FrameAvailability(retention: String, runStatus: String)
+
+    def getFrameAvailability(runId: Long): Option[FrameAvailability] = {
+        if (GlobalState.APP_MODE.skipDatabase) return None
+        val conn = getConnection
+        var stmt: PreparedStatement = null
+        try {
+            stmt = conn.prepareStatement(
+                """SELECT frame_retention::text, status::text FROM public.generated_runs WHERE id = ?
+                  | UNION ALL
+                  | SELECT frame_retention::text, status::text FROM public.custom_runs WHERE id = ?
+                  | LIMIT 1""".stripMargin
+            )
+            stmt.setLong(1, runId)
+            stmt.setLong(2, runId)
+            val rs = stmt.executeQuery()
+            if (rs.next()) Some(FrameAvailability(rs.getString(1), rs.getString(2))) else None
+        } catch {
+            case ex: Exception =>
+                Logger.logError(s"getFrameAvailability($runId) failed: ${ex.getMessage}")
+                None
+        } finally {
+            if (stmt != null) stmt.close()
+            conn.close()
+        }
+    }
+
+    // Deletes frames for ephemeral runs whose terminal state is older than `graceMinutes`.
+    // Returns the number of rows deleted. Run periodically from the Server cron.
+    def cleanupEphemeralFrames(graceMinutes: Int): Int = {
+        if (GlobalState.APP_MODE.skipDatabase) return 0
+        val conn = getConnection
+        var stmt: PreparedStatement = null
+        try {
+            stmt = conn.prepareStatement(
+                s"""DELETE FROM public.network_frames
+                   | WHERE run_id IN (
+                   |   SELECT id FROM public.generated_runs
+                   |   WHERE frame_retention = 'ephemeral'
+                   |     AND status <> 'running'
+                   |     AND completed_at IS NOT NULL
+                   |     AND completed_at < NOW() - INTERVAL '$graceMinutes minutes'
+                   |   UNION ALL
+                   |   SELECT id FROM public.custom_runs
+                   |   WHERE frame_retention = 'ephemeral'
+                   |     AND status <> 'running'
+                   |     AND completed_at IS NOT NULL
+                   |     AND completed_at < NOW() - INTERVAL '$graceMinutes minutes'
+                   | )""".stripMargin
+            )
+            stmt.executeUpdate()
+        } catch {
+            case ex: Exception =>
+                Logger.logError(s"cleanupEphemeralFrames failed: ${ex.getMessage}")
+                0
+        } finally {
+            if (stmt != null) stmt.close()
+            conn.close()
+        }
+    }
+
+    // Explicit cleanup for DELETE /simulations/{runId}. Drops all frames tied to the run
+    // regardless of retention policy.
+    def deleteFramesForRun(runId: Long): Int = {
+        if (GlobalState.APP_MODE.skipDatabase) return 0
+        val conn = getConnection
+        var stmt: PreparedStatement = null
+        try {
+            stmt = conn.prepareStatement("DELETE FROM public.network_frames WHERE run_id = ?")
+            stmt.setLong(1, runId)
+            stmt.executeUpdate()
+        } catch {
+            case ex: Exception =>
+                Logger.logError(s"deleteFramesForRun($runId) failed: ${ex.getMessage}")
+                0
+        } finally {
+            if (stmt != null) stmt.close()
             conn.close()
         }
     }

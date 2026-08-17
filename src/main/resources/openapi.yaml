@@ -119,19 +119,19 @@ components:
       properties:
         runId:
           type: string
-          description: Snowflake ID
+          description: Snowflake ID (64-bit, returned as string)
         status:
           type: string
           enum: [running]
         networkCount:
           type: integer
-        channelId:
-          type: string
-        wsTicket:
-          type: string
-          description: Single-use ticket for WS connection (30s TTL)
         wsUrl:
           type: string
+          example: /ws
+          description: |
+            Constant path of the persistent WebSocket endpoint.
+            After receiving this response, send `{"type":"subscribe","runId":"<runId>"}` over the
+            already-open WS connection (see `GET /ws`).
 
     AgentType:
       type: object
@@ -195,6 +195,23 @@ components:
           type: array
           items:
             $ref: '#/components/schemas/BiasType'
+        persistFrames:
+          type: boolean
+          default: false
+          description: |
+            When `true`, the backend persists every WS round frame so they can be replayed via
+            `GET /simulations/{runId}/networks/{networkId}/frames`. Enables timeline scrubbing,
+            page-refresh resilience mid-simulation, and recovery for sims that complete before
+            the WebSocket connects.
+        frameRetention:
+          type: string
+          enum: [ephemeral, persistent]
+          default: ephemeral
+          description: |
+            Retention policy for persisted frames. `ephemeral` (default) deletes frames ~60 minutes
+            after the run leaves the `running` state. `persistent` keeps them indefinitely and is
+            restricted to users with the `Administrator` role; non-admins requesting `persistent`
+            receive `403 forbidden`.
 
     Agent:
       type: object
@@ -263,6 +280,19 @@ components:
           type: array
           items:
             $ref: '#/components/schemas/Edge'
+        persistFrames:
+          type: boolean
+          default: false
+          description: |
+            When `true`, the backend persists every WS round frame so they can be replayed via
+            `GET /simulations/{runId}/networks/{networkId}/frames`.
+        frameRetention:
+          type: string
+          enum: [ephemeral, persistent]
+          default: ephemeral
+          description: |
+            `ephemeral` deletes frames ~60 minutes after the run leaves `running`. `persistent`
+            keeps them indefinitely and is restricted to Administrators.
 
 security:
   - BearerAuth: []
@@ -856,13 +886,22 @@ paths:
         '404':
           description: Run not found
 
-  /simulations/{runId}/ws-ticket:
-    post:
+  /simulations/{runId}/networks/{networkId}/frames:
+    get:
       tags: [Simulations]
-      summary: Issue a fresh WS ticket
+      summary: Replay persisted WS frames
       description: |
-        Issues a new single-use ticket for WebSocket reconnections.
-        Ticket expires in 30 seconds. Owner or Administrator only.
+        Returns binary frames byte-for-byte identical to what the WebSocket emits, so a client
+        can reuse its WS parser. Requires the run to have been created with `persistFrames=true`.
+        Owner or Administrator only.
+
+        Query forms (mutually exclusive):
+        - `?round=N` — single round
+        - `?round=last` — most recent persisted round
+        - `?from=A&to=B` — inclusive range, capped at **1000 rounds per request**
+
+        Returns `404 frames_not_persisted` if `persistFrames=false` on the run, if the requested
+        rounds were never emitted, or if ephemeral frames already expired.
       parameters:
         - name: runId
           in: path
@@ -870,56 +909,173 @@ paths:
           schema:
             type: integer
             format: int64
+        - name: networkId
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+        - name: round
+          in: query
+          schema:
+            oneOf:
+              - type: integer
+              - type: string
+                enum: [last]
+        - name: from
+          in: query
+          schema:
+            type: integer
+        - name: to
+          in: query
+          schema:
+            type: integer
       responses:
         '200':
-          description: Ticket issued
+          description: |
+            Concatenation of WS slices ordered by `(round, starts_at)`. Each slice has the same
+            36-byte header + (publicBelief, privateBelief, speaking) payload as the WS stream.
           content:
-            application/json:
+            application/octet-stream:
               schema:
-                type: object
-                properties:
-                  wsTicket:
-                    type: string
+                type: string
+                format: binary
+        '400':
+          description: Invalid range or `range_too_large`
         '403':
           description: Forbidden
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/Error'
         '404':
-          description: Run not found
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/Error'
+          description: Frames not persisted or expired
 
   # ── WebSocket ──────────────────────────────────────────────────────────────
 
-  /simulations/{runId}/stream:
+  /ws:
     get:
       tags: [WebSocket]
-      summary: WebSocket stream for a simulation run
+      summary: Persistent authenticated WebSocket
       description: |
-        Upgrades the connection to WebSocket. Requires a single-use ticket.
+        Upgrades the connection to a single persistent WebSocket per user session.
+        Open once at login; keep it alive for the entire session.
 
-        **Text frames (JSON control events):**
+        ## Handshake (client → server, first message)
+
+        Auth must be the very first message. The server closes the connection if it
+        receives anything else or if the token is invalid.
+
         ```json
-        {"event":"topology_ready",   "runId":"...", "networkId":"..."}
-        {"event":"network_started",  "runId":"...", "networkId":"..."}
-        {"event":"network_converged","runId":"...", "networkId":"...","round":10,"consensus":true}
-        {"event":"run_completed",    "runId":"..."}
+        {"type": "auth", "token": "<Firebase idToken>"}
         ```
 
-        **Binary frames:** agent belief state per round, little-endian.
+        Server responds (server → client):
+        ```json
+        {"type": "auth_ok", "userId": "<uid>"}
+        ```
+        or on failure:
+        ```json
+        {"type": "error", "code": "auth_failed"}
+        ```
 
-        Source of truth: `AgentProcessor.scala:465-470` (header) + `461-482` (full frame writer).
+        ## Subscribe to a run (client → server)
+
+        Send after `POST /simulations/generated` or `POST /simulations/custom` returns `runId`.
+        Can be sent before the simulation starts — **this eliminates the race condition**.
+
+        ```json
+        {"type": "subscribe", "runId": "<runId>"}
+        ```
+
+        **Replay buffer.** The server keeps every event emitted for a run (control events and
+        binary frames, in original wire order) in an in-memory buffer keyed by `runId`. On
+        subscribe the buffer is drained to the client before live events flow, so a subscriber
+        joining mid-run or just after `run_completed` sees the full sequence — including
+        `network_started` and any binary frames already emitted. The buffer is evicted 60
+        minutes after the run reaches a terminal state, after which the server falls back to
+        a DB-backed replay.
+
+        **If the run is still running:** the server registers the connection, drains the
+        buffer (any events emitted before subscribe), and live events continue to flow.
+
+        **If the run is already completed:** the buffer drain delivers the full sequence
+        in the same order as live emission — see "Live event order per network" below.
+        After 60 minutes the buffer is gone and the server falls back to DB replay
+        (`topology_ready` → `network_started` → frame binaries if `persistFrames=true` →
+        `network_converged` → `run_completed`; the topology binary is **not** replayed from
+        DB — fetch it via `GET /topology` if you need it).
+
+        **If the run does not exist:**
+        ```json
+        {"type": "error", "code": "run_not_found", "runId": "<runId>"}
+        ```
+
+        ## Unsubscribe (client → server)
+
+        ```json
+        {"type": "unsubscribe", "runId": "<runId>"}
+        ```
+
+        ## Live event order per network
+
+        For each network in the run, in this exact order:
+
+        1. **Topology binary** (one frame, 32-byte header) — full adjacency in CSR layout.
+        2. `topology_ready` JSON event.
+        3. `network_started` JSON event.
+        4. **Frame binary** (one per `AgentProcessor` per round, 36-byte header) — repeated
+           until convergence or iteration limit.
+        5. `network_converged` JSON event.
+
+        After every network finishes, the run emits `run_completed`.
+
+        ## Control events (server → client, JSON text frames)
+
+        ```json
+        {"event": "topology_ready",    "runId": "...", "networkId": "..."}
+        {"event": "network_started",   "runId": "...", "networkId": "..."}
+        {"event": "network_converged", "runId": "...", "networkId": "...", "round": 10, "consensus": true}
+        {"event": "run_completed",     "runId": "..."}
+        ```
+
+        On `topology_ready`, the network topology is already in your buffer as the preceding
+        binary message; you can also fetch it via `GET /simulations/{runId}/networks/{networkId}/topology`
+        if you missed it.
+
+        ## Topology binary (server → client, one per network)
+
+        Full adjacency snapshot in CSR (Compressed Sparse Row) layout. Emitted once per
+        network, immediately before `topology_ready`. Little-endian throughout.
 
         ```
-        Header (36 bytes, little-endian):
+        Header (32 bytes):
+          0-7    int64    networkId.mostSigBits
+          8-15   int64    networkId.leastSigBits
+          16-23  int64    runId             (Snowflake ID — read with BigInt on JS)
+          24-27  int32    numberOfAgents    (= n)
+          28-31  int32    numberOfNeighbors (= m, sum of all per-agent degrees)
+
+        Body:
+          indexOffset      n × int32    — cumulative neighbor counts. The neighbors of
+                                          agent i live at body indices
+                                          [indexOffset(i-1), indexOffset(i))
+                                          (or [0, indexOffset(0)) for i=0).
+          neighborsRefs    m × int32    — target agent indices, ordered by source.
+          neighborsWeights m × float32  — connection weight (influence) per edge.
+          neighborBiases   m × uint8    — cognitive bias enum per edge.
+        ```
+
+        Total: `32 + n*4 + m*9` bytes.
+
+        ## Frame binary (server → client, one per AgentProcessor partition per round)
+
+        Agent belief state per round, little-endian. Wire format is identical to the
+        data returned by `GET /simulations/{runId}/networks/{networkId}/frames` — the
+        same parser handles both.
+
+        ```
+        Header (36 bytes):
           0-7    int64    networkId.mostSigBits
           8-15   int64    networkId.leastSigBits
           16-23  int64    runId           (Snowflake ID — read with BigInt on JS)
-          24-27  int32    numberOfAgents  (in this partition)
+          24-27  int32    numberOfAgents  (agents in this partition)
           28-31  int32    round
           32-35  int32    startsAt        (index of the first agent in this partition)
 
@@ -930,42 +1086,48 @@ paths:
           [isSpeaking (uint8)] × n
         ```
 
-        Total payload size per frame: `36 + 9 * numberOfAgents` bytes.
+        Total per frame: `36 + 9 × numberOfAgents` bytes.
 
-        **Partitioning.** A single round may emit multiple binary frames with different
-        `startsAt` values — multiple `AgentProcessor` actors write to the same channel and
-        partition the agent ID space. Each frame covers the slice
-        `[startsAt, startsAt + numberOfAgents)`. The client merges partitions by
-        `(runId, networkId, round)`, indexed on `startsAt`, before treating the round as
-        complete.
+        **Partitioning.** One round may emit multiple frame binaries with different `startsAt`
+        values (one per `AgentProcessor` actor). Each frame covers `[startsAt, startsAt + numberOfAgents)`.
+        Merge partitions by `(runId, networkId, round)` before treating a round as complete.
 
-        **Belief is a pair.** Each agent reports both `publicBelief` and `privateBelief`.
-        Visualization (Spiral of Silence) uses `publicBelief`; the inspector and analytical
-        dashboard may surface `privateBelief`. Both must be exposed in the parsed
-        `SimulationFrame`.
+        ## Discriminating binaries
 
-        **Bandwidth example.** 100k agents at 30 Hz, 4 partitions of 25k each:
-        `4 × (36 + 9 × 25_000) = ~900 KB/s` of WS traffic.
-      parameters:
-        - name: runId
-          in: path
-          required: true
-          schema:
-            type: integer
-            format: int64
-        - name: ticket
-          in: query
-          required: true
-          schema:
-            type: string
-          description: Single-use ticket from run creation or `/ws-ticket`. Expires in 30s.
+        Both topology and frame share the same WS channel. Discriminate by header bytes
+        24-27 vs 28-31, or by total payload size:
+
+        - Topology frame: `numberOfAgents` at bytes 24-27, `numberOfNeighbors` at 28-31. The
+          payload after the 32-byte header is `n*4 + m*9` bytes.
+        - Round frame: `numberOfAgents` at bytes 24-27, `round` at 28-31, `startsAt` at 32-35.
+          The payload after the 36-byte header is `9 × numberOfAgents` bytes.
+
+        A simple discriminator: if total bytes equals `36 + 9 × numberOfAgents` it's a round
+        frame; otherwise it's the topology frame for that network. In practice, the topology
+        always arrives once, immediately before `topology_ready`.
+
+        **Multiplexing with JSON.** Binary and JSON frames share the same connection.
+        Discriminate by `typeof event.data`: `"string"` → JSON control event; otherwise →
+        binary (topology or round frame).
+
+        **Bandwidth example.** 100 k agents at 30 Hz, 4 partitions of 25 k:
+        `4 × (36 + 9 × 25 000) ≈ 900 KB/s` of round frames.
+
+        ## Reconnect
+
+        On reconnect: re-send `auth`, then re-subscribe to any active runs.
+        The server replays topology and (if `persistFrames`) frames from the point of reconnect.
+
+        ## Multiple tabs
+
+        Each tab opens its own WebSocket connection. The server tracks all connections for a user
+        independently; each manages its own subscription set.
+      security: []
       responses:
         '101':
           description: Switching Protocols — WebSocket connection established
-        '403':
-          description: Invalid or expired ticket
-        '404':
-          description: Run not active
+        '400':
+          description: Not a WebSocket upgrade request
 
   # ── Legacy ─────────────────────────────────────────────────────────────────
 
@@ -987,11 +1149,12 @@ paths:
       security: []
       responses:
         '200':
-          description: Raw channel ID string
+          description: Run ID as plain string
           content:
             text/plain:
               schema:
                 type: string
+                description: Snowflake run ID
 
   /custom:
     post:
@@ -1009,25 +1172,9 @@ paths:
       security: []
       responses:
         '200':
-          description: Raw channel ID string
+          description: Run ID as plain string
           content:
             text/plain:
               schema:
                 type: string
-
-  /ws/{channelId}:
-    get:
-      tags: [Legacy]
-      deprecated: true
-      summary: "[Deprecated] WebSocket by raw channel ID"
-      description: Use `GET /simulations/{runId}/stream?ticket=<t>` instead.
-      parameters:
-        - name: channelId
-          in: path
-          required: true
-          schema:
-            type: string
-      security: []
-      responses:
-        '101':
-          description: Switching Protocols
+                description: Snowflake run ID

@@ -11,7 +11,7 @@ import core.simulation.*
 import core.simulation.config.GlobalState
 import io.web.Server
 import io.persistence.RoundRouter
-import io.persistence.actors.{AgentState, AgentStatesSilent, AgentStatesSpeaking, NeighborStructure, SendNeighbors, SendStaticAgentData}
+import io.persistence.actors.{AgentState, AgentStatesSilent, AgentStatesSpeaking, FrameSaverRouter, NeighborStructure, PersistFrame, SendNeighbors, SendStaticAgentData}
 import io.serialization.binary.Encoder
 import utils.logging.Logger
 import utils.rng.distributions.*
@@ -483,8 +483,21 @@ class AgentProcessor(
         buffer.put(speakingBuffer, startsAt, numberOfAgents)
         
         buffer.flip()
-        
-        Server.sendSimulationBinaryData(runMetadata.channelId, buffer)
+
+        // Persist a copy *before* sendSimulationBinaryData, which may advance position via duplicate/read.
+        // `buffer` is reused next round (clear() above), so the saver must own its own byte array.
+        if (runMetadata.persistFrames) {
+            val saver = FrameSaverRouter.getRoute
+            if (saver != null) {
+                val len = buffer.remaining()
+                val copy = new Array[Byte](len)
+                val dup = buffer.duplicate()
+                dup.get(copy)
+                saver ! PersistFrame(networkId, round, startsAt, copy, runMetadata.runID)
+            }
+        }
+
+        Server.sendSimulationBinaryData(runMetadata.runID, buffer)
     }
     
     // ============================================================================

@@ -4,14 +4,15 @@ import akka.actor.{ActorRef, ActorSystem}
 import akka.http.scaladsl.Http
 import akka.http.scaladsl.model.HttpMethods.{DELETE, GET, OPTIONS, POST, PUT}
 import akka.http.scaladsl.model.headers.*
-import akka.http.scaladsl.model.ws.{BinaryMessage, Message}
+import akka.http.scaladsl.model.ws.{BinaryMessage, Message, TextMessage}
 import akka.http.scaladsl.model.{ContentType, ContentTypes, HttpCharsets, HttpEntity, HttpResponse, MediaType, MediaTypes, StatusCodes}
 import akka.http.scaladsl.server.Directives.*
 import akka.http.scaladsl.server.{Directive0, Route}
 import akka.http.scaladsl.unmarshalling.{FromEntityUnmarshaller, Unmarshaller}
-import akka.stream.Materializer
-import akka.stream.scaladsl.{BroadcastHub, Flow, Keep, MergeHub, Sink, Source}
+import akka.stream.{Materializer, OverflowStrategy}
+import akka.stream.scaladsl.{Flow, Sink, Source}
 import akka.util.ByteString
+import io.web.ws.{ConnectionClosed, Dispatch, WsConnectionActor, WsRegistry}
 import akka.http.scaladsl.marshallers.sprayjson.SprayJsonSupport.*
 import core.model.agent.behavior.bias.CognitiveBiases
 import core.model.agent.behavior.bias.CognitiveBiases.Bias
@@ -24,7 +25,7 @@ import core.simulation.config.SaveModes.SaveMode
 import utils.logging.Logger
 import io.db.DatabaseManager
 import io.web.auth.ErrorResponses.*
-import io.web.auth.FirebaseAuthDirective.*
+import io.web.auth.FirebaseAuthDirective.{authenticate, requireAdmin}
 import utils.datastructures.SnowflakeID
 import utils.rng.distributions.Uniform
 import spray.json.*
@@ -54,7 +55,9 @@ case class GeneratedRunReq(
     saveMode: Int,
     agentTypes: Seq[AgentTypeReq],
     biasTypes: Seq[BiasTypeReq],
-    coevolution: Option[CoevolutionReq] = None
+    coevolution: Option[CoevolutionReq] = None,
+    persistFrames: Option[Boolean] = None,
+    frameRetention: Option[String] = None
 )
 
 case class AgentReq(
@@ -73,23 +76,24 @@ case class CustomRunReq(
     saveMode: Int,
     agents: Seq[AgentReq],
     edges: Seq[EdgeReq],
-    coevolution: Option[CoevolutionReq] = None
+    coevolution: Option[CoevolutionReq] = None,
+    persistFrames: Option[Boolean] = None,
+    frameRetention: Option[String] = None
 )
 
 object SimulationJsonProtocol {
     implicit val agentTypeReqFmt: RootJsonFormat[AgentTypeReq]       = jsonFormat3(AgentTypeReq.apply)
     implicit val biasTypeReqFmt: RootJsonFormat[BiasTypeReq]         = jsonFormat2(BiasTypeReq.apply)
     implicit val coevolutionReqFmt: RootJsonFormat[CoevolutionReq]   = jsonFormat5(CoevolutionReq.apply)
-    implicit val generatedRunReqFmt: RootJsonFormat[GeneratedRunReq] = jsonFormat9(GeneratedRunReq.apply)
+    implicit val generatedRunReqFmt: RootJsonFormat[GeneratedRunReq] = jsonFormat11(GeneratedRunReq.apply)
     implicit val agentReqFmt: RootJsonFormat[AgentReq]               = jsonFormat6(AgentReq.apply)
     implicit val edgeReqFmt: RootJsonFormat[EdgeReq]                 = jsonFormat4(EdgeReq.apply)
-    implicit val customRunReqFmt: RootJsonFormat[CustomRunReq]       = jsonFormat7(CustomRunReq.apply)
+    implicit val customRunReqFmt: RootJsonFormat[CustomRunReq]       = jsonFormat9(CustomRunReq.apply)
 }
 
 // Data containers:
 case class CustomRunInfo(
     runID: Long,
-    channelId: String,
     stopThreshold: Float,
     iterationLimit: Int,
     saveMode: SaveMode,
@@ -104,7 +108,8 @@ case class CustomRunInfo(
     target: Array[Int],
     influences: Array[Float],
     bias: Array[Bias],
-    coevolutionConfig: Option[CoevolutionConfig] = None
+    coevolutionConfig: Option[CoevolutionConfig] = None,
+    persistFrames: Boolean = false
 )
 
 /**
@@ -161,11 +166,6 @@ object Server {
     private var system: Option[ActorSystem] = None
     private var monitor: Option[ActorRef] = None
     
-    private val channelPublishers = mutable.Map[String, Sink[Message, Any]]()
-    private val channelSources = mutable.Map[String, Source[Message, Any]]()
-    private var channels: Long = 0L
-    private val runChannelMap = mutable.Map[Long, String]()
-    
     def initialize(actorSystem: ActorSystem, monitor: ActorRef): Unit = {
         if (initialized) return
         
@@ -178,16 +178,7 @@ object Server {
         
         val serverHost = sys.env.getOrElse("SERVER_HOST", "0.0.0.0")
         val serverPort = sys.env.getOrElse("SERVER_PORT", "8080").toInt
-        
-        val (sink, source) = MergeHub.source[Message]
-          .toMat(BroadcastHub.sink[Message])(Keep.both)
-          .run()
-        
-        val websocketFlow = Flow.fromSinkAndSourceMat(
-            Sink.ignore, 
-            source
-        )(Keep.right)
-        
+
         val corsResponseHeaders = List(
             `Access-Control-Allow-Origin`.*,
             `Access-Control-Allow-Methods`(POST, GET, PUT, DELETE, OPTIONS),
@@ -207,39 +198,19 @@ object Server {
         }
         
         val webSocketRoute: Route = addCorsHeaders {
-            path("ws" / Segment) { channelId =>
+            path("ws") {
                 get {
-                    withDeprecation("/simulations/{runId}/stream") {
-                        optionalHeaderValueByName("User-Agent") { ua =>
-                            optionalHeaderValueByName("X-Forwarded-For") { xff =>
-                                logLegacy(s"/ws/$channelId", ua, xff)
-                                optionalHeaderValueByName("Origin") { _ =>
-                                    val channelFlow = createChannelFlow(channelId)
-                                    handleWebSocketMessages(channelFlow)
-                                }
-                            }
-                        }
-                    }
-                }
-            } ~
-            path("simulations" / LongNumber / "stream") { runId =>
-                get {
-                    parameter("ticket") { ticket =>
-                        TicketStore.consume(ticket, runId) match {
-                            case None =>
-                                complete(StatusCodes.Forbidden ->
-                                    errorJson("forbidden", "Invalid or expired ticket"))
-                            case Some(_) =>
-                                runChannelMap.get(runId) match {
-                                    case None =>
-                                        complete(StatusCodes.NotFound ->
-                                            errorJson("not_found", "Run not active"))
-                                    case Some(channelId) =>
-                                        val channelFlow = createChannelFlow(channelId)
-                                        handleWebSocketMessages(channelFlow)
-                                }
-                        }
-                    }
+                    val (outRef, outSource) = Source.actorRef[Message](
+                        completionMatcher = PartialFunction.empty,
+                        failureMatcher    = PartialFunction.empty,
+                        bufferSize        = 256,
+                        overflowStrategy  = OverflowStrategy.dropHead
+                    ).preMaterialize()
+                    val connActor = system.get.actorOf(
+                        akka.actor.Props(new WsConnectionActor(outRef)))
+                    val inSink = Sink.actorRef[Message](
+                        connActor, ConnectionClosed, _ => ConnectionClosed)
+                    handleWebSocketMessages(Flow.fromSinkAndSource(inSink, outSource))
                 }
             }
         }
@@ -264,8 +235,8 @@ object Server {
                                             ))
                                             case _ => None
                                         }
-                                        val channelId = parseGeneratedRun(payload.data, config)
-                                        complete(channelId)
+                                        val runIdStr = parseGeneratedRun(payload.data, config)
+                                        complete(runIdStr)
                                     }
                                 }
                             }
@@ -291,8 +262,8 @@ object Server {
                                             ))
                                             case _ => None
                                         }
-                                        val (_, channelId) = parseCustomRun(payload.data, config)
-                                        complete(channelId)
+                                        val runId = parseCustomRun(payload.data, None, config = config)
+                                        complete(runId.toString)
                                     }
                                 }
                             }
@@ -306,8 +277,7 @@ object Server {
                             optionalHeaderValueByName("X-Forwarded-For") { xff =>
                                 logLegacy("/neighbors", ua, xff)
                                 entity(as[Payload]) { payload =>
-                                    val (_, channelId) = parseCustomRun(payload.data)
-                                    complete(channelId)
+                                    complete(parseCustomRun(payload.data).toString)
                                 }
                             }
                         }
@@ -386,23 +356,26 @@ object Server {
         // Periodic cleanup every 60 seconds
         import scala.concurrent.duration.*
         actorSystem.scheduler.scheduleWithFixedDelay(60.seconds, 60.seconds)(() => {
-            TicketStore.cleanup()
             SimulationCache.cleanup()
+            WsRegistry.cleanup()
+        })(actorSystem.dispatcher)
+
+        // Ephemeral frame cleanup runs less often (storage cost, not correctness).
+        // Grace window: 60 minutes after a run leaves 'running'.
+        actorSystem.scheduler.scheduleWithFixedDelay(5.minutes, 30.minutes)(() => {
+            val deleted = DatabaseManager.cleanupEphemeralFrames(60)
+            if (deleted > 0) Logger.log(s"cleanupEphemeralFrames removed $deleted rows")
         })(actorSystem.dispatcher)
 
         import SimulationJsonProtocol.*
 
-        def simCreatedJson(runId: Long, networkCount: Int, channelId: String, uid: String): String = {
-            val ticket = TicketStore.issue(runId, uid)
+        def simCreatedJson(runId: Long, networkCount: Int): String =
             s"""{
                |  "runId": "$runId",
                |  "status": "running",
                |  "networkCount": $networkCount,
-               |  "channelId": "$channelId",
-               |  "wsTicket": "$ticket",
-               |  "wsUrl": "/simulations/$runId/stream"
+               |  "wsUrl": "/ws"
                |}""".stripMargin
-        }
 
         def runSummaryJson(r: DatabaseManager.RunSummary): String =
             s"""{
@@ -420,6 +393,20 @@ object Server {
             HttpResponse(StatusCodes.OK,
                 entity = HttpEntity(ContentTypes.`application/json`, body))
 
+        // Resolves frameRetention: only Administrators can request "persistent".
+        // Returns Right(retention) on success, Left(errorResponse) on rejection.
+        def resolveFrameRetention(requested: Option[String], isAdmin: Boolean): Either[HttpResponse, String] =
+            requested.map(_.toLowerCase) match {
+                case None | Some("ephemeral") => Right("ephemeral")
+                case Some("persistent") if isAdmin => Right("persistent")
+                case Some("persistent") =>
+                    Left(HttpResponse(StatusCodes.Forbidden,
+                        entity = errorJson("forbidden", "frameRetention=persistent requires Administrator role")))
+                case Some(other) =>
+                    Left(HttpResponse(StatusCodes.BadRequest,
+                        entity = errorJson("invalid_body", s"Invalid frameRetention: $other")))
+            }
+
         val simulationRoutes: Route = addCorsHeaders {
             pathPrefix("simulations") {
                 // POST /simulations/generated  — JSON body
@@ -435,33 +422,38 @@ object Server {
                                 else if (req.iterationLimit > limits.maxIterations)
                                     complete(StatusCodes.UnprocessableEntity ->
                                         usageLimitJson("Iteration limit exceeds your limit", limits.maxIterations, req.iterationLimit))
-                                else {
-                                    val effectiveDensity = (req.density * limits.densityFactor).toInt
-                                    val seed = req.seed.getOrElse(-1L) match {
-                                        case -1L => System.currentTimeMillis() ^ System.nanoTime()
-                                        case s   => s
-                                    }
-                                    val agentTypesArr = req.agentTypes.map { a =>
-                                        (SilenceStrategies.fromByte(a.silenceStrategy.toByte),
-                                         SilenceEffects.fromByte(a.silenceEffect.toByte),
-                                         a.count)
-                                    }.toArray
-                                    val biasArr = req.biasTypes.map { b =>
-                                        (CognitiveBiases.fromByte(b.biasType.toByte), b.count)
-                                    }.toArray
-                                    val (runId, channelId) = executeGeneratedRun(
-                                        seed, req.saveMode.toByte, req.numberOfNetworks,
-                                        effectiveDensity, req.iterationLimit, req.stopThreshold,
-                                        agentTypesArr, biasArr,
-                                        agentsPerNetwork,
-                                        userId = Some(authUser.dbUserId),
-                                        coevolutionConfig = req.coevolution.map(c => CoevolutionConfig(
-                                            c.pBreak, c.pCreate, c.rewiringStrategy,
-                                            c.assortStop.getOrElse(1.1f),
-                                            c.fragStop.getOrElse(false)
-                                        ))
-                                    )
-                                    complete(jsonOk(simCreatedJson(runId, req.numberOfNetworks, channelId, authUser.uid)))
+                                else resolveFrameRetention(req.frameRetention, authUser.isAdmin) match {
+                                    case Left(resp) => complete(resp)
+                                    case Right(retention) =>
+                                        val persistFrames = req.persistFrames.getOrElse(false)
+                                        val effectiveDensity = (req.density * limits.densityFactor).toInt
+                                        val seed = req.seed.getOrElse(-1L) match {
+                                            case -1L => System.currentTimeMillis() ^ System.nanoTime()
+                                            case s   => s
+                                        }
+                                        val agentTypesArr = req.agentTypes.map { a =>
+                                            (SilenceStrategies.fromByte(a.silenceStrategy.toByte),
+                                             SilenceEffects.fromByte(a.silenceEffect.toByte),
+                                             a.count)
+                                        }.toArray
+                                        val biasArr = req.biasTypes.map { b =>
+                                            (CognitiveBiases.fromByte(b.biasType.toByte), b.count)
+                                        }.toArray
+                                        val runId = executeGeneratedRun(
+                                            seed, req.saveMode.toByte, req.numberOfNetworks,
+                                            effectiveDensity, req.iterationLimit, req.stopThreshold,
+                                            agentTypesArr, biasArr,
+                                            agentsPerNetwork,
+                                            userId = Some(authUser.dbUserId),
+                                            coevolutionConfig = req.coevolution.map(c => CoevolutionConfig(
+                                                c.pBreak, c.pCreate, c.rewiringStrategy,
+                                                c.assortStop.getOrElse(1.1f),
+                                                c.fragStop.getOrElse(false)
+                                            )),
+                                            persistFrames = persistFrames,
+                                            frameRetention = retention
+                                        )
+                                        complete(jsonOk(simCreatedJson(runId, req.numberOfNetworks)))
                                 }
                             }
                         }
@@ -474,9 +466,10 @@ object Server {
                             extractRequest { req =>
                                 val ct = req.entity.contentType.mediaType.toString
                                 if (ct.contains("octet-stream")) {
+                                    // Binary payload has no persistFrames flag — defaults to false/ephemeral.
                                     entity(as[Payload]) { payload =>
-                                        val (runId, channelId) = parseCustomRun(payload.data, userId = Some(authUser.dbUserId))
-                                        complete(jsonOk(simCreatedJson(runId, 1, channelId, authUser.uid)))
+                                        val runId = parseCustomRun(payload.data, Some(authUser.dbUserId))
+                                        complete(jsonOk(simCreatedJson(runId, 1)))
                                     }
                                 } else {
                                     entity(as[CustomRunReq]) { runReq =>
@@ -488,15 +481,21 @@ object Server {
                                         else if (runReq.iterationLimit > limits.maxIterations)
                                             complete(StatusCodes.UnprocessableEntity ->
                                                 usageLimitJson("Iteration limit exceeds your limit", limits.maxIterations, runReq.iterationLimit))
-                                        else {
-                                            val coevCfg = runReq.coevolution.map(c => CoevolutionConfig(
-                                                c.pBreak, c.pCreate, c.rewiringStrategy,
-                                                c.assortStop.getOrElse(1.1f),
-                                                c.fragStop.getOrElse(false)
-                                            ))
-                                            val (runId, channelId) = executeCustomRunFromJson(
-                                                runReq, Some(authUser.dbUserId), coevCfg)
-                                            complete(jsonOk(simCreatedJson(runId, 1, channelId, authUser.uid)))
+                                        else resolveFrameRetention(runReq.frameRetention, authUser.isAdmin) match {
+                                            case Left(resp) => complete(resp)
+                                            case Right(retention) =>
+                                                val coevCfg = runReq.coevolution.map(c => CoevolutionConfig(
+                                                    c.pBreak, c.pCreate, c.rewiringStrategy,
+                                                    c.assortStop.getOrElse(1.1f),
+                                                    c.fragStop.getOrElse(false)
+                                                ))
+                                                val runId = executeCustomRunFromJson(
+                                                    runReq, Some(authUser.dbUserId),
+                                                    coevolutionConfig = coevCfg,
+                                                    persistFrames = runReq.persistFrames.getOrElse(false),
+                                                    frameRetention = retention
+                                                )
+                                                complete(jsonOk(simCreatedJson(runId, 1)))
                                         }
                                     }
                                 }
@@ -642,6 +641,70 @@ object Server {
                                                 }
                                             }
                                         }
+                                    } ~
+                                    // GET /simulations/{runId}/networks/{networkId}/frames
+                                    //   ?round=N           single round
+                                    //   ?from=A&to=B       range (capped at 1000 rounds)
+                                    //   ?round=last        most recent persisted round
+                                    // Body is the WS on-the-wire format (concatenated slices).
+                                    path("frames") {
+                                        get {
+                                            parameters(
+                                                "round".?,
+                                                "from".as[Int].?,
+                                                "to".as[Int].?
+                                            ) { (roundParam, fromOpt, toOpt) =>
+                                                val networkUuid = try Some(java.util.UUID.fromString(networkId))
+                                                                  catch { case _: IllegalArgumentException => None }
+                                                networkUuid match {
+                                                    case None => complete(StatusCodes.BadRequest ->
+                                                        errorJson("invalid_body", "Invalid networkId UUID"))
+                                                    case Some(nid) =>
+                                                        val range: Either[String, (Int, Int)] = roundParam match {
+                                                            case Some("last") =>
+                                                                DatabaseManager.getLastFrameRound(nid) match {
+                                                                    case Some(r) => Right((r, r))
+                                                                    case None    => Left("no_frames")
+                                                                }
+                                                            case Some(r) =>
+                                                                try { val v = r.toInt; Right((v, v)) }
+                                                                catch { case _: NumberFormatException => Left("invalid_round") }
+                                                            case None =>
+                                                                (fromOpt, toOpt) match {
+                                                                    case (Some(f), Some(t)) if f <= t => Right((f, t))
+                                                                    case _ => Left("missing_range")
+                                                                }
+                                                        }
+                                                        range match {
+                                                            case Left("no_frames") =>
+                                                                complete(StatusCodes.NotFound ->
+                                                                    errorJson("frames_not_persisted",
+                                                                        "No frames stored for this network (persistFrames was false, or ephemeral frames already expired)"))
+                                                            case Left("invalid_round") =>
+                                                                complete(StatusCodes.BadRequest ->
+                                                                    errorJson("invalid_body", "round must be an integer or 'last'"))
+                                                            case Left(_) =>
+                                                                complete(StatusCodes.BadRequest ->
+                                                                    errorJson("invalid_body", "Provide ?round=N|last or ?from=A&to=B"))
+                                                            case Right((fromR, toR)) =>
+                                                                val span = toR - fromR + 1
+                                                                if (span > 1000)
+                                                                    complete(StatusCodes.BadRequest ->
+                                                                        errorJson("range_too_large", "Frame range capped at 1000 rounds per request"))
+                                                                else {
+                                                                    val bytes = DatabaseManager.getFramesInRange(nid, fromR, toR)
+                                                                    if (bytes.isEmpty)
+                                                                        complete(StatusCodes.NotFound ->
+                                                                            errorJson("frames_not_persisted",
+                                                                                "No frames stored in this range (persistFrames was false, or ephemeral frames already expired)"))
+                                                                    else
+                                                                        complete(HttpResponse(StatusCodes.OK,
+                                                                            entity = HttpEntity(ContentTypes.`application/octet-stream`, bytes)))
+                                                                }
+                                                        }
+                                                }
+                                            }
+                                        }
                                     }
                             }
                         }
@@ -748,30 +811,6 @@ object Server {
         initialized = true
     }
     
-    private def createChannelFlow(channelId: String): Flow[Message, Message, Any] = {
-        implicit val systenImplicit: ActorSystem = system.get
-        implicit val materializer: Materializer = Materializer(system.get)
-        
-        val (sink, source) = channelPublishers.get(channelId) match {
-            case Some(existingSink) =>
-                (existingSink, channelSources(channelId))
-            case None =>
-                val (newSink, newSource) = MergeHub.source[Message]
-                  .toMat(BroadcastHub.sink[Message])(Keep.both)
-                  .run()
-                
-                channelPublishers(channelId) = newSink
-                channelSources(channelId) = newSource
-                (newSink, newSource)
-         }
-        
-        Flow.fromSinkAndSourceMat(
-            Sink.ignore,
-            source
-        )(Keep.right)
-    }
-    
-    
     /**
      * Broadcasts binary simulation data to all WebSocket clients connected to a specific channel.
      *
@@ -809,26 +848,13 @@ object Server {
      *  - Single Source broadcasts to multiple clients efficiently
      *  - Debug logging only enabled when APP_MODE.hasServerLogs is true
      *
-     * @param channelId Unique identifier for the simulation run (maps to WebSocket connections)
+     * @param runId Unique identifier for the simulation run
      * @param buffer Binary packet containing agent states (created by AgentProcessor.sendRoundToWebSocketServer)
      */
-    def sendSimulationBinaryData(channelId: String, buffer: ByteBuffer): Unit = {
-        if (!initialized || system.isEmpty) {
-            Logger.logError("Error: WebSocket server not initialized properly")
-            return
-        }
-        
-        channelPublishers.get(channelId) match {
-            case Some(publisher) =>
-                if (GlobalState.APP_MODE.hasServerLogs) logBufferDebugInfo(buffer)
-                
-                implicit val materializer: Materializer = Materializer(system.get)
-                implicit val ec: ExecutionContext = system.get.dispatcher
-                val message = BinaryMessage(ByteString(buffer))
-                Source.single(message).runWith(publisher)
-            case None =>
-                Logger.logError(s"Error: No WebSocket clients connected to channel $channelId")
-        }
+    def sendSimulationBinaryData(runId: Long, buffer: ByteBuffer): Unit = {
+        if (!initialized) return
+        if (GlobalState.APP_MODE.hasServerLogs) logBufferDebugInfo(buffer)
+        WsRegistry.dispatchBinary(runId, ByteString(buffer))
     }
     
     /**
@@ -847,9 +873,9 @@ object Server {
      * '''Binary Data Layout:'''
      * {{{
      * ┌─────────────────────────────────────────────────────────────────────────────┐
-     * │ INPUT: ByteBuffer from Network.sendNeighbors()                              │
-     * ├──────────────────────────────────────────────────────────────────────────┤
-     * │ HEADER (24 bytes)      │ networkId + runID + numberOfAgents + neighbors  │
+     * │ INPUT: ByteBuffer from Network.sendNeighbors() (little-endian)              │
+     * ├─────────────────────────────────────────────────────────────────────────────┤
+     * │ HEADER (32 bytes)      │ networkId(16) + runId(8) + numAgents(4) + numN(4)│
      * │ INDEX OFFSETS (n*4)    │ Agent index mapping for n agents (CSR format)   │
      * │ NEIGHBOR REFS (m*4)    │ Neighbor reference indices for m connections    │
      * │ NEIGHBOR WEIGHTS (m*4) │ Connection weights for m neighbor pairs         │
@@ -870,35 +896,17 @@ object Server {
      *  - Single Source broadcasts to multiple clients efficiently
      *  - Debug logging only enabled when APP_MODE.hasServerLogs is true
      *
-     * @param channelId Unique identifier for the simulation run (maps to WebSocket connections)
+     * @param runId Unique identifier for the simulation run
      * @param buffer Binary packet containing network topology data (created by Network.sendNeighbors)
      */
-    def sendNeighborBinaryData(channelId: String, buffer: ByteBuffer): Unit = {
-        if (!initialized || system.isEmpty) {
-            Logger.logError("Error: WebSocket server not initialized properly")
-            return
-        }
-        channelPublishers.get(channelId) match {
-            case Some(publisher) =>
-                if (GlobalState.APP_MODE.hasServerLogs) logBufferDebugInfo(buffer)
-                
-                implicit val materializer: Materializer = Materializer(system.get)
-                val message = BinaryMessage(ByteString(buffer))
-                Source.single(message).runWith(publisher)
-            case None =>
-                Logger.logError(s"Error: No WebSocket clients connected to channel $channelId")
-        }
+    def sendNeighborBinaryData(runId: Long, buffer: ByteBuffer): Unit = {
+        if (!initialized) return
+        WsRegistry.dispatchBinary(runId, ByteString(buffer))
     }
-    
-    def sendControlEvent(channelId: String, json: String): Unit = {
-        if (!initialized || system.isEmpty) return
-        channelPublishers.get(channelId) match {
-            case Some(publisher) =>
-                implicit val materializer: Materializer = Materializer(system.get)
-                Source.single(akka.http.scaladsl.model.ws.TextMessage(json)).runWith(publisher)
-            case None =>
-                Logger.logError(s"sendControlEvent: no channel $channelId")
-        }
+
+    def sendControlEvent(runId: Long, json: String): Unit = {
+        if (!initialized) return
+        WsRegistry.dispatchText(runId, json)
     }
 
     private def topologyPageJson(snap: TopologySnapshot, runId: Long, networkId: String,
@@ -964,8 +972,10 @@ object Server {
         agentsPerNetwork: Int,
         confidenceParams: mutable.Map[Int, (Float, Float)] = mutable.Map(),
         userId: Option[Int] = None,
-        coevolutionConfig: Option[CoevolutionConfig] = None
-    ): (Long, String) = {
+        coevolutionConfig: Option[CoevolutionConfig] = None,
+        persistFrames: Boolean = false,
+        frameRetention: String = "ephemeral"
+    ): Long = {
         var runID = SnowflakeID.generateId()
         val convertedSaveMode = if (GlobalState.APP_MODE.skipDatabase || !GlobalState.APP_MODE.usesLegacyDB)
             SaveModes.DEBUG
@@ -988,21 +998,20 @@ object Server {
                 stopThreshold = stopThreshold,
                 agentTypeDistributions = agentTypes,
                 cognitiveBiasDistributions = biases,
-                userId = userId
+                userId = userId,
+                frameRetention = frameRetention
             )
         }
 
-        val channelId = takeChannel()
-        runChannelMap(runID) = channelId
-
         monitor.get ! AddNetworks(
-            runID, channelId, agentTypes, biases, confidenceParams,
+            runID, agentTypes, biases, confidenceParams,
             Uniform, convertedSaveMode, numberOfNetworks, density,
             iterationLimit, seed, 2.5f, stopThreshold,
-            coevolutionConfig
+            coevolutionConfig,
+            persistFrames
         )
 
-        (runID, channelId)
+        runID
     }
 
     private def parseGeneratedRun(data: Array[Byte], config: Option[CoevolutionConfig] = None): String = {
@@ -1040,15 +1049,20 @@ object Server {
             curOffset += 5
         }
 
-        val (_, channelId) = executeGeneratedRun(
+        executeGeneratedRun(
             seed, saveMode, numberOfNetworks, density, iterationLimit, stopThreshold,
-            agentTypes, biases, agentsPerNetwork, confidenceParams,
+            agentTypes, biases, agentsPerNetwork, confidenceParams, userId = None,
             coevolutionConfig = config
-        )
-        channelId
+        ).toString
     }
     
-    private def parseCustomRun(data: Array[Byte], config: Option[CoevolutionConfig] = None, userId: Option[Int] = None): (Long, String) = {
+    private def parseCustomRun(
+        data: Array[Byte],
+        userId: Option[Int] = None,
+        persistFrames: Boolean = false,
+        frameRetention: String = "ephemeral",
+        config: Option[CoevolutionConfig] = None
+    ): Long = {
         // Header
         val stopThreshold = bytesToFloat(data, 0)
         val iterationLimit = bytesToInt(data, 4)
@@ -1086,72 +1100,44 @@ object Server {
             val strByteLength = data(offset)
             offset += 1
             agentNames(i) = byteArrToString(data, offset, strByteLength)
-            agentIndexes.put(agentNames(i), i)
             offset += strByteLength
+            agentIndexes(agentNames(i)) = i
         }
         
         // Align to 4 bytes
         while (offset % 4 != 0) offset += 1
         
+        // Target Agent Offset
+        val indexOffset = byteArrayToIntArray(data, offset, numberOfAgents)
+        offset += 4 * numberOfAgents
+        
         // Neighbor section
         val numberOfNeighbors = bytesToInt(data, offset)
-        
         offset += 4
+        
+        val target = byteArrayToIntArray(data, offset, numberOfNeighbors)
+        offset += 4 * numberOfNeighbors
         
         val influences = byteArrayToFloatArray(data, offset, numberOfNeighbors)
         offset += 4 * numberOfNeighbors
         
-        val biases = data.slice(offset, offset + numberOfNeighbors).asInstanceOf[Array[Bias]]
-        offset += numberOfNeighbors
+        val bias = data.slice(offset, offset + numberOfNeighbors).asInstanceOf[Array[Bias]]
         
-        val source = new Array[Int](numberOfNeighbors)
+        // Sorting the index offset
+        val sourceIndex = new Array[Int](numberOfNeighbors)
+        var agentIndex = 0
         for (i <- 0 until numberOfNeighbors) {
-            val strByteLength = data(offset)
-            offset += 1
-            source(i) = agentIndexes(byteArrToString(data, offset, strByteLength))
-            offset += strByteLength
-        }
-        
-        val target = new Array[Int](numberOfNeighbors)
-        for (i <- 0 until numberOfNeighbors) {
-            val strByteLength = data(offset)
-            offset += 1
-            target(i) = agentIndexes(byteArrToString(data, offset, strByteLength))
-            offset += strByteLength
-        }
-        
-        // Optional data
-        val majorityThreshold: mutable.Map[Int, Float] = mutable.Map()
-        val confidences: mutable.Map[Int, Float] = mutable.Map()
-        while (offset < data.length) {
-            val possibleConfidence = bytesToFloat(data, offset + 8)
-            possibleConfidence match {
-                case 2.0 =>
-                    majorityThreshold(bytesToInt(data, offset)) = bytesToFloat(data, offset + 4)
-                case _ =>
-                    majorityThreshold(bytesToInt(data, offset)) = bytesToFloat(data, offset + 4)
-                    confidences(bytesToInt(data, offset)) = possibleConfidence
+            if (agentIndex < indexOffset.length - 1 && i >= indexOffset(agentIndex + 1)) {
+                agentIndex += 1
             }
-            offset += 12
+            sourceIndex(i) = agentIndex
         }
         
-        // Preparing data
-        val sortedIndices = source.indices.sortBy(source(_))
-        
-        val sortedInfluences = sortedIndices.map(influences(_)).toArray
-        val sortedBiases = sortedIndices.map(biases(_)).toArray
-        val sortedSource = sortedIndices.map(source(_)).toArray
-        val sortedTarget = sortedIndices.map(target(_)).toArray
-        
-        val indexOffset = new Array[Int](numberOfAgents)
-        var count = 0
-        for (i <- 0 until numberOfNeighbors) {
-            if ((i != 0) && sortedSource(i - 1) != sortedSource(i)) {
-                indexOffset(count) = i
-                count += 1
-            }
-        }
-        indexOffset(indexOffset.length - 1) = numberOfNeighbors
+        val sortedIndices = sourceIndex.indices.sortBy(i => (sourceIndex(i), target(i)))
+        val sortedSource = sortedIndices.map(sourceIndex).toArray
+        val sortedTarget = sortedIndices.map(target).toArray
+        val sortedInfluences = sortedIndices.map(influences).toArray
+        val sortedBiases = sortedIndices.map(bias).toArray
         
         var runID = SnowflakeID.generateId()
         val convertedSaveMode = if (GlobalState.APP_MODE.skipDatabase) SaveModes.DEBUG
@@ -1159,7 +1145,7 @@ object Server {
         
         if (SaveModes.savesToDB(convertedSaveMode)) {
             runID = DatabaseManager.createRun(
-                RunMode.GENERATED, saveMode, 1, None, None,
+                RunMode.CUSTOM, saveMode, 1, None, None,
                 stopThreshold, iterationLimit,
                 "uniform"
             ).get
@@ -1176,8 +1162,7 @@ object Server {
                     silenceStrategies,
                     silenceEffects,
                     agentNames,
-                    if (majorityThreshold.isEmpty) None else Some(majorityThreshold),
-                    if (confidences.isEmpty) None else Some(confidences),
+                    None, None
                 ),
                 customNeighborsData = CustomNeighborsData(
                     sortedSource,
@@ -1185,16 +1170,14 @@ object Server {
                     sortedInfluences,
                     sortedBiases
                 ),
-                userId = userId
+                userId = userId,
+                frameRetention = frameRetention
             )
         }
 
 
-        val channelId = takeChannel()
-
         val customRunInfo = CustomRunInfo(
             runID = runID,
-            channelId = channelId,
             stopThreshold = stopThreshold,
             iterationLimit = iterationLimit,
             saveMode = convertedSaveMode,
@@ -1209,16 +1192,22 @@ object Server {
             target = sortedTarget,
             influences = sortedInfluences,
             bias = sortedBiases,
-            coevolutionConfig = config
+            coevolutionConfig = config,
+            persistFrames = persistFrames
         )
         
         monitor.get ! RunCustomNetwork(customRunInfo)
 
-        (runID, channelId)
+        runID
     }
 
-    private def executeCustomRunFromJson(req: CustomRunReq, userId: Option[Int],
-        coevolutionConfig: Option[CoevolutionConfig] = None): (Long, String) = {
+    private def executeCustomRunFromJson(
+        req: CustomRunReq,
+        userId: Option[Int],
+        coevolutionConfig: Option[CoevolutionConfig] = None,
+        persistFrames: Boolean = false,
+        frameRetention: String = "ephemeral"
+    ): Long = {
         val agentIndexes = req.agents.zipWithIndex.map { case (a, i) => a.name -> i }.toMap
         val agentNames         = req.agents.map(_.name).toArray
         val initialBeliefs     = req.agents.map(_.belief).toArray
@@ -1258,7 +1247,7 @@ object Server {
 
         if (GlobalState.APP_MODE.usesLegacyDB && SaveModes.savesToDB(convertedSaveMode)) {
             runID = DatabaseManager.createRun(
-                RunMode.GENERATED, saveMode, 1, None, None,
+                RunMode.CUSTOM, saveMode, 1, None, None,
                 req.stopThreshold, req.iterationLimit, "uniform"
             ).get
         } else if (!GlobalState.APP_MODE.skipDatabase) {
@@ -1270,15 +1259,13 @@ object Server {
                 customAgentsData  = CustomAgentsData(initialBeliefs, toleranceRadius, toleranceOffset,
                                       silenceStrategies, silenceEffects, agentNames, None, None),
                 customNeighborsData = CustomNeighborsData(sortedSrc, sortedTgt, sortedInf, sortedBiases),
-                userId = userId
+                userId = userId,
+                frameRetention = frameRetention
             )
         }
 
-        val channelId = takeChannel()
-        runChannelMap(runID) = channelId
         monitor.get ! RunCustomNetwork(CustomRunInfo(
             runID                = runID,
-            channelId            = channelId,
             stopThreshold        = req.stopThreshold,
             iterationLimit       = req.iterationLimit,
             saveMode             = convertedSaveMode,
@@ -1293,23 +1280,12 @@ object Server {
             target               = sortedTgt,
             influences           = sortedInf,
             bias                 = sortedBiases,
-            coevolutionConfig    = coevolutionConfig
+            coevolutionConfig    = coevolutionConfig,
+            persistFrames        = persistFrames
         ))
-        (runID, channelId)
+        runID
     }
 
-    // Bit operation methods for channels
-    private def takeChannel(): String = {
-        val index = java.lang.Long.numberOfTrailingZeros(~channels).toString
-        channels = channels | (channels + 1)
-        createChannelFlow(index)
-        index
-    }
-    
-    def freeChannel(index: Int): Unit = {
-        channels = channels & ~(1L << index)
-    }
-    
     // Utility methods for data transformation
     private def bytesToInt(bytes: Array[Byte], offset: Int): Int = {
         ByteBuffer.wrap(bytes, offset, 4).order(ByteOrder.LITTLE_ENDIAN).getInt()

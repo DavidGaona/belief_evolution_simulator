@@ -86,7 +86,6 @@ class ParametricOrchestrator(
         // Create RunMetadata
         val metadata = RunMetadata(
             runID = currentRunID,
-            channelId = "parametric_test",
             runMode = RunMode.GENERATED,
             saveMode = if (GlobalState.APP_MODE.skipDatabase) SaveModes.DEBUG else SaveModes.FULL,
             distribution = Uniform,

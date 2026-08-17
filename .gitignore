@@ -33,3 +33,5 @@ project/plugins/project/
 *.gif
 *.svg
 .env
+.claude/
+.context/
