@@ -8,7 +8,7 @@ run / connectInput := true
 
 // JVM options
 javaOptions ++= Seq(
-    //"-Xmx32g",
+    "-Xmx24g",
     "--add-modules=jdk.incubator.vector"
 )
 
@@ -27,7 +27,7 @@ lazy val root = (project in file("."))
       
       // JVM options
       javaOptions ++= Seq(
-          //"-Xmx32g",
+          "-Xmx24g",
           "--add-modules=jdk.incubator.vector"
       )
   )

@@ -125,7 +125,7 @@ class ParametricOrchestrator(
     }
     
     override def preStart(): Unit = {
-        io.persistence.RoundRouter.setSavers(context, 2000000)
+        io.persistence.RoundRouter.setSavers(context, 100000)
         startNextRun()
     }
     

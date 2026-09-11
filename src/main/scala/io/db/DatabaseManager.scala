@@ -704,6 +704,7 @@ object DatabaseManager {
                 setPreparedStatementString(stmt, 11, agent.name)
                 stmt.addBatch()
                 i += 1
+                if (i % 2000 == 0) stmt.executeBatch()
             }
             stmt.executeBatch()
         } catch {
@@ -736,6 +737,7 @@ object DatabaseManager {
                 stmt.setInt(5, round)
                 stmt.addBatch()
                 i += 1
+                if (i % 2000 == 0) stmt.executeBatch()
             }
             
             stmt.executeBatch()
@@ -776,6 +778,7 @@ object DatabaseManager {
                 stmt.setInt(5, scc)
                 stmt.addBatch()
                 i += 1
+                if (i % 2000 == 0) stmt.executeBatch()
             }
             stmt.executeBatch()
         } catch {
